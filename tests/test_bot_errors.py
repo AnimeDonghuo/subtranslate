@@ -20,7 +20,7 @@ JOB = TranslationJob(42, 77, "file-id", "movie.srt", len(VALID_SRT), "hi", "Hind
 
 @pytest.fixture
 def service():
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     translator = SimpleNamespace(translate=AsyncMock())
     result = BotService(settings, LanguageCatalog(), translator)
     result.bot = SimpleNamespace(
@@ -66,7 +66,7 @@ async def test_website_failure_is_explained_to_user(service):
 
 async def test_timeout_is_reported_and_browser_coroutine_cancelled(service):
     service.settings = Settings(
-        "12345:TESTTOKEN", "long_secret_token_123", "https://example.com", translation_timeout_seconds=0.2,
+        "12345:TESTTOKEN", "https://example.com", translation_timeout_seconds=0.2,
     )
     service.bot.get_file.return_value = telegram_file(VALID_SRT)
     cancelled = asyncio.Event()

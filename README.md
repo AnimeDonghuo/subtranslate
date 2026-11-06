@@ -18,15 +18,14 @@ Send a subtitle file to the bot, choose a target language, and get a translated 
 1. Create a bot with [@BotFather](https://t.me/BotFather) and keep its token private. Do not paste it into a public repository or chat.
 2. Put this repository and its changes on GitHub, then in Koyeb choose **Create App → GitHub**, select the repository and the branch containing this code, and choose the **Dockerfile** builder. The Dockerfile installs Chromium and its runtime libraries.
 3. Create a **Web Service**, select the **free** instance in **Frankfurt** or **Washington, D.C.**, expose **HTTP port 8080**, and route `/` to that port. Do not add a worker, volume, database, or paid instance.
-4. Add these environment variables in Koyeb (use Secrets for the token and secret):
+4. Add these environment variables in Koyeb (use a Secret for the bot token):
 
    | Variable | Value |
    | --- | --- |
    | `BOT_TOKEN` | Your BotFather token |
-   | `TELEGRAM_WEBHOOK_SECRET` | A separate, random 16–256 character secret using only letters, numbers, `_` or `-` |
    | `PORT` | `8080` (or match the port configured for your service) |
 
-   Generate a secret locally with `python -c "import secrets; print(secrets.token_urlsafe(32))"`. Do not use the bot token as the webhook secret.
+   No Telegram API ID, API hash, or separate webhook secret is required. Webhook authentication is derived automatically from the bot token and remains stable across restarts. If upgrading an older version, you can remove `TELEGRAM_WEBHOOK_SECRET`; the bot registers the updated webhook on startup.
 5. Deploy. Koyeb provides `KOYEB_PUBLIC_DOMAIN`; the bot uses it to register `https://<your-domain>/telegram/webhook` with Telegram automatically. Check Koyeb logs for **Telegram webhook registered**. `GET /healthz` is a public health check and does not reveal secrets.
 6. Open your bot in Telegram, send `/start`, upload a small `.srt` (for example, `tests/fixtures/sample.srt`), and choose a language. The first request after sleep can take longer. For a private bot, send `/id`, then optionally set `ALLOWED_USER_IDS` to your numeric ID (or a comma-separated list) and redeploy.
 

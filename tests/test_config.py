@@ -8,7 +8,6 @@ def environment(monkeypatch):
     for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BOT_TOKEN", "123456:example")
-    monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "a_long_random_secret_1234")
     monkeypatch.setenv("KOYEB_PUBLIC_DOMAIN", "demo-example.koyeb.app")
 
 
@@ -27,9 +26,27 @@ def test_rejects_unusable_public_origins(environment, monkeypatch, url):
         Settings.from_env()
 
 
-def test_rejects_weak_or_invalid_secret(environment, monkeypatch):
+def test_webhook_secret_is_derived_stably_from_bot_token(environment, monkeypatch):
+    import re
+
+    first = Settings.from_env()
+    second = Settings.from_env()
+    assert first.webhook_secret == second.webhook_secret
+    assert re.fullmatch(r"[A-Za-z0-9_-]{1,256}", first.webhook_secret)
+    assert first.bot_token not in first.webhook_secret and first.bot_token not in repr(first)
+    monkeypatch.setenv("BOT_TOKEN", "123456:different")
+    assert Settings.from_env().webhook_secret != first.webhook_secret
+
+
+def test_old_manual_secret_variable_is_ignored(environment, monkeypatch):
+    expected = Settings.from_env().webhook_secret
     monkeypatch.setenv("TELEGRAM_WEBHOOK_SECRET", "short")
-    with pytest.raises(ValueError, match="TELEGRAM_WEBHOOK_SECRET"):
+    assert Settings.from_env().webhook_secret == expected
+
+
+def test_bot_token_is_still_required(environment, monkeypatch):
+    monkeypatch.delenv("BOT_TOKEN")
+    with pytest.raises(ValueError, match="BOT_TOKEN"):
         Settings.from_env()
 
 

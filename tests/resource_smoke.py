@@ -67,7 +67,7 @@ async def main() -> None:
     async with TestServer(mock) as mock_server:
         stub = fake_telegram.TelegramStub()
         builder = Application.builder().request(stub).get_updates_request(stub)
-        settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+        settings = Settings("12345:TESTTOKEN", "https://example.com")
         browser = WebsiteTranslator(chromium, site_url=str(mock_server.make_url("/")))
         with patch.object(Application, "builder", return_value=builder), \
              patch.object(bot_web, "WebsiteTranslator", return_value=browser), \

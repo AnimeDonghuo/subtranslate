@@ -98,7 +98,7 @@ async def test_document_to_button_to_download_and_return():
     queue = asyncio.Queue(maxsize=128)
     telegram = (Application.builder().token("12345:TESTTOKEN").request(request)
                 .get_updates_request(request).update_queue(queue).concurrent_updates(8).build())
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com", allowed_user_ids=frozenset({42}))
+    settings = Settings("12345:TESTTOKEN", "https://example.com", allowed_user_ids=frozenset({42}))
     service = BotService(settings, LanguageCatalog(), FakeTranslator())
     service.install_handlers(telegram)
     receiver = WebhookReceiver(settings.webhook_secret, telegram.bot, queue)
@@ -138,7 +138,7 @@ async def test_picker_navigation_and_select_all_enqueue_with_real_telegram_handl
     request = TelegramStub()
     telegram = (Application.builder().token("12345:TESTTOKEN").request(request)
                 .get_updates_request(request).build())
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     catalog = LanguageCatalog()
     service = BotService(settings, catalog, FakeTranslator())
     service.install_handlers(telegram)
@@ -190,7 +190,7 @@ async def test_select_all_returns_each_file_in_sequence_through_telegram_handler
     request = TelegramStub()
     telegram = (Application.builder().token("12345:TESTTOKEN").request(request)
                 .get_updates_request(request).build())
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     catalog = LanguageCatalog()
     catalog._languages = {"hi": "Hindi", "es": "Spanish", "fr": "French"}
     service = BotService(settings, catalog, MultipleTranslator())
@@ -216,7 +216,7 @@ async def test_language_callback_works_after_process_restart():
     queue = asyncio.Queue(maxsize=128)
     telegram = (Application.builder().token("12345:TESTTOKEN").request(request)
                 .get_updates_request(request).update_queue(queue).build())
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     service = BotService(settings, LanguageCatalog(), FakeTranslator())
     service.install_handlers(telegram)
     await telegram.initialize()
@@ -240,7 +240,7 @@ async def test_web_service_registers_webhook_and_handles_a_callback(monkeypatch)
 
     request = TelegramStub()
     builder = Application.builder().request(request).get_updates_request(request)
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     # Exercise the real web-service lifecycle with a fake Telegram transport.
     with patch.object(Application, "builder", return_value=builder), \
          patch.object(bot_web, "WebsiteTranslator", return_value=FakeTranslator()), \
@@ -254,6 +254,11 @@ async def test_web_service_registers_webhook_and_handles_a_callback(monkeypatch)
             assert registration["drop_pending_updates"] is False
             assert set(registration["allowed_updates"]) == {"message", "callback_query"}
             assert (await client.get("/healthz")).status == 200
+            # Neither an unauthenticated request nor the raw bot token is a
+            # valid webhook credential; Telegram receives the derived value.
+            assert (await client.post("/telegram/webhook", json=callback_update(11))).status == 403
+            wrong_headers = {"X-Telegram-Bot-Api-Secret-Token": settings.bot_token}
+            assert (await client.post("/telegram/webhook", headers=wrong_headers, json=callback_update(11))).status == 403
             headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
             assert (await client.post("/telegram/webhook", headers=headers, json=callback_update(11))).status == 200
             await asyncio.wait_for(request.document_sent.wait(), 2)
@@ -268,7 +273,7 @@ async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chrom
 
     request = TelegramStub()
     builder = Application.builder().request(request).get_updates_request(request)
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     browser = WebsiteTranslator(chromium_path, site_url=mock_site, stage_timeout_ms=5000,
                                 translation_timeout_ms=1500, change_wait_ms=800)
     with patch.object(Application, "builder", return_value=builder), \
@@ -301,7 +306,7 @@ async def test_graceful_web_shutdown_notifies_active_and_waiting_jobs():
 
     request = TelegramStub()
     builder = Application.builder().request(request).get_updates_request(request)
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     with patch.object(Application, "builder", return_value=builder), \
          patch.object(bot_web, "WebsiteTranslator", return_value=SlowTranslator()), \
          patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
@@ -342,7 +347,7 @@ async def test_invalid_bot_token_is_not_exposed_in_startup_errors(caplog):
     token = "12345:VERY_PRIVATE_TOKEN"
     request = RejectingTelegramStub()
     builder = Application.builder().request(request).get_updates_request(request)
-    settings = Settings(token, "long_secret_token_123", "https://example.com")
+    settings = Settings(token, "https://example.com")
     with patch.object(Application, "builder", return_value=builder):
         server = TestServer(bot_web.create_web_app(settings))
         try:

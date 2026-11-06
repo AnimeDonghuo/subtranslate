@@ -21,7 +21,7 @@ JOB = TranslationJob(42, 77, "file", "movie.srt", len(SOURCE), "*", "all languag
 @pytest.fixture
 def batch_service():
     telegram_file = SimpleNamespace(file_size=len(SOURCE), download_as_bytearray=AsyncMock(return_value=bytearray(SOURCE)))
-    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
     service = BotService(settings, LanguageCatalog(), SimpleNamespace(translate=AsyncMock()))
     service.bot = SimpleNamespace(send_message=AsyncMock(), get_file=AsyncMock(return_value=telegram_file),
                                   send_document=AsyncMock())

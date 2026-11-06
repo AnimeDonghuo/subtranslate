@@ -41,9 +41,9 @@ async def test_webhook_registration_retries_without_logging_secrets(monkeypatch,
     from unittest.mock import AsyncMock
 
     token = "12345:DO_NOT_LOG_THIS_TOKEN"
-    secret = "long_secret_do_not_log"
     bot = SimpleNamespace(set_webhook=AsyncMock(side_effect=[TelegramError(token), True]))
-    settings = Settings(token, secret, "https://example.com")
+    settings = Settings(token, "https://example.com")
+    secret = settings.webhook_secret
     sleep = AsyncMock()
     monkeypatch.setattr("subtranslate.web.asyncio.sleep", sleep)
     await register_webhook(bot, settings)
