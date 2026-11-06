@@ -17,7 +17,6 @@ import srt
 import test_bot_flow as fake_telegram
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from telegram.ext import Application
 
 import subtranslate.web as bot_web
 from subtranslate.config import Settings
@@ -66,13 +65,11 @@ async def main() -> None:
     mock.router.add_get("/", serve)
     async with TestServer(mock) as mock_server:
         stub = fake_telegram.TelegramStub()
-        builder = Application.builder().request(stub).get_updates_request(stub)
         settings = Settings("12345:TESTTOKEN", "https://example.com")
         browser = WebsiteTranslator(chromium, site_url=str(mock_server.make_url("/")))
-        with patch.object(Application, "builder", return_value=builder), \
-             patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
+        with patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
              patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
-            async with TestClient(TestServer(bot_web.create_web_app(settings))) as client:
+            async with TestClient(TestServer(bot_web.create_web_app(settings, telegram_request=stub))) as client:
                 await asyncio.wait_for(stub.webhook_set.wait(), 60)
                 headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
                 response = await client.post(

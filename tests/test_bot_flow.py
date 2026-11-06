@@ -239,21 +239,23 @@ async def test_web_service_registers_webhook_and_handles_a_callback(monkeypatch)
     import subtranslate.web as bot_web
 
     request = TelegramStub()
-    builder = Application.builder().request(request).get_updates_request(request)
     settings = Settings("12345:TESTTOKEN", "https://example.com")
     # Exercise the real web-service lifecycle with a fake Telegram transport.
-    with patch.object(Application, "builder", return_value=builder), \
-         patch.object(bot_web, "WebsiteTranslator", return_value=FakeTranslator()), \
+    with patch.object(bot_web, "WebsiteTranslator", return_value=FakeTranslator()), \
          patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
-        app = bot_web.create_web_app(settings)
+        app = bot_web.create_web_app(settings, telegram_request=request)
         async with TestClient(TestServer(app)) as client:
             await asyncio.wait_for(request.webhook_set.wait(), 2)
+            await asyncio.wait_for(app[bot_web.TELEGRAM_STATE].registered.wait(), 2)
+            assert (await client.get("/readyz")).status == 200
             registration = next(params for action, params in request.calls if action == "setWebhook")
             assert registration["url"] == "https://example.com/telegram/webhook"
             assert registration["secret_token"] == settings.webhook_secret
             assert registration["drop_pending_updates"] is False
             assert set(registration["allowed_updates"]) == {"message", "callback_query"}
-            assert (await client.get("/healthz")).status == 200
+            health_response = await client.get("/healthz")
+            assert health_response.status == 200
+            assert await health_response.json() == {"status": "ok", "telegram": "ready"}
             # Neither an unauthenticated request nor the raw bot token is a
             # valid webhook credential; Telegram receives the derived value.
             assert (await client.post("/telegram/webhook", json=callback_update(11))).status == 403
@@ -272,14 +274,12 @@ async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chrom
     from subtranslate.website import WebsiteTranslator
 
     request = TelegramStub()
-    builder = Application.builder().request(request).get_updates_request(request)
     settings = Settings("12345:TESTTOKEN", "https://example.com")
     browser = WebsiteTranslator(chromium_path, site_url=mock_site, stage_timeout_ms=5000,
                                 translation_timeout_ms=1500, change_wait_ms=800)
-    with patch.object(Application, "builder", return_value=builder), \
-         patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
+    with patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
          patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
-        async with TestClient(TestServer(bot_web.create_web_app(settings))) as client:
+        async with TestClient(TestServer(bot_web.create_web_app(settings, telegram_request=request))) as client:
             await asyncio.wait_for(request.webhook_set.wait(), 2)
             headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
             await client.post("/telegram/webhook", headers=headers, json={"update_id": 20, "message": DOCUMENT_MESSAGE})
@@ -305,12 +305,10 @@ async def test_graceful_web_shutdown_notifies_active_and_waiting_jobs():
             await asyncio.Event().wait()
 
     request = TelegramStub()
-    builder = Application.builder().request(request).get_updates_request(request)
     settings = Settings("12345:TESTTOKEN", "https://example.com")
-    with patch.object(Application, "builder", return_value=builder), \
-         patch.object(bot_web, "WebsiteTranslator", return_value=SlowTranslator()), \
+    with patch.object(bot_web, "WebsiteTranslator", return_value=SlowTranslator()), \
          patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
-        async with TestClient(TestServer(bot_web.create_web_app(settings))) as client:
+        async with TestClient(TestServer(bot_web.create_web_app(settings, telegram_request=request))) as client:
             await asyncio.wait_for(request.webhook_set.wait(), 2)
             headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
             assert (await client.post("/telegram/webhook", headers=headers, json=callback_update(30))).status == 200
@@ -332,9 +330,141 @@ async def test_graceful_web_shutdown_notifies_active_and_waiting_jobs():
         assert not request.uploads
 
 
-async def test_invalid_bot_token_is_not_exposed_in_startup_errors(caplog):
-    import traceback
-    from unittest.mock import patch
+async def test_telegram_timeout_keeps_web_service_alive_and_retries_without_losing_updates(caplog):
+    from unittest.mock import AsyncMock, patch
+
+    from telegram.error import TimedOut
+
+    import subtranslate.web as bot_web
+
+    class FlakyTelegramStub(TelegramStub):
+        def __init__(self):
+            super().__init__()
+            self.get_me_started = asyncio.Event()
+            self.release_first_attempt = asyncio.Event()
+            self.attempts = 0
+            self.initialize_calls = 0
+            self.shutdown_calls = 0
+
+        async def initialize(self):
+            self.initialize_calls += 1
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+        async def do_request(self, url, method, request_data=None, **kwargs):
+            if url.endswith("/getMe"):
+                self.attempts += 1
+                if self.attempts == 1:
+                    self.get_me_started.set()
+                    await self.release_first_attempt.wait()
+                    raise TimedOut(f"connection failed for {url}") from ConnectionError(f"cannot reach {url}")
+            return await super().do_request(url, method, request_data, **kwargs)
+
+    request = FlakyTelegramStub()
+    token = "12345:PRIVATE_TOKEN_FOR_TIMEOUT_TEST"
+    settings = Settings(token, "https://example.com")
+    with patch.object(bot_web, "WebsiteTranslator", return_value=FakeTranslator()), \
+         patch.object(LanguageCatalog, "refresh", new=AsyncMock()), \
+         patch.object(bot_web, "_wait_for_retry", new=AsyncMock()) as retry:
+        app = bot_web.create_web_app(settings, telegram_request=request)
+        async with TestClient(TestServer(app)) as client:
+            await asyncio.wait_for(request.get_me_started.wait(), 2)
+            health_response = await client.get("/healthz")
+            assert health_response.status == 200
+            assert await health_response.json() == {"status": "starting", "telegram": "connecting"}
+            assert (await client.get("/readyz")).status == 503
+            headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
+            # Telegram must be asked to retry, not told this update was handled.
+            assert (await client.post("/telegram/webhook", headers=headers, json=callback_update(70))).status == 503
+            assert (await client.post("/telegram/webhook", json=callback_update(70))).status == 403
+            request.release_first_attempt.set()
+            await asyncio.wait_for(app[bot_web.TELEGRAM_STATE].registered.wait(), 2)
+            assert request.attempts == 2
+            assert request.initialize_calls >= 4 and request.shutdown_calls >= 2
+            retry.assert_awaited_once_with(3)
+            assert (await client.get("/readyz")).status == 200
+            assert (await client.post("/telegram/webhook", headers=headers, json=callback_update(70))).status == 200
+            await asyncio.wait_for(request.document_sent.wait(), 2)
+    assert "Telegram initialization failed (TimedOut, caused by ConnectionError); retrying" in caplog.text
+    assert token not in caplog.text and settings.webhook_secret not in caplog.text
+
+
+async def test_shutdown_cancels_a_hanging_telegram_startup():
+    from unittest.mock import AsyncMock, patch
+
+    import subtranslate.web as bot_web
+
+    class HangingTelegramStub(TelegramStub):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.cancelled = asyncio.Event()
+            self.shutdown_calls = 0
+
+        async def shutdown(self):
+            self.shutdown_calls += 1
+
+        async def do_request(self, url, method, request_data=None, **kwargs):
+            if url.endswith("/getMe"):
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.cancelled.set()
+            return await super().do_request(url, method, request_data, **kwargs)
+
+    request = HangingTelegramStub()
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
+    with patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
+        app = bot_web.create_web_app(settings, telegram_request=request)
+        async with TestClient(TestServer(app)) as client:
+            await asyncio.wait_for(request.started.wait(), 2)
+            assert (await client.get("/readyz")).status == 503
+        assert request.cancelled.is_set()
+        assert request.shutdown_calls >= 1
+
+
+async def test_shutdown_cancels_telegram_retry_backoff():
+    from unittest.mock import AsyncMock, patch
+
+    from telegram.error import TimedOut
+
+    import subtranslate.web as bot_web
+
+    class OfflineTelegramStub(TelegramStub):
+        async def do_request(self, url, method, request_data=None, **kwargs):
+            if url.endswith("/getMe"):
+                raise TimedOut("network unavailable")
+            return await super().do_request(url, method, request_data, **kwargs)
+
+    retry_started = asyncio.Event()
+    retry_cancelled = asyncio.Event()
+
+    async def wait_for_retry(delay):
+        assert delay == 3
+        retry_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            retry_cancelled.set()
+
+    request = OfflineTelegramStub()
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
+    with patch.object(LanguageCatalog, "refresh", new=AsyncMock()), \
+         patch.object(bot_web, "_wait_for_retry", new=wait_for_retry):
+        app = bot_web.create_web_app(settings, telegram_request=request)
+        async with TestClient(TestServer(app)) as client:
+            await asyncio.wait_for(retry_started.wait(), 2)
+            health_response = await client.get("/healthz")
+            assert health_response.status == 200
+            assert await health_response.json() == {"status": "starting", "telegram": "retrying"}
+            assert (await client.get("/readyz")).status == 503
+        assert retry_cancelled.is_set()
+
+
+async def test_invalid_bot_token_is_reported_without_exposing_it(caplog):
+    from unittest.mock import AsyncMock, patch
 
     import subtranslate.web as bot_web
 
@@ -346,18 +476,40 @@ async def test_invalid_bot_token_is_not_exposed_in_startup_errors(caplog):
 
     token = "12345:VERY_PRIVATE_TOKEN"
     request = RejectingTelegramStub()
-    builder = Application.builder().request(request).get_updates_request(request)
     settings = Settings(token, "https://example.com")
-    with patch.object(Application, "builder", return_value=builder):
-        server = TestServer(bot_web.create_web_app(settings))
-        try:
-            try:
-                await server.start_server()
-            except RuntimeError as exc:
-                assert "Telegram initialization failed" in str(exc)
-                assert token not in "".join(traceback.format_exception(exc))
-                assert token not in caplog.text
-            else:
-                raise AssertionError("An invalid bot token should prevent startup")
-        finally:
-            await server.close()
+    with patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
+        app = bot_web.create_web_app(settings, telegram_request=request)
+        async with TestClient(TestServer(app)) as client:
+            await asyncio.wait_for(app[bot_web.TELEGRAM_STATE].failed.wait(), 2)
+            health_response = await client.get("/healthz")
+            assert health_response.status == 200
+            assert await health_response.json() == {"status": "error", "telegram": "invalid_token"}
+            assert (await client.get("/readyz")).status == 503
+            assert "Telegram rejected BOT_TOKEN" in caplog.text
+            assert token not in caplog.text and settings.webhook_secret not in caplog.text
+            assert not request.webhook_set.is_set()
+
+
+async def test_rejected_webhook_registration_stops_accepting_updates_without_leaking_token(caplog):
+    from unittest.mock import AsyncMock, patch
+
+    import subtranslate.web as bot_web
+
+    class RejectingWebhookStub(TelegramStub):
+        async def do_request(self, url, method, request_data=None, **kwargs):
+            if url.endswith("/setWebhook"):
+                return 401, b'{"ok":false,"error_code":401,"description":"Unauthorized"}'
+            return await super().do_request(url, method, request_data, **kwargs)
+
+    token = "12345:PRIVATE_WEBHOOK_TOKEN"
+    request = RejectingWebhookStub()
+    settings = Settings(token, "https://example.com")
+    with patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
+        app = bot_web.create_web_app(settings, telegram_request=request)
+        async with TestClient(TestServer(app)) as client:
+            await asyncio.wait_for(app[bot_web.TELEGRAM_STATE].failed.wait(), 2)
+            assert (await client.get("/readyz")).status == 503
+            headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
+            assert (await client.post("/telegram/webhook", headers=headers, json=callback_update(71))).status == 503
+    assert "Telegram rejected BOT_TOKEN while registering the webhook" in caplog.text
+    assert token not in caplog.text and settings.webhook_secret not in caplog.text
