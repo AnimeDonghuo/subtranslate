@@ -26,9 +26,8 @@ jobs:
       - name: Translate a non-private sample through the actual website
         shell: bash
         run: |
-          PYTHONPATH=. python tests/live_diagnose.py
           python -m subtranslate.smoke tests/fixtures/sample.srt hi --output-dir /tmp \
-            --timeout-seconds 90 --translation-timeout-seconds 20
+            --timeout-seconds 240 --translation-timeout-seconds 90
           python - <<'PY'
           from pathlib import Path
           from subtranslate.subtitles import prepare_subtitle, verify_and_merge
@@ -39,3 +38,5 @@ jobs:
               raise SystemExit('Live website returned unchanged text; check the site and its selectors.')
           print(f'Live website returned changed text for {result.cue_count} cues with matching timestamps.')
           PY
+      - name: Probe other advertised formats with public samples
+        run: PYTHONPATH=. python tests/live_format_probe.py
