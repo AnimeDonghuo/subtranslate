@@ -10,6 +10,7 @@ from pathlib import Path
 
 from playwright.async_api import async_playwright
 
+from subtranslate.languages import LanguageCatalog
 from subtranslate.website import (
     PROGRESS_FINISHED,
     PROGRESS_WATCH,
@@ -23,7 +24,8 @@ from subtranslate.website import (
 FIXTURES = Path("tests/fixtures")
 
 
-async def probe(browser, extension):
+async def probe(browser, filename):
+    extension = filename
     context = await browser.new_context(accept_downloads=True, locale="en-US", service_workers="block")
     await context.route("**/*", _block_unnecessary_requests)
     page = await context.new_page()
@@ -31,13 +33,18 @@ async def probe(browser, extension):
     try:
         async with asyncio.timeout(100):
             await page.goto("https://translatesubtitles.co/", wait_until="domcontentloaded")
-            await page.locator('input[type="file"]').first.set_input_files(str(FIXTURES / f"sample.{extension}"))
+            await page.locator('input[type="file"]').first.set_input_files(str(FIXTURES / filename))
             await _wait_for_uploaded_cues(page, 2, 25_000)
             cells = page.locator("td.notranslate.target-sub")
             before = await cells.all_text_contents()
             print(f"{extension}: parsed {len(before)} cues: {before!r}", flush=True)
             selector = page.locator("select.goog-te-combo").first
             await selector.locator("option").nth(1).wait_for(state="attached")
+            if filename == "sample.vtt":
+                site_codes = set(await selector.locator("option").evaluate_all("els => els.map(el => el.value).filter(Boolean)"))
+                catalog_codes = {code for code, _ in LanguageCatalog().items()}
+                print(f"Language codes: site={len(site_codes)}, catalog={len(catalog_codes)}, "
+                      f"site-only={sorted(site_codes - catalog_codes)}, catalog-only={sorted(catalog_codes - site_codes)}", flush=True)
             await selector.select_option("hi")
             await _close_vip_popup(page)
             await page.evaluate(PROGRESS_WATCH)
@@ -71,8 +78,9 @@ async def main():
         browser = await playwright.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         try:
             results = {}
-            for extension in ("vtt", "sbv", "ass", "sub", "stl"):
-                results[extension] = await probe(browser, extension)
+            for filename in ("sample.vtt", "sample.sbv", "sample.ass", "sample.sub", "sample-microfps.sub",
+                             "sample-subviewer.sub", "sample.stl"):
+                results[filename] = await probe(browser, filename)
         finally:
             await browser.close()
     print("Public live format probe results:", results, flush=True)
