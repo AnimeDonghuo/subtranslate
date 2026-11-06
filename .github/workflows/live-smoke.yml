@@ -34,8 +34,9 @@ jobs:
           source = prepare_subtitle(Path('tests/fixtures/sample.srt').read_bytes())
           output = Path('/tmp/sample.Hindi.srt').read_bytes()
           result = verify_and_merge(source, output)
-          if result.unchanged:
-              raise SystemExit('Live website returned unchanged text; check the site and its selectors.')
+          output_cues = prepare_subtitle(output).cues
+          if result.cue_count != 2 or any(a.content.strip() == b.content.strip() for a, b in zip(source.cues, output_cues)):
+              raise SystemExit('Live website did not translate both sample cues; check the site and its selectors.')
           print(f'Live website returned changed text for {result.cue_count} cues with matching timestamps.')
           PY
       - name: Translate other public format samples through the bot flow

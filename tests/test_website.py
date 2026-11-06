@@ -48,6 +48,29 @@ async def test_sub_variants_use_srt_bridge_and_keep_original_timing(mock_site, c
         assert b"00:00:03.00,00:00:04.00" in result.content
 
 
+async def test_site_upload_is_retried_once_if_its_table_never_renders(mock_site, chromium_path, source, caplog):
+    browser = translator(mock_site + "?mode=retryupload", chromium_path)
+    browser.stage_timeout_ms = 1500
+    result = await browser.translate(source, "es")
+    assert b"Hola mundo" in result.content
+    assert "displayed 0 of 1 expected cues" in caplog.text
+    assert "Hello world" not in caplog.text
+
+
+async def test_upload_timeout_after_retry_is_reported_without_private_text(mock_site, chromium_path, source, caplog):
+    browser = translator(mock_site + "?mode=noupload", chromium_path)
+    browser.stage_timeout_ms = 1500
+    with pytest.raises(WebsiteError, match="timed out"):
+        await browser.translate(source, "es")
+    assert caplog.text.count("displayed 0 of 1 expected cues") == 2
+    assert "Hello world" not in caplog.text
+
+
+async def test_upload_uses_a_random_name_instead_of_the_users_filename(mock_site, chromium_path, source):
+    result = await translator(mock_site + "?mode=randomname", chromium_path).translate(source, "es")
+    assert b"Hola mundo" in result.content
+
+
 async def test_success_message_without_loader_is_accepted(mock_site, chromium_path, source):
     result = await translator(mock_site + "?mode=successonly", chromium_path).translate(source, "hi")
     assert b"Hola mundo" in result.content

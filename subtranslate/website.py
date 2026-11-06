@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import re
+import secrets
 import tempfile
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -65,6 +66,8 @@ async def _wait_for_uploaded_cues(page, expected_count: int, timeout_ms: int) ->
             raise WebsiteError("The website parsed a different number of cues. Please try again.")
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
+            # Counts only: do not log filenames, URLs or subtitle text.
+            logger.warning("Subtitle website displayed %d of %d expected cues before timeout", count, expected_count)
             raise PlaywrightTimeout("The website did not display all uploaded subtitle cues")
         try:
             await cells.nth(expected_count - 1).wait_for(
@@ -203,7 +206,9 @@ class WebsiteTranslator:
         try:
             site_source = subtitle_for_website(source)
             with tempfile.TemporaryDirectory(prefix="subtranslate-") as temp_dir:
-                input_path = Path(temp_dir) / f"input{site_source.extension}"
+                # Avoid predictable upload names if the third-party site stores
+                # uploads by filename. Never send the user's original filename.
+                input_path = Path(temp_dir) / f"subtitle-{secrets.token_hex(12)}{site_source.extension}"
                 output_path = Path(temp_dir) / f"download{site_source.extension}"
                 input_path.write_bytes(site_source.utf8)
                 async with async_playwright() as playwright:
@@ -226,7 +231,15 @@ class WebsiteTranslator:
                         await page.locator('input[type="file"]').first.set_input_files(str(input_path))
                         # The uploaded file is parsed on the website's next page.
                         target_cells = page.locator("td.notranslate.target-sub")
-                        await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
+                        try:
+                            await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
+                        except PlaywrightTimeout:
+                            # Transient uploads sometimes never render their table.
+                            # Retry only before translation has started.
+                            logger.info("Retrying the subtitle upload once")
+                            await page.goto(self.site_url, wait_until="domcontentloaded", timeout=self.stage_timeout_ms)
+                            await page.locator('input[type="file"]').first.set_input_files(str(input_path))
+                            await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
                         selector = page.locator("select.goog-te-combo").first
                         await selector.locator("option").nth(1).wait_for(state="attached", timeout=self.stage_timeout_ms)
                         await _close_vip_popup(page)

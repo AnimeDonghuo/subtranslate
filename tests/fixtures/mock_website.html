@@ -17,6 +17,11 @@ let renderQueued = false;
 let translateCount = 0;
 const mode = new URL(location.href).searchParams.get('mode');
 document.querySelector('#file').onchange = async e => {
+  if (mode === 'retryupload' && !sessionStorage.getItem('uploadRetried')) {
+    sessionStorage.setItem('uploadRetried', 'yes'); return;
+  }
+  if (mode === 'noupload' ||
+      (mode === 'randomname' && !/^subtitle-[0-9a-f]{24}\.srt$/.test(e.target.files[0].name))) return;
   const raw = await e.target.files[0].text();
   blocks = raw.trim().split(/\r?\n\r?\n/).map(block => block.split(/\r?\n/));
   document.querySelector('#vip').style.display = 'block';

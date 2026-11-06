@@ -20,7 +20,10 @@ async def main():
             async with asyncio.timeout(150):
                 result = await translator.translate(source, "hi")
             checked = verify_and_merge(source, result.content)
-            if checked.unchanged or checked.cue_count != 2:
+            output = prepare_subtitle(result.content, filename)
+            if checked.cue_count != 2 or any(
+                before.content.strip() == after.content.strip() for before, after in zip(source.cues, output.cues)
+            ):
                 raise AssertionError("The sample did not produce two changed, valid cues")
             results[filename] = "passed"
             print(f"{filename}: translated {checked.cue_count} cues with matching times", flush=True)
