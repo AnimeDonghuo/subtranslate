@@ -7,8 +7,9 @@
 <select class="goog-te-combo" id="lang"></select>
 <div id="loader" style="display:none">TRANSLATING</div>
 <h4 class="skiptranslate success-msg" style="display:none">Subtitle Translated!</h4>
-<button onclick="translateFile()">1. Translate</button>
-<button onclick="downloadFile()">2. Download</button>
+<a href="#decoy" id="google-brand" onclick="document.body.dataset.wrongClick='yes';return false">Translate</a>
+<a href="#translate" onclick="translateFile();return false">1. Translate</a>
+<a href="#download" onclick="downloadFile();return false">2. Download</a>
 <table id="table"></table>
 <script>
 let blocks = [];

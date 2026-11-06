@@ -74,12 +74,21 @@ async def _wait_for_uploaded_cues(page, expected_count: int, timeout_ms: int) ->
 
 
 async def _button(page, label: str, number: int):
-    expression = re.compile(rf"^\s*(?:{number}\.\s*)?{label}\s*$", re.IGNORECASE)
-    button = page.get_by_role("button", name=expression).first
+    # The site renders its controls as links. The Google Translate widget also
+    # has a plain "Translate" link, so prefer the exact numbered site control.
+    numbered = re.compile(rf"^\s*{number}\.\s*{label}\s*$", re.IGNORECASE)
+    button = page.get_by_role("button", name=numbered).first
     if await button.count():
         return button
-    # Some versions of the site use links or spans rather than buttons.
-    return page.get_by_text(expression).first
+    text = page.get_by_text(numbered).first
+    if await text.count():
+        return text
+    # If a future version drops numbering, only accept a real button, not the
+    # Google branding link. The final locator will time out if neither exists.
+    plain_button = page.get_by_role("button", name=re.compile(rf"^\s*{label}\s*$", re.IGNORECASE)).first
+    if await plain_button.count():
+        return plain_button
+    return text
 
 
 async def _block_unnecessary_requests(route) -> None:
