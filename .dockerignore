@@ -6,4 +6,9 @@ __pycache__
 .env
 .env.*
 *.srt
+*.ass
+*.sub
+*.sbv
+*.vtt
+*.stl
 tests

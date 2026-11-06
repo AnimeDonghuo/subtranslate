@@ -3,7 +3,6 @@
 import logging
 import math
 import re
-import string
 import unicodedata
 from importlib.resources import files
 
@@ -12,10 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger(__name__)
 CATALOG_URL = "https://translate.google.com/translate_a/l?client=te&hl=en"
-POPULAR_CODES = (
-    "en", "hi", "bn", "es", "fr", "ar", "pt", "zh-CN", "ja", "ko", "de", "ru", "id", "tr", "ur", "ta",
-)
-PAGE_SIZE = 16
+PAGE_SIZE = 5
 CODE_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*\Z")
 
 
@@ -68,45 +64,26 @@ class LanguageCatalog:
             logger.info("Language catalog refresh unavailable; using bundled languages")
 
 
-def _rows(buttons: list[InlineKeyboardButton], width: int) -> list[list[InlineKeyboardButton]]:
-    return [buttons[pos : pos + width] for pos in range(0, len(buttons), width)]
-
-
-def _language_button(code: str, name: str) -> InlineKeyboardButton:
-    return InlineKeyboardButton(name, callback_data=f"lang:{code}")
-
-
-def popular_keyboard(catalog: LanguageCatalog) -> InlineKeyboardMarkup:
-    buttons = [_language_button(code, catalog.get(code)) for code in POPULAR_CODES if catalog.get(code)]
-    return InlineKeyboardMarkup(_rows(buttons, 2) + [[InlineKeyboardButton("🌐 All languages", callback_data="letters")]])
-
-
-def _initial(name: str) -> str:
-    normalized = unicodedata.normalize("NFKD", name)
-    first = normalized[:1].upper()
-    return first if first in string.ascii_uppercase else "#"
-
-
-def letters_keyboard(catalog: LanguageCatalog) -> InlineKeyboardMarkup:
-    letters = sorted({_initial(name) for _, name in catalog.items()})
-    buttons = [InlineKeyboardButton(letter, callback_data=f"group:{letter}:0") for letter in letters]
-    return InlineKeyboardMarkup(_rows(buttons, 5) + [[InlineKeyboardButton("‹ Popular", callback_data="popular")]])
-
-
-def group_keyboard(catalog: LanguageCatalog, letter: str, page: int) -> tuple[InlineKeyboardMarkup, int, int]:
-    if letter not in string.ascii_uppercase + "#" or len(letter) != 1:
-        raise ValueError("Invalid language group")
-    matches = [(code, name) for code, name in catalog.items() if _initial(name) == letter]
-    page_count = max(1, math.ceil(len(matches) / PAGE_SIZE))
+def language_keyboard(catalog: LanguageCatalog, page: int = 0) -> tuple[InlineKeyboardMarkup, int, int]:
+    """Show five languages at a time, with navigation and an all-languages option."""
+    languages = catalog.items()
+    page_count = max(1, math.ceil(len(languages) / PAGE_SIZE))
     page = max(0, min(page, page_count - 1))
-    shown = matches[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
-    rows = _rows([_language_button(code, name) for code, name in shown], 2)
+    shown = languages[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+    rows = [[InlineKeyboardButton(name, callback_data=f"lang:{code}")] for code, name in shown]
     navigation = []
     if page > 0:
-        navigation.append(InlineKeyboardButton("‹ Previous", callback_data=f"group:{letter}:{page - 1}"))
+        navigation.append(InlineKeyboardButton("‹ Previous", callback_data=f"page:{page - 1}"))
     if page + 1 < page_count:
-        navigation.append(InlineKeyboardButton("Next ›", callback_data=f"group:{letter}:{page + 1}"))
+        navigation.append(InlineKeyboardButton("Next ›", callback_data=f"page:{page + 1}"))
     if navigation:
         rows.append(navigation)
-    rows.append([InlineKeyboardButton("‹ All languages", callback_data="letters")])
+    rows.append([InlineKeyboardButton("🌐 Select all languages", callback_data=f"all:confirm:{page}")])
     return InlineKeyboardMarkup(rows), page + 1, page_count
+
+
+def confirm_all_keyboard(page: int = 0) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Yes, translate all", callback_data="all:start")],
+        [InlineKeyboardButton("‹ Back to languages", callback_data=f"page:{page}")],
+    ])

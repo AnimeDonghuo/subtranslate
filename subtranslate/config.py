@@ -63,8 +63,8 @@ class Settings:
             raise ValueError("PORT, TRANSLATION_TIMEOUT_SECONDS and ALLOWED_USER_IDS must be integers") from exc
         if not 1 <= port <= 65535:
             raise ValueError("PORT must be between 1 and 65535")
-        # One active job plus two waiting jobs must finish within Koyeb's
-        # one-hour idle window even when all three hit their deadline.
+        # A deadline applies to each individual language, not to a whole
+        # all-language batch, which may take much longer.
         if not 60 <= timeout <= 1000:
             raise ValueError("TRANSLATION_TIMEOUT_SECONDS must be between 60 and 1000")
         if allowed is not None and (not allowed or any(value <= 0 for value in allowed)):

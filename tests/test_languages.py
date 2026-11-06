@@ -1,10 +1,8 @@
-import string
-
 from subtranslate.languages import (
+    PAGE_SIZE,
     LanguageCatalog,
-    group_keyboard,
-    letters_keyboard,
-    popular_keyboard,
+    confirm_all_keyboard,
+    language_keyboard,
 )
 
 
@@ -19,22 +17,27 @@ def test_catalog_has_full_current_widget_snapshot():
     assert catalog.get("mni-Mtei") == "Meiteilon (Manipuri)"
 
 
-def test_every_language_can_be_reached_and_callback_fits_telegram_limit():
+def test_five_per_page_navigation_and_every_language_reachable():
     catalog = LanguageCatalog()
-    seen = set()
-    keyboards = [popular_keyboard(catalog), letters_keyboard(catalog)]
-    for letter in string.ascii_uppercase + "#":
-        keyboard, _, pages = group_keyboard(catalog, letter, 0)
-        keyboards.append(keyboard)
-        for page in range(1, pages):
-            keyboards.append(group_keyboard(catalog, letter, page)[0])
-    for keyboard in keyboards:
-        for row in keyboard.inline_keyboard:
-            for button in row:
-                assert len(button.callback_data.encode()) <= 64
-                if button.callback_data.startswith("lang:"):
-                    seen.add(button.callback_data.removeprefix("lang:"))
-    assert seen == {code for code, _ in catalog.items()}
+    seen = []
+    keyboard, current, pages = language_keyboard(catalog)
+    assert current == 1 and pages == 50
+    for page in range(pages):
+        keyboard, current, total = language_keyboard(catalog, page)
+        assert current == page + 1 and total == pages
+        buttons = [button for row in keyboard.inline_keyboard for button in row]
+        languages = [button for button in buttons if button.callback_data.startswith("lang:")]
+        assert len(languages) == min(PAGE_SIZE, len(catalog.items()) - page * PAGE_SIZE)
+        assert all(len(row) == 1 for row in keyboard.inline_keyboard[:len(languages)])
+        callbacks = {button.callback_data for button in buttons}
+        assert (f"page:{page - 1}" in callbacks) == (page > 0)
+        assert (f"page:{page + 1}" in callbacks) == (page < pages - 1)
+        assert f"all:confirm:{page}" in callbacks
+        seen.extend(button.callback_data.removeprefix("lang:") for button in languages)
+        assert all(len(button.callback_data.encode()) <= 64 for button in buttons)
+    assert seen == [code for code, _ in catalog.items()]
+    assert any(button.callback_data == "all:start"
+               for row in confirm_all_keyboard().inline_keyboard for button in row)
 
 
 def test_remote_catalog_validation_and_merge():

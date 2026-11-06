@@ -80,7 +80,7 @@ class FakeTranslator:
         return verify_and_merge(source, TRANSLATED)
 
 
-def callback_update(update_id=2, code="hi"):
+def callback_update(update_id=2, code="hi", *, data=None):
     # Telegram attaches the document to the bot's reply. No bot-side session
     # or local file is needed, even if the process restarted in between.
     picker = {
@@ -89,7 +89,7 @@ def callback_update(update_id=2, code="hi"):
     }
     return {"update_id": update_id, "callback_query": {
         "id": f"callback-{update_id}", "from": USER, "message": picker,
-        "chat_instance": "42", "data": f"lang:{code}",
+        "chat_instance": "42", "data": data if data is not None else f"lang:{code}",
     }}
 
 
@@ -128,6 +128,85 @@ async def test_document_to_button_to_download_and_return():
             assert b"00:00:01,000 --> 00:00:02,000" in upload[1]
     finally:
         await telegram.stop()
+        await service.queue.close()
+        await telegram.shutdown()
+
+
+async def test_picker_navigation_and_select_all_enqueue_with_real_telegram_handlers():
+    from telegram import Update
+
+    request = TelegramStub()
+    telegram = (Application.builder().token("12345:TESTTOKEN").request(request)
+                .get_updates_request(request).build())
+    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    catalog = LanguageCatalog()
+    service = BotService(settings, catalog, FakeTranslator())
+    service.install_handlers(telegram)
+    await telegram.initialize()
+    try:
+        await telegram.process_update(Update.de_json({"update_id": 1, "message": DOCUMENT_MESSAGE}, telegram.bot))
+        picker = next(params for action, params in request.calls if action == "sendMessage" and params.get("reply_markup"))
+        first_buttons = [button for row in picker["reply_markup"]["inline_keyboard"] for button in row]
+        assert len([button for button in first_buttons if button["callback_data"].startswith("lang:")]) == 5
+        assert any(button["callback_data"] == "page:1" for button in first_buttons)
+        assert any(button["callback_data"] == "all:confirm:0" for button in first_buttons)
+
+        await telegram.process_update(Update.de_json(callback_update(2, data="page:1"), telegram.bot))
+        edit = [params for action, params in request.calls if action == "editMessageText"][-1]
+        assert "Page 2/50" in edit["text"]
+        page_two = [button for row in edit["reply_markup"]["inline_keyboard"] for button in row]
+        assert len([button for button in page_two if button["callback_data"].startswith("lang:")]) == 5
+        assert {"page:0", "page:2", "all:confirm:1"}.issubset({button["callback_data"] for button in page_two})
+
+        await telegram.process_update(Update.de_json(callback_update(3, data="all:confirm:1"), telegram.bot))
+        edit = [params for action, params in request.calls if action == "editMessageText"][-1]
+        confirm = [button for row in edit["reply_markup"]["inline_keyboard"] for button in row]
+        assert {"all:start", "page:1"}.issubset({button["callback_data"] for button in confirm})
+        assert "one at a time" in edit["text"]
+
+        await telegram.process_update(Update.de_json(callback_update(4, data="all:start"), telegram.bot))
+        await telegram.process_update(Update.de_json(callback_update(5, data="all:start"), telegram.bot))
+        assert service.queue._queue.qsize() == 1
+        job = service.queue._queue.get_nowait()
+        assert job.file_id == "file1" and job.languages == tuple(catalog.items())
+        assert len(job.languages) == 249
+        assert any(action == "answerCallbackQuery" and "already queued" in params.get("text", "")
+                   for action, params in request.calls)
+        service.queue._queue.task_done()
+    finally:
+        await telegram.shutdown()
+
+
+async def test_select_all_returns_each_file_in_sequence_through_telegram_handlers():
+    from telegram import Update
+
+    seen = []
+
+    class MultipleTranslator:
+        async def translate(self, source, code):
+            seen.append(code)
+            return verify_and_merge(source, TRANSLATED)
+
+    request = TelegramStub()
+    telegram = (Application.builder().token("12345:TESTTOKEN").request(request)
+                .get_updates_request(request).build())
+    settings = Settings("12345:TESTTOKEN", "long_secret_token_123", "https://example.com")
+    catalog = LanguageCatalog()
+    catalog._languages = {"hi": "Hindi", "es": "Spanish", "fr": "French"}
+    service = BotService(settings, catalog, MultipleTranslator())
+    service.install_handlers(telegram)
+    await telegram.initialize()
+    service.queue.start()
+    try:
+        await telegram.process_update(Update.de_json(callback_update(1, data="all:start"), telegram.bot))
+        await asyncio.wait_for(service.queue._queue.join(), 5)
+        assert seen == ["fr", "hi", "es"]  # alphabetical names in the picker
+        assert [next(iter(upload.values()))[0] for upload in request.uploads] == [
+            "movie.French.srt", "movie.Hindi.srt", "movie.Spanish.srt",
+        ]
+        documents = [params for action, params in request.calls if action == "sendDocument"]
+        assert [item["caption"].split(" · ")[0] for item in documents] == ["1/3", "2/3", "3/3"]
+    finally:
         await service.queue.close()
         await telegram.shutdown()
 

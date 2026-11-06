@@ -6,6 +6,8 @@ from subtranslate.subtitles import (
     MAX_INPUT_BYTES,
     SubtitleError,
     prepare_subtitle,
+    restore_subtitle_from_website,
+    subtitle_for_website,
     translated_filename,
     verify_and_merge,
 )
@@ -97,3 +99,97 @@ def test_safe_and_informative_output_names():
 def test_common_legacy_encodings_are_converted_when_detectable(encoding, text):
     data = f"1\n00:00:01,000 --> 00:00:02,000\n{text}\n\n".encode(encoding)
     assert text in prepare_subtitle(data).utf8.decode("utf-8")
+
+
+@pytest.mark.parametrize("filename,source,changed_time", [
+    ("film.vtt", "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\n\n", "00:00:02.100"),
+    ("film.sbv", "0:00:01.000,0:00:02.000\nHello\n\n", "0:00:02.100"),
+    ("film.sub", "{0}{0}25.000\n{25}{50}Hello\n", "{51}"),
+    ("film.stl", "// Spruce STL\n00:00:01:00,00:00:02:00,Hello\n", "00:00:02:01"),
+    ("film.ass", ("[Script Info]\nScriptType: v4.00+\n[Events]\n"
+     "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+     "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hello\n"), "0:00:02.10"),
+])
+def test_other_supported_text_formats_keep_extension_and_verify_timing(filename, source, changed_time):
+    prepared = prepare_subtitle(source.encode(), filename)
+    assert len(prepared.cues) == 1
+    assert prepared.extension == "." + filename.rsplit(".", 1)[1]
+    output = source.replace("Hello", "Hola").encode()
+    result = verify_and_merge(prepared, output)
+    assert not result.unchanged and result.cue_count == 1 and b"Hola" in result.content
+    assert translated_filename(filename, "Spanish") == filename.replace(".", ".Spanish.")
+    old_end = {
+        "vtt": "00:00:02.000", "sbv": "0:00:02.000", "sub": "{50}",
+        "stl": "00:00:02:00", "ass": "0:00:02.00",
+    }[filename.rsplit(".", 1)[1]]
+    with pytest.raises(SubtitleError, match="timestamps"):
+        verify_and_merge(prepared, source.replace(old_end, changed_time).encode())
+
+
+@pytest.mark.parametrize("with_fps", [False, True])
+def test_microdvd_sub_is_bridged_through_srt_and_restored_with_original_frames(with_fps):
+    header = "{1}{1}23.976\r\n" if with_fps else ""
+    source_text = header + "{25}{75}Hello|world\r\n{100}{150}Thank you!\r\n"
+    source = prepare_subtitle(source_text.encode(), "movie.sub")
+    site_source = subtitle_for_website(source)
+    assert site_source.extension == ".srt"
+    assert len(site_source.cues) == 2
+    assert b"Hello\nworld" in site_source.utf8
+    translated = site_source.utf8.replace(b"Hello\nworld", b"Hola\nmundo").replace(b"Thank you!", b"Gracias!")
+    restored = restore_subtitle_from_website(source, verify_and_merge(site_source, translated))
+    assert restored.content.decode() == header + "{25}{75}Hola|mundo\r\n{100}{150}Gracias!\r\n"
+    assert not restored.unchanged and restored.cue_count == 2
+
+
+def test_subviewer_sub_is_bridged_and_retains_header_timestamps_and_line_breaks():
+    source_text = (
+        "[INFORMATION]\r\n[TITLE]Original\r\n[END INFORMATION]\r\n[SUBTITLE]\r\n"
+        "00:00:01.00,00:00:03.00\r\nHello[br]world\r\n\r\n"
+        "00:00:04.00,00:00:06.00\r\nThank you!\r\n"
+    )
+    source = prepare_subtitle(source_text.encode(), "movie.sub")
+    site_source = subtitle_for_website(source)
+    assert len(site_source.cues) == 2 and b"Hello\nworld" in site_source.utf8
+    translated = site_source.utf8.replace(b"Hello\nworld", b"Hola\nmundo").replace(b"Thank you!", b"Gracias!")
+    restored = restore_subtitle_from_website(source, verify_and_merge(site_source, translated))
+    assert restored.content.decode() == source_text.replace("Hello[br]world", "Hola[br]mundo").replace("Thank you!", "Gracias!")
+    assert not restored.unchanged and restored.cue_count == 2
+
+
+def test_ass_preserves_source_styles_dialogue_metadata_and_comments():
+    import pysubs2
+
+    source = (
+        "[Script Info]\nTitle: Original\nScriptType: v4.00+\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, "
+        "Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Custom,OriginalFont,24,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Comment: 0,0:00:00.00,0:00:01.00,Custom,,0,0,0,,Original note\n"
+        "Dialogue: 2,0:00:01.00,0:00:02.00,Custom,Speaker,12,13,14,,Hello\n"
+    )
+    # Mimic the site's rebuilding of the ASS file with a default style.
+    downloaded = (
+        "[Script Info]\nTitle: subtitles\nScriptType: v4.00+\n[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hola\n"
+    )
+    result = verify_and_merge(prepare_subtitle(source.encode(), "movie.ass"), downloaded.encode())
+    merged = pysubs2.SSAFile.from_string(result.content.decode(), format_="ass")
+    assert merged.info["Title"] == "Original"
+    assert merged.styles["Custom"].fontname == "OriginalFont"
+    assert merged.events[0].is_comment and merged.events[0].text == "Original note"
+    dialogue = merged.events[1]
+    assert dialogue.style == "Custom" and dialogue.name == "Speaker" and dialogue.layer == 2
+    assert (dialogue.marginl, dialogue.marginr, dialogue.marginv) == (12, 13, 14)
+    assert dialogue.plaintext == "Hola"
+
+
+def test_rejects_unknown_and_binary_subtitle_formats():
+    with pytest.raises(SubtitleError, match="SRT, ASS"):
+        prepare_subtitle(b"hello", "movie.txt")
+    with pytest.raises(SubtitleError):
+        prepare_subtitle(b"\x00\x01\x00\x01", "movie.stl")

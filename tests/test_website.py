@@ -28,6 +28,26 @@ async def test_upload_select_wait_for_late_text_and_download(mock_site, chromium
     assert not result.unchanged
 
 
+@pytest.mark.parametrize("source_text", [
+    "{25}{50}Hello world\n{51}{75}Thank you\n",
+    "{1}{1}23.976\n{25}{50}Hello world\n{51}{75}Thank you\n",
+    ("[INFORMATION]\n[TITLE]Sample\n[END INFORMATION]\n[SUBTITLE]\n"
+     "00:00:01.00,00:00:02.00\nHello world\n\n00:00:03.00,00:00:04.00\nThank you\n"),
+])
+async def test_sub_variants_use_srt_bridge_and_keep_original_timing(mock_site, chromium_path, source_text):
+    source = prepare_subtitle(source_text.encode(), "movie.sub")
+    result = await translator(mock_site, chromium_path).translate(source, "es")
+    assert result.cue_count == 2 and not result.unchanged
+    assert result.content.count(b"Hola mundo") == 2
+    if source_text.startswith("{"):
+        assert b"{25}{50}Hola mundo" in result.content
+        assert b"{51}{75}Hola mundo" in result.content
+    else:
+        assert b"[TITLE]Sample" in result.content
+        assert b"00:00:01.00,00:00:02.00" in result.content
+        assert b"00:00:03.00,00:00:04.00" in result.content
+
+
 async def test_success_message_without_loader_is_accepted(mock_site, chromium_path, source):
     result = await translator(mock_site + "?mode=successonly", chromium_path).translate(source, "hi")
     assert b"Hola mundo" in result.content

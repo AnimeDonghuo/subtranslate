@@ -6,5 +6,16 @@ __pycache__/
 .env
 .env.*
 !.env.example
+# Subtitle files can contain private dialogue. Only the public fixtures are tracked.
 *.srt
+*.ass
+*.sub
+*.sbv
+*.vtt
+*.stl
 !tests/fixtures/*.srt
+!tests/fixtures/*.ass
+!tests/fixtures/*.sub
+!tests/fixtures/*.sbv
+!tests/fixtures/*.vtt
+!tests/fixtures/*.stl

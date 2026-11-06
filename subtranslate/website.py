@@ -15,6 +15,8 @@ from .subtitles import (
     MAX_OUTPUT_BYTES,
     PreparedSubtitle,
     TranslatedSubtitle,
+    restore_subtitle_from_website,
+    subtitle_for_website,
     verify_and_merge,
 )
 
@@ -199,10 +201,11 @@ class WebsiteTranslator:
     async def translate(self, source: PreparedSubtitle, language_code: str) -> TranslatedSubtitle:
         stage = _stage("starting the browser")
         try:
+            site_source = subtitle_for_website(source)
             with tempfile.TemporaryDirectory(prefix="subtranslate-") as temp_dir:
-                input_path = Path(temp_dir) / "input.srt"
-                output_path = Path(temp_dir) / "download.srt"
-                input_path.write_bytes(source.utf8)
+                input_path = Path(temp_dir) / f"input{site_source.extension}"
+                output_path = Path(temp_dir) / f"download{site_source.extension}"
+                input_path.write_bytes(site_source.utf8)
                 async with async_playwright() as playwright:
                     browser = await playwright.chromium.launch(
                         executable_path=self.chromium_path,
@@ -223,7 +226,7 @@ class WebsiteTranslator:
                         await page.locator('input[type="file"]').first.set_input_files(str(input_path))
                         # The uploaded file is parsed on the website's next page.
                         target_cells = page.locator("td.notranslate.target-sub")
-                        await _wait_for_uploaded_cues(page, len(source.cues), self.stage_timeout_ms)
+                        await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
                         selector = page.locator("select.goog-te-combo").first
                         await selector.locator("option").nth(1).wait_for(state="attached", timeout=self.stage_timeout_ms)
                         await _close_vip_popup(page)
@@ -232,7 +235,7 @@ class WebsiteTranslator:
                         before = await target_cells.evaluate_all(
                             "els => els.map(el => (el.textContent || '').trim())"
                         )
-                        if len(before) != len(source.cues):
+                        if len(before) != len(site_source.cues):
                             raise WebsiteError("The website parsed a different number of cues. Please try again.")
 
                         stage = _stage("selecting the target language")
@@ -304,8 +307,10 @@ class WebsiteTranslator:
                     finally:
                         await browser.close()
                 # Refuse missing cues or changed times rather than silently
-                # sending broken subtitles to the user.
-                return verify_and_merge(source, downloaded)
+                # sending broken subtitles to the user. SUB inputs use an SRT
+                # bridge; restore their original frames/timing afterward.
+                verified = verify_and_merge(site_source, downloaded)
+                return restore_subtitle_from_website(source, verified)
         except LanguageUnavailable:
             raise
         except WebsiteError:

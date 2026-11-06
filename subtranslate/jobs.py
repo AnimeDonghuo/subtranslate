@@ -18,6 +18,7 @@ class TranslationJob:
     file_size: int | None
     language_code: str
     language_name: str
+    languages: tuple[tuple[str, str], ...] = ()
 
     @property
     def key(self) -> tuple[int, int, str]:
@@ -53,6 +54,25 @@ class JobQueue:
             return EnqueueResult.FULL
         self._pending.add(job.key)
         return EnqueueResult.ACCEPTED
+
+    def cancel_waiting_batches(self, chat_id: int) -> int:
+        """Remove this user's queued all-language jobs without stopping others."""
+        retained = []
+        removed = 0
+        while not self._queue.empty():
+            job = self._queue.get_nowait()
+            if job.chat_id == chat_id and job.languages:
+                self._pending.discard(job.key)
+                self._queue.task_done()
+                removed += 1
+            else:
+                retained.append(job)
+        for job in retained:
+            # Requeue before marking the old entry done, so join() cannot be
+            # released early while there is retained work waiting.
+            self._queue.put_nowait(job)
+            self._queue.task_done()
+        return removed
 
     async def _run(self) -> None:
         while True:

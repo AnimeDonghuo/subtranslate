@@ -18,7 +18,7 @@ async def _run(args) -> None:
     if not name:
         raise ValueError("Unknown target language code; check subtranslate/languages.tsv")
     path = Path(args.file)
-    source = prepare_subtitle(path.read_bytes())
+    source = prepare_subtitle(path.read_bytes(), path.name)
     async with asyncio.timeout(args.timeout_seconds):
         result = await WebsiteTranslator(
             os.getenv("CHROMIUM_PATH") or None,
@@ -35,7 +35,7 @@ async def _run(args) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Test the actual subtitle website without Telegram")
-    parser.add_argument("file", help="Input .srt file")
+    parser.add_argument("file", help="Input text subtitle: .srt, .ass, .sub, .sbv, .vtt or .stl")
     parser.add_argument("language", help="Target widget language code, e.g. hi or zh-CN")
     parser.add_argument("--output-dir", default=".")
     parser.add_argument("--timeout-seconds", type=int, default=900, help="Overall deadline (60–1,000 seconds)")
