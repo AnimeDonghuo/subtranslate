@@ -34,6 +34,12 @@ class LanguageUnavailable(WebsiteError):
     pass
 
 
+def _stage(name: str) -> str:
+    # Stage names are fixed strings: never log subtitle text or filenames.
+    logger.info("Subtitle website: %s", name)
+    return name
+
+
 async def _close_vip_popup(page) -> None:
     close = page.locator(".popup-vip.notranslate a.close").first
     try:
@@ -124,6 +130,23 @@ PROGRESS_FINISHED = r"""() => {
     return state.loaderFinished || (!state.successInitiallyVisible && success);
 }"""
 
+PROGRESS_DIAGNOSTICS = r"""() => {
+    const visible = (el) => !!(el && el.getClientRects().length &&
+        getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).opacity !== '0');
+    const loader = document.querySelector('#loader');
+    const success = document.querySelector('h4.skiptranslate.success-msg');
+    const state = window.__subtranslateWatch;
+    return {
+        loaderPresent: !!loader,
+        loaderVisible: visible(loader),
+        successPresent: !!success,
+        successVisible: visible(success),
+        successInitiallyVisible: state?.successInitiallyVisible ?? null,
+        loaderSeen: state?.loaderSeen ?? null,
+        loaderFinished: state?.loaderFinished ?? null,
+    };
+}"""
+
 TEXT_CHANGED = r"""(before) => {
     const after = document.querySelectorAll('td.notranslate.target-sub');
     return before.some((text, index) => {
@@ -165,7 +188,7 @@ class WebsiteTranslator:
         self.settle_timeout_ms = settle_timeout_ms
 
     async def translate(self, source: PreparedSubtitle, language_code: str) -> TranslatedSubtitle:
-        stage = "starting the browser"
+        stage = _stage("starting the browser")
         try:
             with tempfile.TemporaryDirectory(prefix="subtranslate-") as temp_dir:
                 input_path = Path(temp_dir) / "input.srt"
@@ -185,9 +208,9 @@ class WebsiteTranslator:
                         page = await context.new_page()
                         page.set_default_timeout(self.stage_timeout_ms)
 
-                        stage = "opening the subtitle site"
+                        stage = _stage("opening the subtitle site")
                         await page.goto(self.site_url, wait_until="domcontentloaded", timeout=self.stage_timeout_ms)
-                        stage = "uploading and parsing the subtitle"
+                        stage = _stage("uploading and parsing the subtitle")
                         await page.locator('input[type="file"]').first.set_input_files(str(input_path))
                         # The uploaded file is parsed on the website's next page.
                         target_cells = page.locator("td.notranslate.target-sub")
@@ -203,7 +226,7 @@ class WebsiteTranslator:
                         if len(before) != len(source.cues):
                             raise WebsiteError("The website parsed a different number of cues. Please try again.")
 
-                        stage = "selecting the target language"
+                        stage = _stage("selecting the target language")
                         values = await selector.locator("option").evaluate_all("els => els.map(el => el.value)")
                         if language_code not in values:
                             raise LanguageUnavailable(
@@ -212,15 +235,24 @@ class WebsiteTranslator:
                         await selector.select_option(value=language_code)
                         await _close_vip_popup(page)
 
-                        stage = "translating"
+                        stage = _stage("translating")
                         # Install before clicking so even a very fast loader is observed.
                         await page.evaluate(PROGRESS_WATCH)
                         await _close_vip_popup(page)
                         translate_button = await _button(page, "Translate", 1)
                         await translate_button.click()
-                        await page.wait_for_function(
-                            PROGRESS_FINISHED, timeout=self.translation_timeout_ms, polling=250
-                        )
+                        try:
+                            await page.wait_for_function(
+                                PROGRESS_FINISHED, timeout=self.translation_timeout_ms, polling=250
+                            )
+                        except PlaywrightTimeout:
+                            try:
+                                # Only booleans about the UI, never subtitle content.
+                                state = await page.evaluate(PROGRESS_DIAGNOSTICS)
+                                logger.warning("Website completion state: %s", state)
+                            except PlaywrightError:
+                                logger.info("Website completion state could not be inspected")
+                            raise
                         # Some site versions signal success early or need a second
                         # click for very short files. Retry once only if no cue has
                         # changed; same-language translations may also be unchanged.
@@ -250,7 +282,7 @@ class WebsiteTranslator:
                         except PlaywrightTimeout:
                             raise WebsiteError("The website's translation did not finish settling. Please try again.")
 
-                        stage = "downloading"
+                        stage = _stage("downloading")
                         await _close_vip_popup(page)
                         download_button = await _button(page, "Download", 2)
                         async with page.expect_download(timeout=self.stage_timeout_ms) as download_info:

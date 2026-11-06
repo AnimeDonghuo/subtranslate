@@ -38,9 +38,12 @@ async def test_same_text_warns_instead_of_being_rejected(mock_site, chromium_pat
     assert result.unchanged
 
 
-async def test_hidden_loader_is_not_a_false_success(mock_site, chromium_path, source):
+async def test_hidden_loader_is_not_a_false_success(mock_site, chromium_path, source, caplog):
     with pytest.raises(WebsiteError, match="timed out"):
         await translator(mock_site + "?mode=nosignal", chromium_path).translate(source, "es")
+    assert "Website completion state" in caplog.text
+    assert "'loaderSeen': False" in caplog.text
+    assert "Hello world" not in caplog.text
 
 
 async def test_rejects_unavailable_language_and_bad_timing(mock_site, chromium_path, source):

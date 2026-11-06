@@ -57,7 +57,7 @@ The browser integration tests use a **local mock website**, not the real transla
 TEST_CHROMIUM_PATH=/usr/bin/chromium python -m pytest -q
 ```
 
-The included CI workflow is configured to build the deployment image and run a complete **mocked** Telegram → browser → Telegram flow with a 3,000-cue, 999,786-byte file under a 512,000,000-byte memory limit, no swap, and 0.1 CPU. The Docker build has not been run in the development sandbox. You can reproduce the container check locally with Docker:
+The included CI workflow builds the deployment image and runs a complete **mocked** Telegram → browser → Telegram flow with a 3,000-cue, 999,786-byte file under a 512,000,000-byte memory limit, no swap, and 0.1 CPU. That container check has passed on GitHub Actions. You can reproduce it locally with Docker:
 
 ```sh
 docker build -t subtranslate-local .
@@ -75,7 +75,7 @@ For a manual test of the **actual** website from a machine with Internet access,
 python -m subtranslate.smoke tests/fixtures/sample.srt hi --output-dir .
 ```
 
-Use `CHROMIUM_PATH=/usr/bin/chromium` if using system Chromium. The command refuses to overwrite an existing output file.
+Use `CHROMIUM_PATH=/usr/bin/chromium` if using system Chromium. The command logs the current website stage and refuses to overwrite an existing output file. Use `--timeout-seconds` and `--translation-timeout-seconds` to shorten its deadlines when diagnosing a stalled site.
 
 There is also an opt-in **Live website smoke test** in GitHub Actions. To run it from an unmerged branch, include `[live-site-test]` in the pushed commit's message. Once the workflow file exists on the default branch, you can instead open **Actions → Live website smoke test (manual) → Run workflow**. It uploads a tiny, non-private English sample to the real site and checks that the Hindi output changed while preserving timestamps; it does not need a bot token or test Telegram/Koyeb. The site may block GitHub's runner or be unavailable, in which case the check will fail.
 
