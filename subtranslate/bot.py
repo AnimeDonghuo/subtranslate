@@ -18,6 +18,7 @@ from telegram.ext import (
 from .config import Settings
 from .jobs import EnqueueResult, JobQueue, TranslationJob
 from .languages import LanguageCatalog, confirm_all_keyboard, language_keyboard
+from .progress import ProgressMessage
 from .subtitles import (
     MAX_INPUT_BYTES,
     SubtitleError,
@@ -231,12 +232,12 @@ class BotService:
             await query.answer(f"Queued for {name}")
             if languages:
                 await message.reply_text(
-                    f"Queued {len(languages)} languages. I’ll send each file one by one. "
-                    "This may take hours; use /cancel to stop."
+                    f"Queued {len(languages)} languages. A stage bar will appear when the batch starts. "
+                    "I’ll send each file one by one. This may take hours; use /cancel to stop."
                 )
             else:
                 await message.reply_text(
-                    f"Queued for {name}. I’ll send the file here when it’s ready. "
+                    f"Queued for {name}. A stage bar will appear when the job starts. "
                     "This may take several minutes on the free instance."
                 )
 
@@ -256,6 +257,11 @@ class BotService:
             logger.warning("Could not send a Telegram status (%s)", type(exc).__name__)
             return False
 
+    async def _finish_progress(self, progress: ProgressMessage, chat_id: int, text: str) -> None:
+        if not await progress.finish(text):
+            # If Telegram refuses an edit, try a normal message instead.
+            await self._notice(chat_id, text)
+
     async def _download_source(self, job: TranslationJob):
         telegram_file = await self.bot.get_file(job.file_id)
         file_size = telegram_file.file_size if telegram_file.file_size is not None else job.file_size
@@ -268,7 +274,12 @@ class BotService:
 
     async def _send_result(self, job: TranslationJob, name: str, result, progress: str = "") -> None:
         filename = translated_filename(job.file_name, name)
-        caption = f"{progress}{name} · {result.cue_count:,} cues\nPlease review the machine translation."
+        cue_word = "cue" if result.cue_count == 1 else "cues"
+        caption = f"{progress}{name} · {result.cue_count:,} {cue_word} checked"
+        if result.changed_cues is not None:
+            caption += (f"\n{result.changed_cues:,}/{result.cue_count:,} cue texts differ from the original. "
+                        "Names or shared words may stay the same.")
+        caption += "\nDownloaded from the subtitle website. Please review the machine translation."
         if result.unchanged:
             caption += (
                 "\n\n⚠️ The website returned unchanged text. It may already be in the target "
@@ -287,23 +298,31 @@ class BotService:
         if job.languages:
             await self._process_all(job)
             return
-        if not await self._notice(job.chat_id, f"Translating to {job.language_name} now…"):
+        progress = await ProgressMessage.start(self.bot, job.chat_id, job.language_name)
+        if progress is None:
             return
         try:
-            async with asyncio.timeout(self.settings.translation_timeout_seconds):
-                source = await self._download_source(job)
-                result = await self.translator.translate(source, job.language_code)
-                await self._send_result(job, job.language_name, result)
-        except (SubtitleError, WebsiteError) as exc:
-            await self._notice(job.chat_id, f"Could not translate: {exc}\n\nYou can tap a language button to try again.")
-        except TimeoutError:
-            await self._notice(job.chat_id, "Translation timed out. Try again or use a smaller subtitle.")
-        except TelegramError as exc:
-            logger.warning("Telegram file transfer failed (%s)", type(exc).__name__)
-            await self._notice(job.chat_id, "Telegram could not download or send the file. Please resend it and try again.")
-        except Exception as exc:  # noqa: BLE001 - notify the user on unexpected job failures
-            logger.error("Translation failed (%s)", type(exc).__name__)
-            await self._notice(job.chat_id, "Something went wrong while translating. Please try again later.")
+            try:
+                async with asyncio.timeout(self.settings.translation_timeout_seconds):
+                    source = await self._download_source(job)
+                    result = await self.translator.translate(source, job.language_code, on_progress=progress.set_stage)
+                    progress.set_stage("sending result")
+                    await self._send_result(job, job.language_name, result)
+                cue_word = "cue" if result.cue_count == 1 else "cues"
+                final = f"✅ {job.language_name} complete. Sent the file with {result.cue_count:,} checked {cue_word}."
+            except (SubtitleError, WebsiteError) as exc:
+                final = f"Could not translate: {exc}\n\nYou can tap a language button to try again."
+            except TimeoutError:
+                final = "Translation timed out. Try again or use a smaller subtitle."
+            except TelegramError as exc:
+                logger.warning("Telegram file transfer failed (%s)", type(exc).__name__)
+                final = "Telegram could not download or send the file. Please resend it and try again."
+            except Exception as exc:  # noqa: BLE001 - notify the user on unexpected job failures
+                logger.error("Translation failed (%s)", type(exc).__name__)
+                final = "Something went wrong while translating. Please try again later."
+            await self._finish_progress(progress, job.chat_id, final)
+        finally:
+            await progress.close()
 
     async def _keep_active_batch_awake(self) -> None:
         # A batch is real work, but Koyeb only sees incoming HTTP traffic. Ping
@@ -323,14 +342,14 @@ class BotService:
         cancel = asyncio.Event()
         self._batch_cancellations[job.chat_id] = cancel
         heartbeat = None
+        progress = None
         delivered = skipped = failed = consecutive_failures = 0
         skipped_names: list[str] = []
         failed_names: list[str] = []
-        stopped = False
+        stopped = session_failed = repeated_failures = False
         try:
-            if not await self._notice(
-                job.chat_id, f"Starting {len(job.languages)} languages, one at a time. Use /cancel to stop."
-            ):
+            progress = await ProgressMessage.start(self.bot, job.chat_id, "all languages", batch_total=len(job.languages))
+            if progress is None:
                 return
             heartbeat = asyncio.create_task(self._keep_active_batch_awake(), name="batch-heartbeat")
             try:
@@ -338,38 +357,53 @@ class BotService:
                     source = await self._download_source(job)
             except Exception as exc:  # noqa: BLE001 - notify the user if the batch cannot start
                 logger.warning("Could not start all-language batch (%s)", type(exc).__name__)
-                await self._notice(job.chat_id, "Could not read the subtitle file. Please resend it and try again.")
+                await self._finish_progress(progress, job.chat_id, "Could not read the subtitle file. Please resend it and try again.")
                 return
-            for number, (code, name) in enumerate(job.languages, start=1):
-                if cancel.is_set():
-                    stopped = True
-                    break
+            if cancel.is_set():
+                stopped = True
+            else:
                 try:
-                    async with asyncio.timeout(self.settings.translation_timeout_seconds):
-                        result = await self.translator.translate(source, code)
-                        await self._send_result(job, name, result, progress=f"{number}/{len(job.languages)} · ")
-                    delivered += 1
-                    consecutive_failures = 0
-                except LanguageUnavailable:
-                    skipped += 1
-                    skipped_names.append(name)
-                    # A stale catalog entry is not a website outage.
-                    consecutive_failures = 0
-                except TelegramError as exc:
-                    failed += 1
-                    failed_names.append(name)
-                    stopped = True
-                    logger.warning("Telegram batch delivery failed (%s)", type(exc).__name__)
-                    break
-                except Exception as exc:  # noqa: BLE001 - prevent repeated failures from running all day
-                    failed += 1
-                    failed_names.append(name)
-                    consecutive_failures += 1
-                    logger.warning("Batch language failed (%s)", type(exc).__name__)
-                    if consecutive_failures >= 3:
-                        stopped = True
-                        await self._notice(job.chat_id, "The website failed repeatedly; stopping the batch. Try again later.")
-                        break
+                    progress.set_stage("starting the browser")
+                    # One browser process is reused for sequential languages;
+                    # each language gets a clean context and a fresh download.
+                    async with self.translator.session() as translator:
+                        for number, (code, name) in enumerate(job.languages, start=1):
+                            if cancel.is_set():
+                                stopped = True
+                                break
+                            progress.set_language(name, number, delivered + skipped + failed)
+                            progress.set_stage("starting the browser")
+                            try:
+                                async with asyncio.timeout(self.settings.translation_timeout_seconds):
+                                    result = await translator.translate(source, code, on_progress=progress.set_stage)
+                                    progress.set_stage("sending result")
+                                    await self._send_result(job, name, result, progress=f"{number}/{len(job.languages)} · ")
+                                delivered += 1
+                                consecutive_failures = 0
+                            except LanguageUnavailable:
+                                skipped += 1
+                                skipped_names.append(name)
+                                # A stale catalog entry is not a website outage.
+                                consecutive_failures = 0
+                            except TelegramError as exc:
+                                failed += 1
+                                failed_names.append(name)
+                                stopped = True
+                                logger.warning("Telegram batch delivery failed (%s)", type(exc).__name__)
+                                break
+                            except Exception as exc:  # noqa: BLE001 - prevent repeated failures from running all day
+                                failed += 1
+                                failed_names.append(name)
+                                consecutive_failures += 1
+                                logger.warning("Batch language failed (%s)", type(exc).__name__)
+                                if consecutive_failures >= 3:
+                                    stopped = repeated_failures = True
+                                    break
+                            finally:
+                                progress.set_completed(delivered + skipped + failed)
+                except Exception as exc:  # noqa: BLE001 - session startup/cleanup can also fail
+                    stopped = session_failed = True
+                    logger.warning("Batch browser session failed (%s)", type(exc).__name__)
             if cancel.is_set():
                 stopped = True
             suffix = "Stopped" if stopped else "Finished"
@@ -379,13 +413,19 @@ class BotService:
                     summary += f"\n{label}: {', '.join(names[:8])}"
                     if len(names) > 8:
                         summary += f" and {len(names) - 8} more"
+            if repeated_failures:
+                summary += "\nThe website failed repeatedly; try again later."
+            if session_failed:
+                summary += "\nThe browser session failed; try again later."
             if stopped or failed:
                 summary += "\nUse the language buttons to retry."
-            await self._notice(job.chat_id, summary)
+            await self._finish_progress(progress, job.chat_id, summary)
         finally:
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
+            if progress is not None:
+                await progress.close()
             self._batch_cancellations.pop(job.chat_id, None)
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:

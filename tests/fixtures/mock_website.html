@@ -77,7 +77,8 @@ function downloadFile() {
   const result = blocks.map((block, i) => {
     let time = block[1];
     if (mode === 'badtime') time = time.replace('02,000', '02,100');
-    return block[0] + '\n' + time + '\n' + cells[i].textContent;
+    const content = mode === 'download-different' ? 'Text from the downloaded file' : cells[i].textContent;
+    return block[0] + '\n' + time + '\n' + content;
   }).join('\n\n') + '\n\n';
   const url = URL.createObjectURL(new Blob([result], {type: 'text/plain'}));
   const link = document.createElement('a'); link.href = url; link.download = 'translated.srt';

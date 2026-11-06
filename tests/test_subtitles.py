@@ -40,16 +40,34 @@ def test_unicode_and_utf16_input():
         assert prepared.cues[1].content == "مرحبا بالعالم"
 
 
-def test_merge_preserves_source_indices_times_and_metadata():
+def test_srt_sends_the_actual_utf8_download_without_rewriting_it():
     prepared = prepare_subtitle(SOURCE.encode())
-    result = verify_and_merge(prepared, TRANSLATED.encode())
-    cues = list(srt.parse(result.content.decode("utf-8")))
-    assert [c.index for c in cues] == [10, 25]
+    # The site can re-number cues, use CRLF, or include a UTF-8 BOM. Keep its
+    # downloaded bytes rather than re-creating an SRT from the page preview.
+    downloaded = b"\xef\xbb\xbf" + TRANSLATED.replace("\n", "\r\n").encode()
+    result = verify_and_merge(prepared, downloaded)
+    assert result.content == downloaded
+    cues = list(srt.parse(result.content.decode("utf-8-sig")))
+    assert [c.index for c in cues] == [1, 2]
     assert [(c.start, c.end) for c in cues] == [(c.start, c.end) for c in prepared.cues]
-    assert cues[0].proprietary == prepared.cues[0].proprietary
     assert [c.content for c in cues] == ["Hello, world!", "Welcome!"]
+    assert result.cue_count == 2 and result.changed_cues == 2 and not result.unchanged
+
+
+def test_reports_changed_cue_count_without_claiming_unchanged_names_failed():
+    source = prepare_subtitle(b"1\n00:00:01,000 --> 00:00:02,000\nAlice\n\n"
+                              b"2\n00:00:03,000 --> 00:00:04,000\nHello\n\n")
+    downloaded = source.utf8.replace(b"Hello", b"Hola")
+    result = verify_and_merge(source, downloaded)
+    assert result.cue_count == 2 and result.changed_cues == 1 and not result.unchanged
+    assert result.content == downloaded
+
+
+def test_srt_converts_non_utf8_download_to_utf8_after_validation():
+    prepared = prepare_subtitle(SOURCE.encode())
+    result = verify_and_merge(prepared, TRANSLATED.encode("utf-16"))
+    assert result.content == TRANSLATED.encode("utf-8")
     assert result.cue_count == 2
-    assert not result.unchanged
 
 
 def test_unchanged_output_is_reported_not_silently_claimed_translated():

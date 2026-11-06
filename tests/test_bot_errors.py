@@ -24,7 +24,8 @@ def service():
     translator = SimpleNamespace(translate=AsyncMock())
     result = BotService(settings, LanguageCatalog(), translator)
     result.bot = SimpleNamespace(
-        send_message=AsyncMock(), get_file=AsyncMock(), send_document=AsyncMock(),
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=123)),
+        edit_message_text=AsyncMock(), get_file=AsyncMock(), send_document=AsyncMock(),
     )
     return result
 
@@ -37,7 +38,7 @@ def telegram_file(data: bytes, size: int | None = None):
 
 
 def last_notice(service: BotService) -> str:
-    return service.bot.send_message.await_args.kwargs["text"]
+    return service.bot.edit_message_text.await_args.kwargs["text"]
 
 
 async def test_invalid_srt_is_rejected_before_upload_to_site(service):
@@ -71,7 +72,7 @@ async def test_timeout_is_reported_and_browser_coroutine_cancelled(service):
     service.bot.get_file.return_value = telegram_file(VALID_SRT)
     cancelled = asyncio.Event()
 
-    async def slow_translate(source, code):
+    async def slow_translate(source, code, *, on_progress=None):
         try:
             await asyncio.Event().wait()
         finally:
@@ -98,6 +99,25 @@ async def test_unchanged_file_has_a_warning_in_the_caption(service):
     send = service.bot.send_document.await_args.kwargs
     assert "unchanged text" in send["caption"]
     assert send["document"].filename == "movie.Hindi.srt"
+
+
+async def test_caption_reports_changed_text_as_a_comparison_not_a_translation_guarantee(service):
+    service.bot.get_file.return_value = telegram_file(VALID_SRT)
+    service.translator.translate.return_value = TranslatedSubtitle(VALID_SRT, 2, unchanged=False, changed_cues=1)
+    await service.process_job(JOB)
+    caption = service.bot.send_document.await_args.kwargs["caption"]
+    assert "2 cues checked" in caption and "1/2 cue texts differ" in caption
+    assert "may stay the same" in caption and "Please review" in caption
+
+
+async def test_status_edit_failure_does_not_discard_a_translated_file(service, caplog):
+    service.bot.get_file.return_value = telegram_file(VALID_SRT)
+    service.bot.edit_message_text.side_effect = TelegramError("DO_NOT_LOG_THIS_TOKEN")
+    service.translator.translate.return_value = TranslatedSubtitle(VALID_SRT, 1, unchanged=False)
+    await service.process_job(JOB)
+    service.bot.send_document.assert_awaited_once()
+    assert "Hindi complete" in service.bot.send_message.await_args.kwargs["text"]
+    assert "DO_NOT_LOG_THIS_TOKEN" not in caplog.text
 
 
 async def test_job_does_not_run_when_status_cannot_be_delivered(service):

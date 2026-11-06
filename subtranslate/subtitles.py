@@ -38,6 +38,7 @@ class TranslatedSubtitle:
     content: bytes
     cue_count: int
     unchanged: bool
+    changed_cues: int | None = None
 
 
 def decode_subtitle(data: bytes) -> str:
@@ -235,46 +236,46 @@ def restore_subtitle_from_website(source: PreparedSubtitle, site_result: Transla
     return verify_and_merge(source, original.encode("utf-8"))
 
 
+def _download_as_utf8(downloaded: bytes, text: str) -> bytes:
+    """Keep the site's bytes when already UTF-8; convert other encodings safely."""
+    try:
+        decoded = downloaded.decode("utf-8")
+        if "\x00" not in decoded:
+            return downloaded
+    except UnicodeDecodeError:
+        pass
+    return text.encode("utf-8")
+
+
 def verify_and_merge(source: PreparedSubtitle, downloaded: bytes) -> TranslatedSubtitle:
+    """Validate the actual download; merge only formats needing metadata restoration."""
     if len(downloaded) > MAX_OUTPUT_BYTES:
         raise SubtitleError("The website returned an unexpectedly large file. Please try again.")
     text = decode_subtitle(downloaded)
     translated = _parse(text, is_output=True) if source.extension == ".srt" else _parse_other(text, source.extension)
     if len(source.cues) != len(translated):
         raise SubtitleError("The website changed the number of subtitle cues, so the result was not sent. Please try again.")
-    if source.extension != ".srt":
-        for original, result in zip(source.cues, translated):
-            if original.start != result.start or original.end != result.end:
-                raise SubtitleError("The website changed subtitle timestamps, so the result was not sent. Please try again.")
-        unchanged = all(a.content.strip() == b.content.strip() for a, b in zip(source.cues, translated))
-        if source.extension == ".ass":
-            # The site rebuilds ASS downloads with default styles. Retain the
-            # source styles, dialogue metadata and comments while replacing its
-            # dialogue text; inline override tags may still be changed by the site.
-            original_ass = pysubs2.SSAFile.from_string(source.utf8.decode("utf-8"), format_="ass")
-            result_ass = pysubs2.SSAFile.from_string(text, format_="ass")
-            original_events = (event for event in original_ass.events if not event.is_comment)
-            result_events = (event for event in result_ass.events if not event.is_comment)
-            for original_event, result_event in zip(original_events, result_events):
-                original_event.text = result_event.text
-            text = original_ass.to_string(format_="ass")
-        return TranslatedSubtitle(content=text.encode("utf-8"), cue_count=len(translated), unchanged=unchanged)
-    merged = []
-    for position, (original, result) in enumerate(zip(source.cues, translated), start=1):
+    for original, result in zip(source.cues, translated):
         if original.start != result.start or original.end != result.end:
             raise SubtitleError("The website changed subtitle timestamps, so the result was not sent. Please try again.")
-        merged.append(srt.Subtitle(
-            index=original.index if original.index is not None else position,
-            start=original.start,
-            end=original.end,
-            content=result.content,
-            proprietary=original.proprietary,
-        ))
-    unchanged = all(a.content.strip() == b.content.strip() for a, b in zip(source.cues, translated))
-    # Do not reorder/reindex: the source's timing, cue order, and indices belong
-    # to the user. Only the website's translated text is substituted.
-    content = srt.compose(merged, reindex=False, eol="\n").encode("utf-8")
-    return TranslatedSubtitle(content=content, cue_count=len(merged), unchanged=unchanged)
+    changed_cues = sum(a.content.strip() != b.content.strip() for a, b in zip(source.cues, translated))
+    if source.extension == ".ass":
+        # The site rebuilds ASS downloads with default styles. Retain the
+        # source styles, dialogue metadata and comments while replacing its
+        # dialogue text; inline override tags may still be changed by the site.
+        original_ass = pysubs2.SSAFile.from_string(source.utf8.decode("utf-8"), format_="ass")
+        result_ass = pysubs2.SSAFile.from_string(text, format_="ass")
+        original_events = (event for event in original_ass.events if not event.is_comment)
+        result_events = (event for event in result_ass.events if not event.is_comment)
+        for original_event, result_event in zip(original_events, result_events):
+            original_event.text = result_event.text
+        content = original_ass.to_string(format_="ass").encode("utf-8")
+    else:
+        # Send the website's actual Download file, not its on-page preview.
+        # Keep byte-for-byte output when it is UTF-8.
+        content = _download_as_utf8(downloaded, text)
+    return TranslatedSubtitle(content=content, cue_count=len(translated), unchanged=changed_cues == 0,
+                              changed_cues=changed_cues)
 
 
 def translated_filename(original: str, language: str) -> str:

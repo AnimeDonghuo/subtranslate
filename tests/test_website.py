@@ -28,6 +28,56 @@ async def test_upload_select_wait_for_late_text_and_download(mock_site, chromium
     assert not result.unchanged
 
 
+async def test_output_comes_from_download_button_not_preview(mock_site, chromium_path, source):
+    result = await translator(mock_site + "?mode=download-different", chromium_path).translate(source, "es")
+    assert result.content == (
+        b"10\n00:00:01,000 --> 00:00:02,000\nText from the downloaded file\n\n"
+    )
+    assert b"Hola mundo" not in result.content  # The mock's preview text.
+
+
+async def test_batch_reuses_browser_isolates_contexts_and_recycles_it(mock_site, chromium_path, source):
+    browser = translator(mock_site, chromium_path)
+    stages = []
+    async with browser.session() as session:
+        session.max_browser_uses = 2
+        first = await session.translate(source, "es", on_progress=stages.append)
+        first_browser = session._browser
+        assert first.cue_count == 1 and first_browser.is_connected()
+        assert not first_browser.contexts
+        second = await session.translate(source, "hi")
+        assert second.cue_count == 1 and session._browser is first_browser
+        assert not first_browser.contexts
+        third = await session.translate(source, "es")
+        second_browser = session._browser
+        assert third.cue_count == 1 and second_browser is not first_browser
+        assert not first_browser.is_connected() and not second_browser.contexts
+    assert not second_browser.is_connected()
+    assert stages == [
+        "starting the browser", "opening the subtitle site", "uploading and parsing the subtitle",
+        "selecting the target language", "translating", "waiting for translation to settle",
+        "downloading", "validating the downloaded file",
+    ]
+
+
+async def test_session_restarts_a_disconnected_browser():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, Mock
+
+    from subtranslate.website import WebsiteSession
+
+    old = SimpleNamespace(is_connected=Mock(return_value=False), close=AsyncMock())
+    new = SimpleNamespace(is_connected=Mock(return_value=True), close=AsyncMock())
+    playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(side_effect=[old, new])))
+    session = WebsiteSession(SimpleNamespace(chromium_path=None), playwright)
+    assert await session.browser() is old
+    assert await session.browser() is new
+    old.close.assert_awaited_once()
+    assert playwright.chromium.launch.await_count == 2
+    await session._close_browser()
+    new.close.assert_awaited_once()
+
+
 @pytest.mark.parametrize("source_text", [
     "{25}{50}Hello world\n{51}{75}Thank you\n",
     "{1}{1}23.976\n{25}{50}Hello world\n{51}{75}Thank you\n",

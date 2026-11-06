@@ -5,6 +5,8 @@ import logging
 import re
 import secrets
 import tempfile
+from collections.abc import Callable
+from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -37,9 +39,14 @@ class LanguageUnavailable(WebsiteError):
     pass
 
 
-def _stage(name: str) -> str:
+def _stage(name: str, on_progress: Callable[[str], None] | None = None) -> str:
     # Stage names are fixed strings: never log subtitle text or filenames.
     logger.info("Subtitle website: %s", name)
+    if on_progress is not None:
+        try:
+            on_progress(name)
+        except Exception as exc:  # noqa: BLE001 - status updates must not break a translation
+            logger.warning("Could not update translation progress (%s)", type(exc).__name__)
     return name
 
 
@@ -128,6 +135,7 @@ PROGRESS_WATCH = r"""() => {
                 mutation.target : mutation.target.parentElement;
             if (el && el.closest && el.closest('td.notranslate.target-sub')) {
                 state.lastTextChange = performance.now();
+                break; // One timestamp per mutation batch is enough, even for thousands of cues.
             }
         }
     });
@@ -161,7 +169,17 @@ PROGRESS_DIAGNOSTICS = r"""() => {
     };
 }"""
 
-TEXT_CHANGED = r"""(before) => {
+CACHE_INITIAL_CUES = r"""() => {
+    // Keep this only in the page: it is used to detect changes, never to
+    // construct the output file. Avoid transferring all subtitle text twice.
+    const cells = document.querySelectorAll('td.notranslate.target-sub');
+    window.__subtranslateBefore = Array.from(cells, el => (el.textContent || '').trim());
+    return cells.length;
+}"""
+
+TEXT_CHANGED = r"""() => {
+    const before = window.__subtranslateBefore;
+    if (!before) return false;
     const after = document.querySelectorAll('td.notranslate.target-sub');
     return before.some((text, index) => {
         const current = (after[index]?.textContent || '').trim();
@@ -176,6 +194,45 @@ TEXT_STABLE = r"""(settleMs) => {
     return window.__subtranslateWatch && !loading &&
         performance.now() - window.__subtranslateWatch.lastTextChange >= settleMs;
 }"""
+
+
+class WebsiteSession:
+    """Reuse a browser for a batch, but isolate every language in a fresh context."""
+
+    def __init__(self, translator, playwright, *, max_browser_uses: int = 10) -> None:
+        self.translator = translator
+        self.playwright = playwright
+        self.max_browser_uses = max_browser_uses
+        self._browser = None
+        self._uses = 0
+
+    async def _close_browser(self) -> None:
+        if self._browser is not None:
+            try:
+                await self._browser.close()
+            except PlaywrightError as exc:
+                logger.warning("Could not close the subtitle browser (%s)", type(exc).__name__)
+            finally:
+                self._browser = None
+                self._uses = 0
+
+    async def browser(self):
+        if self._browser is not None and (not self._browser.is_connected() or self._uses >= self.max_browser_uses):
+            # Recycling periodically bounds long-batch memory growth and also
+            # restarts a browser that crashed between languages.
+            await self._close_browser()
+        if self._browser is None:
+            self._browser = await self.playwright.chromium.launch(
+                executable_path=self.translator.chromium_path,
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+        self._uses += 1
+        return self._browser
+
+    async def translate(self, source: PreparedSubtitle, language_code: str, *,
+                        on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:
+        return await self.translator._translate_in_session(source, language_code, self, on_progress)
 
 
 class WebsiteTranslator:
@@ -201,8 +258,28 @@ class WebsiteTranslator:
         self.settle_ms = settle_ms
         self.settle_timeout_ms = settle_timeout_ms
 
-    async def translate(self, source: PreparedSubtitle, language_code: str) -> TranslatedSubtitle:
-        stage = _stage("starting the browser")
+    @asynccontextmanager
+    async def session(self):
+        """Open one Playwright session for one or several sequential languages."""
+        try:
+            async with async_playwright() as playwright:
+                session = WebsiteSession(self, playwright)
+                try:
+                    yield session
+                finally:
+                    await session._close_browser()
+        except (PlaywrightError, OSError) as exc:
+            logger.warning("Could not open or close the subtitle browser (%s)", type(exc).__name__)
+            raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from exc
+
+    async def translate(self, source: PreparedSubtitle, language_code: str, *,
+                        on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:
+        async with self.session() as session:
+            return await session.translate(source, language_code, on_progress=on_progress)
+
+    async def _translate_in_session(self, source: PreparedSubtitle, language_code: str, session: WebsiteSession,
+                                    on_progress: Callable[[str], None] | None) -> TranslatedSubtitle:
+        stage = _stage("starting the browser", on_progress)
         try:
             site_source = subtitle_for_website(source)
             with tempfile.TemporaryDirectory(prefix="subtranslate-") as temp_dir:
@@ -211,119 +288,114 @@ class WebsiteTranslator:
                 input_path = Path(temp_dir) / f"subtitle-{secrets.token_hex(12)}{site_source.extension}"
                 output_path = Path(temp_dir) / f"download{site_source.extension}"
                 input_path.write_bytes(site_source.utf8)
-                async with async_playwright() as playwright:
-                    browser = await playwright.chromium.launch(
-                        executable_path=self.chromium_path,
-                        headless=True,
-                        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
-                    )
+                browser = await session.browser()
+                context = await browser.new_context(
+                    accept_downloads=True, locale="en-US", service_workers="block"
+                )
+                try:
+                    await context.route("**/*", _block_unnecessary_requests)
+                    page = await context.new_page()
+                    page.set_default_timeout(self.stage_timeout_ms)
+
+                    stage = _stage("opening the subtitle site", on_progress)
+                    await page.goto(self.site_url, wait_until="domcontentloaded", timeout=self.stage_timeout_ms)
+                    stage = _stage("uploading and parsing the subtitle", on_progress)
+                    await page.locator('input[type="file"]').first.set_input_files(str(input_path))
+                    # The uploaded file is parsed on the website's next page.
                     try:
-                        context = await browser.new_context(
-                            accept_downloads=True, locale="en-US", service_workers="block"
-                        )
-                        await context.route("**/*", _block_unnecessary_requests)
-                        page = await context.new_page()
-                        page.set_default_timeout(self.stage_timeout_ms)
-
-                        stage = _stage("opening the subtitle site")
+                        await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
+                    except PlaywrightTimeout:
+                        # Transient uploads sometimes never render their table.
+                        # Retry only before translation has started.
+                        logger.info("Retrying the subtitle upload once")
                         await page.goto(self.site_url, wait_until="domcontentloaded", timeout=self.stage_timeout_ms)
-                        stage = _stage("uploading and parsing the subtitle")
                         await page.locator('input[type="file"]').first.set_input_files(str(input_path))
-                        # The uploaded file is parsed on the website's next page.
-                        target_cells = page.locator("td.notranslate.target-sub")
-                        try:
-                            await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
-                        except PlaywrightTimeout:
-                            # Transient uploads sometimes never render their table.
-                            # Retry only before translation has started.
-                            logger.info("Retrying the subtitle upload once")
-                            await page.goto(self.site_url, wait_until="domcontentloaded", timeout=self.stage_timeout_ms)
-                            await page.locator('input[type="file"]').first.set_input_files(str(input_path))
-                            await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
-                        selector = page.locator("select.goog-te-combo").first
-                        await selector.locator("option").nth(1).wait_for(state="attached", timeout=self.stage_timeout_ms)
-                        await _close_vip_popup(page)
-                        # Compare every cue: the first few may be names or numbers
-                        # which legitimately stay the same after translation.
-                        before = await target_cells.evaluate_all(
-                            "els => els.map(el => (el.textContent || '').trim())"
+                        await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
+                    selector = page.locator("select.goog-te-combo").first
+                    await selector.locator("option").nth(1).wait_for(state="attached", timeout=self.stage_timeout_ms)
+                    await _close_vip_popup(page)
+                    # Track changes inside the page, not by copying its preview
+                    # into Python. Names or numbers can remain unchanged, so
+                    # compare every cue when deciding whether to retry.
+                    initial_count = await page.evaluate(CACHE_INITIAL_CUES)
+                    if initial_count != len(site_source.cues):
+                        raise WebsiteError("The website parsed a different number of cues. Please try again.")
+
+                    stage = _stage("selecting the target language", on_progress)
+                    values = await selector.locator("option").evaluate_all("els => els.map(el => el.value)")
+                    if language_code not in values:
+                        raise LanguageUnavailable(
+                            "That language is no longer available on the subtitle site. Please choose another."
                         )
-                        if len(before) != len(site_source.cues):
-                            raise WebsiteError("The website parsed a different number of cues. Please try again.")
+                    await selector.select_option(value=language_code)
+                    await _close_vip_popup(page)
 
-                        stage = _stage("selecting the target language")
-                        values = await selector.locator("option").evaluate_all("els => els.map(el => el.value)")
-                        if language_code not in values:
-                            raise LanguageUnavailable(
-                                "That language is no longer available on the subtitle site. Please choose another."
-                            )
-                        await selector.select_option(value=language_code)
-                        await _close_vip_popup(page)
-
-                        stage = _stage("translating")
-                        # Install before clicking so even a very fast loader is observed.
-                        await page.evaluate(PROGRESS_WATCH)
-                        await _close_vip_popup(page)
-                        translate_button = await _button(page, "Translate", 1)
-                        await translate_button.click()
+                    stage = _stage("translating", on_progress)
+                    # Install before clicking so even a very fast loader is observed.
+                    await page.evaluate(PROGRESS_WATCH)
+                    await _close_vip_popup(page)
+                    translate_button = await _button(page, "Translate", 1)
+                    await translate_button.click()
+                    try:
+                        await page.wait_for_function(
+                            PROGRESS_FINISHED, timeout=self.translation_timeout_ms, polling=250
+                        )
+                    except PlaywrightTimeout:
                         try:
-                            await page.wait_for_function(
-                                PROGRESS_FINISHED, timeout=self.translation_timeout_ms, polling=250
-                            )
-                        except PlaywrightTimeout:
+                            # Only booleans about the UI, never subtitle content.
+                            state = await page.evaluate(PROGRESS_DIAGNOSTICS)
+                            logger.warning("Website completion state: %s", state)
+                        except PlaywrightError:
+                            logger.info("Website completion state could not be inspected")
+                        raise
+                    stage = _stage("waiting for translation to settle", on_progress)
+                    # Some site versions signal success early or need a second
+                    # click for very short files. Retry once only if no cue has
+                    # changed; same-language translations may also be unchanged.
+                    try:
+                        await page.wait_for_function(
+                            TEXT_CHANGED, timeout=self.change_wait_ms, polling=500
+                        )
+                    except PlaywrightTimeout:
+                        await _close_vip_popup(page)
+                        try:
+                            await translate_button.click(timeout=3_000)
+                        except PlaywrightError:
+                            # The retry is optional; some site versions disable
+                            # the button after a legitimate same-language result.
+                            logger.info("Could not retry the website's translation button")
+                        else:
                             try:
-                                # Only booleans about the UI, never subtitle content.
-                                state = await page.evaluate(PROGRESS_DIAGNOSTICS)
-                                logger.warning("Website completion state: %s", state)
-                            except PlaywrightError:
-                                logger.info("Website completion state could not be inspected")
-                            raise
-                        # Some site versions signal success early or need a second
-                        # click for very short files. Retry once only if no cue has
-                        # changed; same-language translations may also be unchanged.
-                        try:
-                            await page.wait_for_function(
-                                TEXT_CHANGED, arg=before, timeout=self.change_wait_ms, polling=500
-                            )
-                        except PlaywrightTimeout:
-                            await _close_vip_popup(page)
-                            try:
-                                await translate_button.click(timeout=3_000)
-                            except PlaywrightError:
-                                # The retry is optional; some site versions disable
-                                # the button after a legitimate same-language result.
-                                logger.info("Could not retry the website's translation button")
-                            else:
-                                try:
-                                    await page.wait_for_function(
-                                        TEXT_CHANGED, arg=before, timeout=self.retry_change_wait_ms, polling=500
-                                    )
-                                except PlaywrightTimeout:
-                                    pass
-                        try:
-                            await page.wait_for_function(
-                                TEXT_STABLE, arg=self.settle_ms, timeout=self.settle_timeout_ms, polling=500
-                            )
-                        except PlaywrightTimeout:
-                            raise WebsiteError("The website's translation did not finish settling. Please try again.")
+                                await page.wait_for_function(
+                                    TEXT_CHANGED, timeout=self.retry_change_wait_ms, polling=500
+                                )
+                            except PlaywrightTimeout:
+                                pass
+                    try:
+                        await page.wait_for_function(
+                            TEXT_STABLE, arg=self.settle_ms, timeout=self.settle_timeout_ms, polling=500
+                        )
+                    except PlaywrightTimeout:
+                        raise WebsiteError("The website's translation did not finish settling. Please try again.")
 
-                        stage = _stage("downloading")
-                        await _close_vip_popup(page)
-                        download_button = await _button(page, "Download", 2)
-                        async with page.expect_download(timeout=self.stage_timeout_ms) as download_info:
-                            await download_button.click()
-                        download = await download_info.value
-                        await download.save_as(str(output_path))
-                        if output_path.stat().st_size > MAX_OUTPUT_BYTES:
-                            raise WebsiteError("The site returned an unexpectedly large file. Please try again.")
-                        downloaded = output_path.read_bytes()
-                    finally:
-                        await browser.close()
+                    stage = _stage("downloading", on_progress)
+                    await _close_vip_popup(page)
+                    download_button = await _button(page, "Download", 2)
+                    async with page.expect_download(timeout=self.stage_timeout_ms) as download_info:
+                        await download_button.click()
+                    download = await download_info.value
+                    await download.save_as(str(output_path))
+                    if output_path.stat().st_size > MAX_OUTPUT_BYTES:
+                        raise WebsiteError("The site returned an unexpectedly large file. Please try again.")
+                    downloaded = output_path.read_bytes()
+                finally:
+                    await context.close()
                 # Refuse missing cues or changed times rather than silently
                 # sending broken subtitles to the user. SUB inputs use an SRT
                 # bridge; restore their original frames/timing afterward.
-                verified = verify_and_merge(site_source, downloaded)
-                return restore_subtitle_from_website(source, verified)
+                stage = _stage("validating the downloaded file", on_progress)
+                verified = await asyncio.to_thread(verify_and_merge, site_source, downloaded)
+                return await asyncio.to_thread(restore_subtitle_from_website, source, verified)
         except LanguageUnavailable:
             raise
         except WebsiteError:

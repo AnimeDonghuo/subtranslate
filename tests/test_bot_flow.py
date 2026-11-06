@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -75,8 +76,14 @@ class TelegramStub(BaseRequest):
 
 
 class FakeTranslator:
-    async def translate(self, source, code):
+    @asynccontextmanager
+    async def session(self):
+        yield self
+
+    async def translate(self, source, code, *, on_progress=None):
         assert code == "hi"
+        if on_progress:
+            on_progress("translating")
         return verify_and_merge(source, TRANSLATED)
 
 
@@ -182,8 +189,8 @@ async def test_select_all_returns_each_file_in_sequence_through_telegram_handler
 
     seen = []
 
-    class MultipleTranslator:
-        async def translate(self, source, code):
+    class MultipleTranslator(FakeTranslator):
+        async def translate(self, source, code, *, on_progress=None):
             seen.append(code)
             return verify_and_merge(source, TRANSLATED)
 
@@ -267,6 +274,49 @@ async def test_web_service_registers_webhook_and_handles_a_callback(monkeypatch)
     assert not any(action == "deleteWebhook" for action, _ in request.calls)
 
 
+async def test_webhook_job_edits_one_truthful_stage_bar_and_sends_the_file():
+    from unittest.mock import AsyncMock, patch
+
+    import subtranslate.web as bot_web
+
+    translating = asyncio.Event()
+    release = asyncio.Event()
+
+    class ProgressTranslator(FakeTranslator):
+        async def translate(self, source, code, *, on_progress=None):
+            on_progress("translating")
+            translating.set()
+            await release.wait()
+            return verify_and_merge(source, TRANSLATED)
+
+    request = TelegramStub()
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
+    with patch.object(bot_web, "WebsiteTranslator", return_value=ProgressTranslator()), \
+         patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
+        app = bot_web.create_web_app(settings, telegram_request=request)
+        async with TestClient(TestServer(app)) as client:
+            await asyncio.wait_for(app[bot_web.TELEGRAM_STATE].registered.wait(), 2)
+            headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
+            assert (await client.post("/telegram/webhook", headers=headers, json=callback_update(80))).status == 200
+            await asyncio.wait_for(translating.wait(), 2)
+
+            async def wait_for_edit(fragment):
+                while True:
+                    for action, params in request.calls:
+                        if action == "editMessageText" and fragment in params.get("text", ""):
+                            return params
+                    await asyncio.sleep(0.01)
+
+            stage = await asyncio.wait_for(wait_for_edit("Stage: Translating on the website"), 3)
+            assert "Step 6/10" in stage["text"]
+            assert "not the website's translation percentage" in stage["text"]
+            release.set()
+            await asyncio.wait_for(request.document_sent.wait(), 2)
+            final = await asyncio.wait_for(wait_for_edit("Hindi complete"), 3)
+            assert final["message_id"] == stage["message_id"]
+            assert "1 checked cue" in final["text"]
+
+
 async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chromium_path):
     from unittest.mock import AsyncMock, patch
 
@@ -275,7 +325,7 @@ async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chrom
 
     request = TelegramStub()
     settings = Settings("12345:TESTTOKEN", "https://example.com")
-    browser = WebsiteTranslator(chromium_path, site_url=mock_site, stage_timeout_ms=5000,
+    browser = WebsiteTranslator(chromium_path, site_url=mock_site + "?mode=download-different", stage_timeout_ms=5000,
                                 translation_timeout_ms=1500, change_wait_ms=800)
     with patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
          patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
@@ -288,8 +338,48 @@ async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chrom
             await asyncio.wait_for(request.document_sent.wait(), 15)
             upload = next(iter(request.uploads[0].values()))
             assert upload[0] == "movie.Hindi.srt"
-            assert b"Hola mundo" in upload[1]  # The local mock's fake translation.
-            assert b"00:00:01,000 --> 00:00:02,000" in upload[1]
+            # The preview says Hola mundo, but Download returns different text.
+            # The Telegram attachment must be exactly the downloaded SRT bytes.
+            assert upload[1] == b"10\n00:00:01,000 --> 00:00:02,000\nText from the downloaded file\n\n"
+            sent = next(params for action, params in request.calls if action == "sendDocument")
+            assert "1/1 cue texts differ" in sent["caption"]
+
+
+async def test_sequential_batch_through_webhook_and_reused_browser(mock_site, chromium_path):
+    from unittest.mock import AsyncMock, patch
+
+    import subtranslate.web as bot_web
+    from subtranslate.website import WebsiteTranslator
+
+    request = TelegramStub()
+    settings = Settings("12345:TESTTOKEN", "https://example.com")
+    catalog = LanguageCatalog()
+    catalog._languages = {"hi": "Hindi", "es": "Spanish"}
+    browser = WebsiteTranslator(chromium_path, site_url=mock_site, stage_timeout_ms=5000,
+                                translation_timeout_ms=1500, change_wait_ms=800, settle_ms=800)
+    with patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
+         patch.object(bot_web, "LanguageCatalog", return_value=catalog), \
+         patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
+        app = bot_web.create_web_app(settings, telegram_request=request)
+        async with TestClient(TestServer(app)) as client:
+            await asyncio.wait_for(app[bot_web.TELEGRAM_STATE].registered.wait(), 2)
+            headers = {"X-Telegram-Bot-Api-Secret-Token": settings.webhook_secret}
+            assert (await client.post("/telegram/webhook", headers=headers,
+                                      json=callback_update(81, data="all:start"))).status == 200
+
+            async def wait_for_batch():
+                while not any(action == "editMessageText" and "Finished: 2 file(s) sent" in params.get("text", "")
+                              for action, params in request.calls):
+                    await asyncio.sleep(0.01)
+
+            await asyncio.wait_for(wait_for_batch(), 20)
+            assert [next(iter(upload.values()))[0] for upload in request.uploads] == [
+                "movie.Hindi.srt", "movie.Spanish.srt",
+            ]
+            assert all(b"Hola mundo" in next(iter(upload.values()))[1] for upload in request.uploads)
+            progress_edits = [params for action, params in request.calls if action == "editMessageText"]
+            assert any("Batch:" in params.get("text", "") for params in progress_edits)
+            assert len({params["message_id"] for params in progress_edits}) == 1
 
 
 async def test_graceful_web_shutdown_notifies_active_and_waiting_jobs():
@@ -300,7 +390,7 @@ async def test_graceful_web_shutdown_notifies_active_and_waiting_jobs():
     started = asyncio.Event()
 
     class SlowTranslator:
-        async def translate(self, source, code):
+        async def translate(self, source, code, *, on_progress=None):
             started.set()
             await asyncio.Event().wait()
 

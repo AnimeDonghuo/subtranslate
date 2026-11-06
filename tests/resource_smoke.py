@@ -21,7 +21,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import subtranslate.web as bot_web
 from subtranslate.config import Settings
 from subtranslate.languages import LanguageCatalog
-from subtranslate.subtitles import MAX_CUES, MAX_INPUT_BYTES
+from subtranslate.subtitles import MAX_CUES, MAX_INPUT_BYTES, prepare_subtitle
 from subtranslate.website import WebsiteTranslator
 
 
@@ -91,6 +91,18 @@ async def main() -> None:
                 assert cues[0].index == 1 and cues[-1].index == MAX_CUES
                 assert all(cue.content == "Hola mundo" for cue in cues)
                 print(f"Success: {len(upload[1]):,} output bytes in {time.monotonic() - start:.1f}s", flush=True)
+
+        # A batch reuses its Chromium process, but each language gets a fresh
+        # context. Check two sequential downloads under the same resource limit.
+        small = prepare_subtitle(b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n")
+        async with browser.session() as session:
+            first = await session.translate(small, "hi")
+            reused_browser = session._browser
+            second = await session.translate(small, "es")
+            assert session._browser is reused_browser and not reused_browser.contexts
+            assert b"Hola mundo" in first.content and b"Hola mundo" in second.content
+        assert not reused_browser.is_connected()
+        print("Success: two languages used one browser with isolated contexts", flush=True)
 
 
 if __name__ == "__main__":
