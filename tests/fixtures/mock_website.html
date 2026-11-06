@@ -1,0 +1,81 @@
+
+<!doctype html><html><body>
+<input type="file" id="file">
+<div class="popup-vip notranslate" id="vip" style="display:none;position:fixed;inset:0;background:white;z-index:10">
+  <a href="#" class="close" onclick="closeVip();return false">Close</a>
+</div>
+<select class="goog-te-combo" id="lang"></select>
+<div id="loader" style="display:none">TRANSLATING</div>
+<h4 class="skiptranslate success-msg" style="display:none">Subtitle Translated!</h4>
+<button onclick="translateFile()">1. Translate</button>
+<button onclick="downloadFile()">2. Download</button>
+<table id="table"></table>
+<script>
+let blocks = [];
+let renderQueued = false;
+let translateCount = 0;
+const mode = new URL(location.href).searchParams.get('mode');
+document.querySelector('#file').onchange = async e => {
+  const raw = await e.target.files[0].text();
+  blocks = raw.trim().split(/\r?\n\r?\n/).map(block => block.split(/\r?\n/));
+  document.querySelector('#vip').style.display = 'block';
+  if (mode === 'gatepopup') renderQueued = true;
+  else renderCues();
+};
+function closeVip() {
+  document.querySelector('#vip').style.display = 'none';
+  if (renderQueued) { renderQueued = false; renderCues(); }
+}
+function renderCues() {
+  const sel = document.querySelector('#lang');
+  sel.innerHTML = '<option value="">Select</option><option value="es">Spanish</option><option value="hi">Hindi</option><option value="zh-CN">Chinese</option>';
+  function addRow(block) {
+    const row = document.createElement('tr');
+    const cell = document.createElement('td'); cell.className = 'notranslate target-sub';
+    cell.textContent = block.slice(2).join('\n'); row.appendChild(cell);
+    document.querySelector('#table').appendChild(row);
+  }
+  if (mode === 'progressive') {
+    addRow(blocks[0]);
+    setTimeout(() => blocks.slice(1).forEach(addRow), 1200);
+  } else {
+    blocks.forEach(addRow);
+    if (mode === 'extracue') addRow(blocks[0]);
+  }
+}
+function translateFile() {
+  const attempt = ++translateCount;
+  if (mode === 'nosignal') return;
+  if (mode !== 'successonly') document.querySelector('#loader').style.display = 'block';
+  setTimeout(() => {
+    if (mode !== 'stuckloader') document.querySelector('#loader').style.display = 'none';
+    document.querySelector('.success-msg').style.display = 'block';
+  }, 100);
+  setTimeout(() => {
+    const cells = document.querySelectorAll('.target-sub');
+    if (mode === 'lateronly') {
+      if (attempt === 1) cells[cells.length - 1].textContent = 'Hola mundo';
+      else for (const cell of cells) cell.textContent = 'Unexpected extra click';
+    } else if (mode !== 'unchanged' && (mode !== 'retry' || attempt > 1)) {
+      for (const cell of cells) cell.textContent = 'Hola mundo';
+    }
+  }, 350);
+  if (mode === 'bursts') {
+    setTimeout(() => {
+      for (const cell of document.querySelectorAll('.target-sub')) cell.textContent = 'Final translation';
+    }, 1600);
+  }
+}
+function downloadFile() {
+  const cells = [...document.querySelectorAll('.target-sub')];
+  const result = blocks.map((block, i) => {
+    let time = block[1];
+    if (mode === 'badtime') time = time.replace('02,000', '02,100');
+    return block[0] + '\n' + time + '\n' + cells[i].textContent;
+  }).join('\n\n') + '\n\n';
+  const url = URL.createObjectURL(new Blob([result], {type: 'text/plain'}));
+  const link = document.createElement('a'); link.href = url; link.download = 'translated.srt';
+  document.body.appendChild(link); link.click(); link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 500);
+}
+</script></body></html>

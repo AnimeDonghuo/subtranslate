@@ -1,0 +1,39 @@
+name: Live website smoke test (manual)
+
+# This uses the real third-party website, so it runs only when requested.
+# Manual dispatch requires the file to exist on the default branch. The
+# explicit commit-message opt-in also works when testing an unmerged branch.
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  live-website:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[live-site-test]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - name: Translate a non-private sample through the actual website
+        shell: bash
+        run: |
+          python -m subtranslate.smoke tests/fixtures/sample.srt hi --output-dir /tmp
+          python - <<'PY'
+          from pathlib import Path
+          from subtranslate.subtitles import prepare_subtitle, verify_and_merge
+          source = prepare_subtitle(Path('tests/fixtures/sample.srt').read_bytes())
+          output = Path('/tmp/sample.Hindi.srt').read_bytes()
+          result = verify_and_merge(source, output)
+          if result.unchanged:
+              raise SystemExit('Live website returned unchanged text; check the site and its selectors.')
+          print(f'Live website returned changed text for {result.cue_count} cues with matching timestamps.')
+          PY

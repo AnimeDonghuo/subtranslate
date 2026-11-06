@@ -1,0 +1,6 @@
+aiohttp==3.14.5
+charset-normalizer==3.5.2
+# The Playwright driver is pinned for memory use; Chromium comes from Debian.
+playwright==1.52.0
+python-telegram-bot==22.8
+srt==3.5.3
