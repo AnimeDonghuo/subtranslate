@@ -26,8 +26,9 @@ jobs:
       - name: Translate a non-private sample through the actual website
         shell: bash
         run: |
+          PYTHONPATH=. python tests/live_diagnose.py
           python -m subtranslate.smoke tests/fixtures/sample.srt hi --output-dir /tmp \
-            --timeout-seconds 180 --translation-timeout-seconds 120
+            --timeout-seconds 90 --translation-timeout-seconds 20
           python - <<'PY'
           from pathlib import Path
           from subtranslate.subtitles import prepare_subtitle, verify_and_merge
