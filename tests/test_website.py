@@ -112,7 +112,10 @@ async def test_upload_timeout_after_retry_is_reported_without_private_text(mock_
     browser.stage_timeout_ms = 1500
     with pytest.raises(WebsiteError, match="timed out"):
         await browser.translate(source, "es")
-    assert caplog.text.count("displayed 0 of 1 expected cues") == 2
+    # Two same-context upload attempts, then the whole early flow once in a
+    # fresh browser; still bounded if the site never renders a table.
+    assert caplog.text.count("displayed 0 of 1 expected cues") == 4
+    assert "error=TimeoutError, category=timeout" in caplog.text
     assert "Hello world" not in caplog.text
 
 
@@ -189,3 +192,113 @@ async def test_waits_until_all_uploaded_cues_are_rendered(mock_site, chromium_pa
 async def test_rejects_when_site_parses_extra_cues(mock_site, chromium_path, source):
     with pytest.raises(WebsiteError, match="different number of cues"):
         await translator(mock_site + "?mode=extracue", chromium_path).translate(source, "es")
+
+
+def _large_chinese_srt(count: int):
+    # Synthetic, non-private text; the mock is not a translation engine.
+    return prepare_subtitle("".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\n这是一个简单的字幕测试句子 {i}\n\n"
+        for i in range(1, count + 1)
+    ).encode())
+
+
+async def test_large_srt_uses_all_downloaded_parts_not_preview(mock_site, chromium_path):
+    import srt
+
+    source = _large_chinese_srt(405)
+    stages = []
+    browser = translator(mock_site + "?mode=partial250-download-different", chromium_path)
+    result = await browser.translate(source, "en", on_progress=stages.append)
+    cues = list(srt.parse(result.content.decode()))
+    assert len(cues) == 405 and result.changed_cues == 405
+    assert [cue.index for cue in cues] == list(range(1, 406))
+    assert all(cue.content == "Text from the downloaded file" for cue in cues)
+    assert "Hola mundo" not in result.content.decode()  # Website preview differs.
+    assert [stage for stage in stages if stage.startswith("part:")] == ["part:1/3", "part:2/3", "part:3/3"]
+    assert [(cue.start, cue.end) for cue in cues] == [(cue.start, cue.end) for cue in source.cues]
+
+
+async def test_likely_partial_part_is_split_and_downloaded_again(mock_site, chromium_path, caplog):
+    source = _large_chinese_srt(100)
+    browser = translator(mock_site + "?mode=partial50", chromium_path)
+    stages = []
+    result = await browser.translate(source, "en", on_progress=stages.append)
+    assert result.cue_count == 100 and result.changed_cues == 100
+    assert result.content.count(b"Hola mundo") == 100
+    assert "likely untranslated run" in caplog.text
+    assert "字幕测试" not in caplog.text
+    assert "part:1/2" in stages and "part:2/2" in stages
+
+
+async def test_likely_untranslated_small_part_is_not_delivered_after_retry(mock_site, chromium_path, caplog):
+    source = _large_chinese_srt(10)
+    browser = translator(mock_site + "?mode=unchanged", chromium_path)
+    browser.change_wait_ms = browser.retry_change_wait_ms = 150
+    browser.settle_ms = 500
+    with pytest.raises(WebsiteError, match="no incomplete file was sent"):
+        await browser.translate(source, "en")
+    assert "retrying once" in caplog.text
+    assert "字幕测试" not in caplog.text
+
+
+async def test_separate_jobs_recover_from_upload_error_in_a_fresh_browser(mock_site, chromium_path, source,
+                                                                   monkeypatch, caplog):
+    from playwright.async_api import Error as PlaywrightError
+
+    from subtranslate import website
+
+    original_wait = website._wait_for_uploaded_cues
+    original_browser = website.WebsiteSession.browser
+    waits = 0
+    browsers = []
+
+    async def flaky_wait(page, count, timeout):
+        nonlocal waits
+        waits += 1
+        if waits == 2:  # The second job, not the first, fails during parsing.
+            raise PlaywrightError("Execution context was destroyed PRIVATE_SUBTITLE PRIVATE_TOKEN")
+        await original_wait(page, count, timeout)
+
+    async def record_browser(session):
+        browser = await original_browser(session)
+        browsers.append(browser)
+        return browser
+
+    monkeypatch.setattr(website, "_wait_for_uploaded_cues", flaky_wait)
+    monkeypatch.setattr(website.WebsiteSession, "browser", record_browser)
+    browser = translator(mock_site, chromium_path)
+    first = await browser.translate(source, "es")
+    second = await browser.translate(source, "es")
+    assert b"Hola mundo" in first.content and b"Hola mundo" in second.content
+    assert waits == 3 and len(browsers) == 3
+    assert browsers[1] is not browsers[2]
+    assert all(not instance.is_connected() for instance in browsers)
+    assert "error=Error, category=navigation" in caplog.text
+    assert "PRIVATE_SUBTITLE" not in caplog.text and "PRIVATE_TOKEN" not in caplog.text
+    assert "Hello world" not in caplog.text
+
+
+async def test_same_script_partial_result_is_warned_not_claimed_as_complete(mock_site, chromium_path):
+    source = prepare_subtitle("".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\nAn English subtitle sentence {i}\n\n"
+        for i in range(1, 41)
+    ).encode())
+    result = await translator(mock_site + "?mode=partial10", chromium_path).translate(source, "es")
+    assert result.changed_cues == 10 and result.longest_unchanged_run == 30
+    assert result.possibly_incomplete
+
+
+async def test_large_sub_bridge_combines_downloads_and_restores_every_frame(mock_site, chromium_path):
+    raw = "{1}{1}23.976\n" + "".join(
+        f"{{{i}}}{{{i + 1}}}Original subtitle {i}\n" for i in range(25, 230)
+    )
+    source = prepare_subtitle(raw.encode(), "movie.sub")
+    result = await translator(mock_site + "?mode=partial250", chromium_path).translate(source, "es")
+    output = result.content.decode()
+    assert output.startswith("{1}{1}23.976\n")
+    assert result.cue_count == 205 and result.changed_cues == 205
+    assert output.count("Hola mundo") == 205
+    assert "{25}{26}Hola mundo" in output and "{229}{230}Hola mundo" in output
+    assert [(cue.start, cue.end) for cue in prepare_subtitle(result.content, "movie.sub").cues] == [
+        (cue.start, cue.end) for cue in source.cues
+    ]

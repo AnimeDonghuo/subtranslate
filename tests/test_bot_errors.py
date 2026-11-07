@@ -125,3 +125,16 @@ async def test_job_does_not_run_when_status_cannot_be_delivered(service):
     await service.process_job(JOB)
     service.bot.get_file.assert_not_awaited()
     service.translator.translate.assert_not_awaited()
+
+
+async def test_possible_partial_result_has_explicit_warning(service):
+    service.bot.get_file.return_value = telegram_file(VALID_SRT)
+    service.translator.translate.return_value = TranslatedSubtitle(
+        VALID_SRT, 50, unchanged=False, changed_cues=5, longest_unchanged_run=45,
+    )
+    await service.process_job(JOB)
+    caption = service.bot.send_document.await_args.kwargs["caption"]
+    assert "A long section stayed unchanged" in caption
+    assert "may be incomplete" in caption
+    assert "may be untranslated" in last_notice(service)
+    assert "complete" not in last_notice(service)

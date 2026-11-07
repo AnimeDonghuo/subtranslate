@@ -93,3 +93,23 @@ async def test_hanging_edit_is_bounded_and_terminal_update_can_recover():
     finally:
         await progress.close()
     assert progress._task.done()
+
+
+async def test_part_progress_and_reset_for_next_batch_language():
+    bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=21)),
+                          edit_message_text=AsyncMock())
+    progress = await ProgressMessage.start(bot, 42, "all languages", batch_total=2, edit_interval=0.01)
+    try:
+        progress.set_language("English", current=1, completed=0)
+        progress.set_stage("part:2/7")
+        progress.set_stage("uploading and parsing the subtitle")
+        text = progress.render()
+        assert "Subtitle part: 2/7 (processed sequentially)" in text
+        assert "Uploading and checking" in text
+        progress.set_stage("part:not-numbers")
+        progress.set_stage("part:9/2")
+        assert "Subtitle part: 2/7" in progress.render()
+        progress.set_language("Hindi", current=2, completed=1)
+        assert "Subtitle part:" not in progress.render()
+    finally:
+        await progress.close()

@@ -211,3 +211,95 @@ def test_rejects_unknown_and_binary_subtitle_formats():
         prepare_subtitle(b"hello", "movie.txt")
     with pytest.raises(SubtitleError):
         prepare_subtitle(b"\x00\x01\x00\x01", "movie.stl")
+
+
+def _many_srt(count: int, text: str = "这是一个简单的字幕测试句子") -> bytes:
+    return "".join(
+        f"{i + 10}\n00:00:01,000 --> 00:00:02,000\n{text} {i}\n\n" for i in range(count)
+    ).encode("utf-8")
+
+
+def test_large_srt_parts_are_bounded_and_combined_from_actual_downloads():
+    from subtranslate.subtitles import combine_srt_downloads, split_srt_for_website
+
+    source = prepare_subtitle(_many_srt(453))
+    parts = split_srt_for_website(source)
+    assert [len(part.cues) for part in parts] == [200, 200, 53]
+    assert all(part.cues[0].index == 1 for part in parts)
+    downloads = []
+    for part in parts:
+        downloaded = part.utf8.replace("这是一个简单的字幕测试句子".encode(), b"From the Download button")
+        downloads.append(verify_and_merge(part, downloaded))
+    result = combine_srt_downloads(source, downloads)
+    parsed = list(srt.parse(result.content.decode()))
+    assert len(parsed) == 453
+    assert [cue.index for cue in parsed] == list(range(1, 454))
+    assert all(cue.content.startswith("From the Download button") for cue in parsed)
+    assert [(cue.start, cue.end) for cue in parsed] == [(cue.start, cue.end) for cue in source.cues]
+    assert result.changed_cues == 453 and not result.possibly_incomplete
+
+
+def test_one_part_preserves_original_bytes_and_character_limit_splits_without_cutting_cues():
+    from subtranslate.subtitles import split_srt_for_website
+
+    one = prepare_subtitle(_many_srt(2))
+    assert split_srt_for_website(one) == [one]
+    parts = split_srt_for_website(one, max_cues=200, max_text_chars=5)
+    assert [len(part.cues) for part in parts] == [1, 1]
+    assert parts[0].cues[0].content == one.cues[0].content
+    with pytest.raises(ValueError):
+        split_srt_for_website(one, max_cues=0)
+
+
+def test_combining_parts_rejects_missing_or_changed_times():
+    from subtranslate.subtitles import (
+        TranslatedSubtitle,
+        combine_srt_downloads,
+        split_srt_for_website,
+    )
+
+    source = prepare_subtitle(_many_srt(201))
+    parts = split_srt_for_website(source)
+    first = verify_and_merge(parts[0], parts[0].utf8)
+    with pytest.raises(SubtitleError, match="missing cues"):
+        combine_srt_downloads(source, [first])
+    altered = parts[1].utf8.replace(b"00:00:02,000", b"00:00:02,500")
+    with pytest.raises(SubtitleError, match="changed timestamps"):
+        combine_srt_downloads(source, [first, TranslatedSubtitle(altered, 1, False)])
+
+
+def test_long_unchanged_sections_are_warnings_not_assumed_failures():
+    source = prepare_subtitle(_many_srt(40, "Already in the target language"))
+    partial = source.utf8.replace(b"Already in the target language 0", b"Translated first cue")
+    result = verify_and_merge(source, partial)
+    assert result.changed_cues == 1
+    assert result.longest_unchanged_run == 39
+    assert result.possibly_incomplete
+    unchanged = verify_and_merge(source, source.utf8)
+    assert unchanged.unchanged and not unchanged.possibly_incomplete
+
+
+def test_obvious_wrong_script_run_is_detected_without_rejecting_names_or_same_language():
+    from subtranslate.subtitles import obviously_untranslated_run
+
+    source = prepare_subtitle(_many_srt(25))
+    partial = source.utf8.replace("这是一个简单的字幕测试句子 0".encode(), b"Translated first cue")
+    result = verify_and_merge(source, partial)
+    assert obviously_untranslated_run(source, result, "en") >= 5
+    assert obviously_untranslated_run(source, result, "zh-CN") == 0
+    assert obviously_untranslated_run(source, result, "ja") == 0
+    short_names = prepare_subtitle(_many_srt(25, "张三"))
+    assert obviously_untranslated_run(short_names, verify_and_merge(short_names, short_names.utf8), "en") == 0
+    already_english = prepare_subtitle(_many_srt(25, "A line already in English"))
+    assert obviously_untranslated_run(already_english, verify_and_merge(already_english, already_english.utf8), "en") == 0
+    assert obviously_untranslated_run(already_english, verify_and_merge(already_english, already_english.utf8), "hi") >= 5
+    # Whitespace or punctuation changes must not hide untranslated Chinese.
+    reformatted = source.utf8.replace("字幕测试句子".encode(), "字幕测试句子，".encode())
+    reformatted_result = verify_and_merge(source, reformatted)
+    assert obviously_untranslated_run(source, reformatted_result, "en") >= 5
+    assert reformatted_result.possibly_incomplete
+    # Repetition of one name is not, by itself, proof of a failed translation.
+    repeated = prepare_subtitle("".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\n很长的重复名字\n\n" for i in range(1, 26)
+    ).encode())
+    assert obviously_untranslated_run(repeated, verify_and_merge(repeated, repeated.utf8), "en") == 0

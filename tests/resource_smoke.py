@@ -66,7 +66,12 @@ async def main() -> None:
     async with TestServer(mock) as mock_server:
         stub = fake_telegram.TelegramStub()
         settings = Settings("12345:TESTTOKEN", "https://example.com")
-        browser = WebsiteTranslator(chromium, site_url=str(mock_server.make_url("/")))
+        # Hundreds of long synthetic cues now require many bounded uploads.
+        # Keep the real browser/cgroup stress, but shorten the mock-only
+        # settling wait (the fixture changes its text after 350 ms). Production
+        # keeps its longer wait for the real, unpredictable website.
+        browser = WebsiteTranslator(chromium, site_url=str(mock_server.make_url("/")),
+                                    settle_ms=750, settle_timeout_ms=5_000)
         with patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
              patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
             async with TestClient(TestServer(bot_web.create_web_app(settings, telegram_request=stub))) as client:

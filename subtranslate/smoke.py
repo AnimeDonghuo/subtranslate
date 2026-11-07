@@ -29,8 +29,8 @@ async def _run(args) -> None:
         raise FileExistsError(f"Refusing to overwrite {output}")
     output.write_bytes(result.content)
     print(f"Saved {result.cue_count} cues to {output}")
-    if result.unchanged:
-        print("Warning: the site returned unchanged text; review the result.")
+    if result.unchanged or result.possibly_incomplete:
+        print("Warning: a long section of text did not change; the result may be incomplete. Please review it.")
 
 
 def main() -> None:

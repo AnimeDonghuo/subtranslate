@@ -5,6 +5,7 @@ import logging
 import re
 import secrets
 import tempfile
+from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,7 +19,10 @@ from .subtitles import (
     MAX_OUTPUT_BYTES,
     PreparedSubtitle,
     TranslatedSubtitle,
+    combine_srt_downloads,
+    obviously_untranslated_run,
     restore_subtitle_from_website,
+    split_srt_for_website,
     subtitle_for_website,
     verify_and_merge,
 )
@@ -39,8 +43,29 @@ class LanguageUnavailable(WebsiteError):
     pass
 
 
+class _RetryableWebsiteError(WebsiteError):
+    """An early browser/site failure for which a fresh browser may help."""
+
+
+def _error_category(exc: Exception) -> str:
+    """Classify common Playwright failures without logging exception details."""
+    detail = str(exc).lower()
+    if (type(exc).__name__ == "TargetClosedError" or "target page, context or browser has been closed" in detail
+            or "target closed" in detail):
+        return "page_or_browser_closed"
+    if "execution context was destroyed" in detail or "because of a navigation" in detail:
+        return "navigation"
+    if "frame was detached" in detail:
+        return "frame_detached"
+    if "net::" in detail or "connection refused" in detail or "connection reset" in detail:
+        return "network"
+    if "timeout" in detail or "timed out" in detail:
+        return "timeout"
+    return "other"
+
+
 def _stage(name: str, on_progress: Callable[[str], None] | None = None) -> str:
-    # Stage names are fixed strings: never log subtitle text or filenames.
+    # Stage names are fixed strings or numeric part counts; never log subtitle text or filenames.
     logger.info("Subtitle website: %s", name)
     if on_progress is not None:
         try:
@@ -230,9 +255,70 @@ class WebsiteSession:
         self._uses += 1
         return self._browser
 
+    async def _translate_part(self, source: PreparedSubtitle, language_code: str,
+                              on_progress: Callable[[str], None] | None) -> TranslatedSubtitle:
+        # Once the site has started translating, do not blindly repeat that
+        # operation. Early upload/navigation failures are safe to retry once
+        # with a new browser and isolated context.
+        for attempt in range(2):
+            try:
+                return await self.translator._translate_in_session(source, language_code, self, on_progress)
+            except _RetryableWebsiteError:
+                if attempt:
+                    raise WebsiteError(
+                        "The subtitle website could not open or upload the file after retrying. "
+                        "It may have timed out or be unavailable; please try again later."
+                    ) from None
+                logger.info("Retrying the early website flow with a fresh browser")
+                await self._close_browser()
+                await asyncio.sleep(1)
+        raise AssertionError("unreachable")
+
     async def translate(self, source: PreparedSubtitle, language_code: str, *,
                         on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:
-        return await self.translator._translate_in_session(source, language_code, self, on_progress)
+        # Use the site's Download button for every part. Bounded SRT uploads
+        # reduce the chance of a successful-looking but partial large result.
+        site_source = await asyncio.to_thread(subtitle_for_website, source)
+        first_parts = await asyncio.to_thread(split_srt_for_website, site_source)
+        pending = deque((part, 0) for part in first_parts)
+        total = len(pending)
+        completed = 0
+        downloads = []
+        while pending:
+            part, depth = pending.popleft()
+            if total > 1:
+                _stage(f"part:{completed + 1}/{total}", on_progress)
+            result = await self._translate_part(part, language_code, on_progress)
+            suspicious = await asyncio.to_thread(obviously_untranslated_run, part, result, language_code)
+            if suspicious:
+                # A smaller upload can recover from sites that stop translating
+                # midway. The two-level limit keeps retries bounded.
+                smaller = []
+                if part.extension == ".srt" and len(part.cues) >= 20 and depth < 2:
+                    smaller = await asyncio.to_thread(
+                        split_srt_for_website, part, max_cues=max(1, len(part.cues) // 2)
+                    )
+                if len(smaller) > 1:
+                    logger.warning("Website download has a likely untranslated run (%d cues); splitting the part", suspicious)
+                    total += len(smaller) - 1
+                    pending.extendleft((subpart, depth + 1) for subpart in reversed(smaller))
+                    await self._close_browser()
+                    continue
+                logger.warning("Website download has a likely untranslated run (%d cues); retrying once", suspicious)
+                await self._close_browser()
+                result = await self._translate_part(part, language_code, on_progress)
+                if await asyncio.to_thread(obviously_untranslated_run, part, result, language_code):
+                    raise WebsiteError(
+                        "The website left a section in the original language after retrying, "
+                        "so no incomplete file was sent. Please try again later or use a smaller subtitle."
+                    )
+            downloads.append(result)
+            completed += 1
+        if len(downloads) == 1:
+            site_result = downloads[0]  # Keep the site's actual bytes for a single SRT download.
+        else:
+            site_result = await asyncio.to_thread(combine_srt_downloads, site_source, downloads)
+        return await asyncio.to_thread(restore_subtitle_from_website, source, site_result)
 
 
 class WebsiteTranslator:
@@ -280,6 +366,8 @@ class WebsiteTranslator:
     async def _translate_in_session(self, source: PreparedSubtitle, language_code: str, session: WebsiteSession,
                                     on_progress: Callable[[str], None] | None) -> TranslatedSubtitle:
         stage = _stage("starting the browser", on_progress)
+        browser = page = None
+        browser_connected = page_closed = None
         try:
             site_source = subtitle_for_website(source)
             with tempfile.TemporaryDirectory(prefix="subtranslate-") as temp_dir:
@@ -389,7 +477,15 @@ class WebsiteTranslator:
                         raise WebsiteError("The site returned an unexpectedly large file. Please try again.")
                     downloaded = output_path.read_bytes()
                 finally:
-                    await context.close()
+                    # Capture state before closing the context; afterward a
+                    # healthy page would always appear closed. No URLs, file
+                    # names, subtitle contents or exception messages are logged.
+                    browser_connected = browser.is_connected()
+                    page_closed = page.is_closed() if page is not None else None
+                    try:
+                        await context.close()
+                    except PlaywrightError as exc:
+                        logger.warning("Could not close the website context (%s)", type(exc).__name__)
                 # Refuse missing cues or changed times rather than silently
                 # sending broken subtitles to the user. SUB inputs use an SRT
                 # bridge; restore their original frames/timing afterward.
@@ -400,12 +496,22 @@ class WebsiteTranslator:
             raise
         except WebsiteError:
             raise
-        except PlaywrightTimeout as exc:
-            logger.warning("Subtitle website timed out while %s", stage)
-            raise WebsiteError("The subtitle website timed out. Please try again later or use a smaller file.") from exc
-        except PlaywrightError as exc:
-            logger.warning("Subtitle website interaction failed while %s", stage)
-            raise WebsiteError("Could not complete the subtitle website flow. It may be unavailable or have changed.") from exc
+        except (PlaywrightTimeout, PlaywrightError) as exc:
+            # The message and traceback may contain private subtitle content,
+            # paths, or capability URLs. Log only an allowlisted category,
+            # exception class, stage and browser/page state.
+            category = "timeout" if isinstance(exc, PlaywrightTimeout) else _error_category(exc)
+            if browser_connected is None and browser is not None:
+                browser_connected = browser.is_connected()
+            logger.warning(
+                "Subtitle website interaction failed while %s (error=%s, category=%s, browser_connected=%s, page_closed=%s)",
+                stage, type(exc).__name__, category, browser_connected, page_closed,
+            )
+            if stage in {"starting the browser", "opening the subtitle site", "uploading and parsing the subtitle"}:
+                raise _RetryableWebsiteError("The early website flow failed.") from None
+            if isinstance(exc, PlaywrightTimeout):
+                raise WebsiteError("The subtitle website timed out. Please try again later or use a smaller file.") from None
+            raise WebsiteError("Could not complete the subtitle website flow. It may be unavailable or have changed.") from None
         except OSError as exc:
-            logger.warning("A local file or browser error occurred while %s", stage)
-            raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from exc
+            logger.warning("A local file or browser error occurred while %s (error=%s)", stage, type(exc).__name__)
+            raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from None

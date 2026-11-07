@@ -34,7 +34,7 @@ function closeVip() {
 }
 function renderCues() {
   const sel = document.querySelector('#lang');
-  sel.innerHTML = '<option value="">Select</option><option value="es">Spanish</option><option value="hi">Hindi</option><option value="zh-CN">Chinese</option>';
+  sel.innerHTML = '<option value="">Select</option><option value="es">Spanish</option><option value="hi">Hindi</option><option value="en">English</option><option value="zh-CN">Chinese</option>';
   function addRow(block) {
     const row = document.createElement('tr');
     const cell = document.createElement('td'); cell.className = 'notranslate target-sub';
@@ -62,6 +62,9 @@ function translateFile() {
     if (mode === 'lateronly') {
       if (attempt === 1) cells[cells.length - 1].textContent = 'Hola mundo';
       else for (const cell of cells) cell.textContent = 'Unexpected extra click';
+    } else if (mode === 'partial250' || mode === 'partial250-download-different' || mode === 'partial50' || mode === 'partial10') {
+      const limit = mode === 'partial10' ? 10 : (mode === 'partial50' ? 50 : 250);
+      cells.forEach((cell, index) => { if (index < limit) cell.textContent = 'Hola mundo'; });
     } else if (mode !== 'unchanged' && (mode !== 'retry' || attempt > 1)) {
       for (const cell of cells) cell.textContent = 'Hola mundo';
     }
@@ -77,7 +80,8 @@ function downloadFile() {
   const result = blocks.map((block, i) => {
     let time = block[1];
     if (mode === 'badtime') time = time.replace('02,000', '02,100');
-    const content = mode === 'download-different' ? 'Text from the downloaded file' : cells[i].textContent;
+    const content = (mode === 'download-different' || mode === 'partial250-download-different')
+      ? 'Text from the downloaded file' : cells[i].textContent;
     return block[0] + '\n' + time + '\n' + content;
   }).join('\n\n') + '\n\n';
   const url = URL.createObjectURL(new Blob([result], {type: 'text/plain'}));

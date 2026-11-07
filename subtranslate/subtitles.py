@@ -12,6 +12,11 @@ from charset_normalizer import from_bytes
 MAX_INPUT_BYTES = 1_000_000
 MAX_OUTPUT_BYTES = 5_000_000
 MAX_CUES = 3000
+# The site can report success even when it has translated only an early part
+# of a large table. Keep SRT uploads bounded; these are conservative bot
+# limits, not documented limits or guarantees from the third-party site.
+MAX_WEBSITE_PART_CUES = 200
+MAX_WEBSITE_PART_TEXT_CHARS = 20_000
 SUPPORTED_EXTENSIONS = frozenset({".srt", ".ass", ".sub", ".sbv", ".vtt", ".stl"})
 
 
@@ -39,6 +44,13 @@ class TranslatedSubtitle:
     cue_count: int
     unchanged: bool
     changed_cues: int | None = None
+    longest_unchanged_run: int = 0
+
+    @property
+    def possibly_incomplete(self) -> bool:
+        # Same-language sections and names can legitimately be unchanged.
+        # This is a warning, not proof of a failed translation.
+        return not self.unchanged and self.longest_unchanged_run >= 20
 
 
 def decode_subtitle(data: bytes) -> str:
@@ -205,6 +217,134 @@ def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
     return PreparedSubtitle(utf8=encoded, cues=site_cues, extension=".srt")
 
 
+def split_srt_for_website(
+    source: PreparedSubtitle, *, max_cues: int = MAX_WEBSITE_PART_CUES,
+    max_text_chars: int = MAX_WEBSITE_PART_TEXT_CHARS,
+) -> list[PreparedSubtitle]:
+    """Create bounded, independently uploadable SRTs without changing times.
+
+    Other formats retain their existing upload path. SUB is converted to SRT
+    before this function is called. A single long cue cannot be split safely.
+    """
+    if max_cues < 1 or max_text_chars < 1:
+        raise ValueError("Subtitle part limits must be positive")
+    if source.extension != ".srt":
+        return [source]
+    groups = []
+    current = []
+    text_chars = 0
+    for cue in source.cues:
+        length = len(cue.content)
+        if current and (len(current) >= max_cues or text_chars + length > max_text_chars):
+            groups.append(current)
+            current = []
+            text_chars = 0
+        current.append(cue)
+        text_chars += length
+    if current:
+        groups.append(current)
+    if len(groups) <= 1:
+        # Preserve a small file exactly as supplied to the site.
+        return [source]
+    parts = []
+    for group in groups:
+        # Each upload starts at 1, since the site may assume sequential cue
+        # numbers. The downloaded parts are renumbered once when combined.
+        cues = [srt.Subtitle(index=index, start=cue.start, end=cue.end,
+                             content=cue.content, proprietary=cue.proprietary)
+                for index, cue in enumerate(group, start=1)]
+        encoded = srt.compose(cues, reindex=False).encode("utf-8")
+        parts.append(PreparedSubtitle(utf8=encoded, cues=cues, extension=".srt"))
+    return parts
+
+
+def combine_srt_downloads(source: PreparedSubtitle, parts: list[TranslatedSubtitle]) -> TranslatedSubtitle:
+    """Combine actual downloaded SRTs, never the website's on-page preview."""
+    if source.extension != ".srt" or not parts:
+        raise SubtitleError("The translated subtitle parts could not be combined.")
+    downloaded_cues = []
+    for part in parts:
+        downloaded_cues.extend(_parse(decode_subtitle(part.content), is_output=True))
+    if len(downloaded_cues) != len(source.cues):
+        raise SubtitleError("The downloaded subtitle parts have missing cues. Please try again.")
+    combined = []
+    for index, (original, downloaded) in enumerate(zip(source.cues, downloaded_cues), start=1):
+        if original.start != downloaded.start or original.end != downloaded.end:
+            raise SubtitleError("The downloaded subtitle parts have changed timestamps. Please try again.")
+        combined.append(srt.Subtitle(index=index, start=downloaded.start, end=downloaded.end,
+                                     content=downloaded.content, proprietary=downloaded.proprietary))
+    encoded = srt.compose(combined, reindex=False).encode("utf-8")
+    return verify_and_merge(source, encoded)
+
+
+_CJK_TARGETS = frozenset({"zh-CN", "zh-TW", "yue", "ja", "ko"})
+_NON_LATIN_TARGETS = frozenset({
+    "zh-CN", "zh-TW", "yue", "ja", "ko", "ar", "fa", "fa-AF", "ur", "ps", "sd", "ug", "ckb",
+    "hi", "ne", "mr", "sa", "bho", "mai", "awa", "doi", "gom", "bn", "as", "pa", "gu", "ta",
+    "te", "kn", "ml", "si", "th", "lo", "km", "my", "el", "iw", "yi", "ru", "uk", "be", "bg",
+    "mk", "sr", "kk", "ky", "mn", "tg", "ka", "hy", "am", "ti",
+})
+
+
+def _plain_cue_text(text: str) -> str:
+    return re.sub(r"<[^>]*>|\{\\[^}]*\}", "", text)
+
+
+def _comparison_key(text: str) -> str:
+    """Ignore markup, spacing and punctuation when looking for likely copies."""
+    normalized = unicodedata.normalize("NFKC", _plain_cue_text(text)).casefold()
+    return "".join(char for char in normalized if char.isalnum())
+
+
+def _cjk_letter_count(text: str) -> int:
+    return sum(
+        0x3400 <= ord(char) <= 0x9FFF or 0xF900 <= ord(char) <= 0xFAFF
+        or 0x3040 <= ord(char) <= 0x30FF or 0xAC00 <= ord(char) <= 0xD7AF
+        for char in text
+    )
+
+
+def obviously_untranslated_run(source: PreparedSubtitle, result: TranslatedSubtitle, language_code: str) -> int:
+    """Find a strong script-mismatch signal, not a general language detector.
+
+    A run of several substantial unchanged cues in a clearly incompatible
+    script is evidence of a partial download. Names, punctuation, same-script
+    language pairs and same-language files must not be rejected merely because
+    one or two cues are unchanged. Unknown and mixed scripts can still evade
+    this conservative check; translation quality cannot be guaranteed.
+    """
+    text = decode_subtitle(result.content)
+    translated = _parse(text, is_output=True) if source.extension == ".srt" else _parse_other(text, source.extension)
+    run = chars = gap = 0
+    distinct = set()
+    for original, output in zip(source.cues, translated):
+        before = original.content.strip()
+        after = output.content.strip()
+        key = _comparison_key(before)
+        if not key or key != _comparison_key(after):
+            run = chars = gap = 0
+            distinct.clear()
+            continue
+        clean = _plain_cue_text(before)
+        cjk = _cjk_letter_count(clean) if language_code not in _CJK_TARGETS else 0
+        latin = (sum("LATIN" in unicodedata.name(char, "") and char.isalpha() for char in clean)
+                 if language_code in _NON_LATIN_TARGETS else 0)
+        weight = cjk if cjk >= 3 else latin if latin >= 12 else 0
+        if weight:
+            run += 1
+            chars += weight
+            distinct.add(key)
+            gap = 0
+            if run >= 5 and chars >= 30 and len(distinct) >= 3:
+                return run
+        else:
+            gap += 1
+            if gap > 2:
+                run = chars = gap = 0
+                distinct.clear()
+    return 0
+
+
 def restore_subtitle_from_website(source: PreparedSubtitle, site_result: TranslatedSubtitle) -> TranslatedSubtitle:
     """Put translated SRT cue text back into a text .sub without changing its timing."""
     if source.extension != ".sub":
@@ -258,7 +398,17 @@ def verify_and_merge(source: PreparedSubtitle, downloaded: bytes) -> TranslatedS
     for original, result in zip(source.cues, translated):
         if original.start != result.start or original.end != result.end:
             raise SubtitleError("The website changed subtitle timestamps, so the result was not sent. Please try again.")
-    changed_cues = sum(a.content.strip() != b.content.strip() for a, b in zip(source.cues, translated))
+    changed_cues = 0
+    unchanged_run = longest_unchanged_run = 0
+    for original, result in zip(source.cues, translated):
+        if original.content.strip() != result.content.strip():
+            changed_cues += 1
+        key = _comparison_key(original.content)
+        if key and key == _comparison_key(result.content) and any(char.isalpha() for char in key):
+            unchanged_run += 1
+            longest_unchanged_run = max(longest_unchanged_run, unchanged_run)
+        else:
+            unchanged_run = 0
     if source.extension == ".ass":
         # The site rebuilds ASS downloads with default styles. Retain the
         # source styles, dialogue metadata and comments while replacing its
@@ -275,7 +425,7 @@ def verify_and_merge(source: PreparedSubtitle, downloaded: bytes) -> TranslatedS
         # Keep byte-for-byte output when it is UTF-8.
         content = _download_as_utf8(downloaded, text)
     return TranslatedSubtitle(content=content, cue_count=len(translated), unchanged=changed_cues == 0,
-                              changed_cues=changed_cues)
+                              changed_cues=changed_cues, longest_unchanged_run=longest_unchanged_run)
 
 
 def translated_filename(original: str, language: str) -> str:

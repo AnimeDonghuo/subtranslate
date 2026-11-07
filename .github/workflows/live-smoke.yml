@@ -41,3 +41,20 @@ jobs:
           PY
       - name: Translate other public format samples through the bot flow
         run: PYTHONPATH=. python tests/live_formats.py
+
+  live-large-constrained:
+    # Run after the smaller live checks so we do not concurrently send a
+    # larger diagnostic load to the third-party website.
+    needs: live-website
+    if: (github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[live-site-test]')) && !cancelled()
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the deployment image
+        run: docker build -t subtranslate-live .
+      - name: Run separate large synthetic jobs under free-instance limits
+        run: |
+          docker run --rm --memory 512000000 --memory-swap 512000000 --cpus 0.1 \
+            --mount type=bind,source="$PWD/tests",target=/smoke,readonly \
+            --env PYTHONPATH=/app subtranslate-live python /smoke/live_large.py

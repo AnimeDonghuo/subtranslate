@@ -279,11 +279,16 @@ class BotService:
         if result.changed_cues is not None:
             caption += (f"\n{result.changed_cues:,}/{result.cue_count:,} cue texts differ from the original. "
                         "Names or shared words may stay the same.")
-        caption += "\nDownloaded from the subtitle website. Please review the machine translation."
+        caption += "\nFrom the website's downloads. Please review the machine translation."
         if result.unchanged:
             caption += (
                 "\n\n⚠️ The website returned unchanged text. It may already be in the target "
                 "language, or translation may have failed."
+            )
+        elif result.possibly_incomplete:
+            caption += (
+                "\n\n⚠️ A long section stayed unchanged. It may already be in the target language, "
+                "or the translation may be incomplete. Please review it."
             )
         await self.bot.send_document(
             chat_id=job.chat_id,
@@ -309,7 +314,11 @@ class BotService:
                     progress.set_stage("sending result")
                     await self._send_result(job, job.language_name, result)
                 cue_word = "cue" if result.cue_count == 1 else "cues"
-                final = f"✅ {job.language_name} complete. Sent the file with {result.cue_count:,} checked {cue_word}."
+                if result.unchanged or result.possibly_incomplete:
+                    final = (f"⚠️ Sent {job.language_name} with {result.cue_count:,} checked {cue_word}, "
+                             "but some text may be untranslated. Please review the file.")
+                else:
+                    final = f"✅ {job.language_name} complete. Sent the file with {result.cue_count:,} checked {cue_word}."
             except (SubtitleError, WebsiteError) as exc:
                 final = f"Could not translate: {exc}\n\nYou can tap a language button to try again."
             except TimeoutError:
