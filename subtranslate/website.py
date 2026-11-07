@@ -288,13 +288,20 @@ TEXT_CHANGED = r"""() => {
 TEXT_CHANGE_COUNTS = r"""() => {
     const before = window.__subtranslateBefore, hash = window.__subtranslateHash;
     const cells = document.querySelectorAll('td.notranslate.target-sub');
-    if (!before || !hash) return {count: cells.length, changed: 0};
-    let changed = 0;
+    if (!before || !hash) return {count: cells.length, changed: 0, longestUnchanged: 0};
+    let changed = 0, unchangedRun = 0, longestUnchanged = 0;
     cells.forEach((cell, index) => {
         const text = (cell.textContent || '').trim();
-        if (text && (text.length !== before[index * 2] || hash(text) !== before[index * 2 + 1])) changed++;
+        if (text && (text.length !== before[index * 2] || hash(text) !== before[index * 2 + 1])) {
+            changed++;
+            unchangedRun = 0;
+        } else if (text) {
+            longestUnchanged = Math.max(longestUnchanged, ++unchangedRun);
+        } else {
+            unchangedRun = 0;
+        }
     });
-    return {count: cells.length, changed};
+    return {count: cells.length, changed, longestUnchanged};
 }"""
 
 TEXT_STABLE = r"""(settleMs) => {
@@ -427,6 +434,7 @@ class WebsiteTranslator:
         retry_change_wait_ms: int = 30_000,
         settle_ms: int = 30_000,
         settle_timeout_ms: int = 300_000,
+        partial_settle_ms: int | None = None,
     ) -> None:
         self.chromium_path = chromium_path
         # site_url is injectable for local integration tests, not user input.
@@ -437,6 +445,8 @@ class WebsiteTranslator:
         self.retry_change_wait_ms = retry_change_wait_ms
         self.settle_ms = settle_ms
         self.settle_timeout_ms = settle_timeout_ms
+        # Only use this longer quiet period when the preview looks partial.
+        self.partial_settle_ms = max(settle_ms, partial_settle_ms if partial_settle_ms is not None else settle_ms * 4)
 
     @asynccontextmanager
     async def session(self):
@@ -577,6 +587,23 @@ class WebsiteTranslator:
                     counts = await page.evaluate(TEXT_CHANGE_COUNTS)
                     logger.info("Website text changed in %d of %d displayed cues before download",
                                 counts["changed"], counts["count"])
+                    if (counts["changed"] and counts["longestUnchanged"] >= 20
+                            and self.partial_settle_ms > self.settle_ms):
+                        # Do not reconstruct the file from the preview. A long
+                        # unchanged stretch may simply be legitimate, but give
+                        # a potentially delayed translation more time before
+                        # taking the one authoritative website download.
+                        logger.info("A long unchanged preview section remains; waiting longer before download")
+                        try:
+                            await _wait_for_site_progress(
+                                page, TEXT_STABLE, max(self.settle_timeout_ms, self.partial_settle_ms + 1000),
+                                arg=self.partial_settle_ms, interval=0.5,
+                            )
+                        except PlaywrightTimeout:
+                            raise WebsiteError("The website's translation did not finish settling. Please try again.")
+                        counts = await page.evaluate(TEXT_CHANGE_COUNTS)
+                        logger.info("Website text changed in %d of %d displayed cues after the extra wait",
+                                    counts["changed"], counts["count"])
                     stage = _stage("downloading", on_progress)
                     await _close_vip_popup(page)
                     download_button = await _button(page, "Download", 2)

@@ -76,13 +76,18 @@ function translateFile() {
     if (mode === 'lateronly') {
       if (attempt === 1) cells[cells.length - 1].textContent = 'Hola mundo';
       else for (const cell of cells) cell.textContent = 'Unexpected extra click';
-    } else if (mode === 'partial250' || mode === 'partial250-download-different' || mode === 'partial50' || mode === 'partial10') {
-      const limit = mode === 'partial10' ? 10 : (mode === 'partial50' ? 50 : 250);
+    } else if (mode === 'partial250' || mode === 'partial250-download-different' || mode === 'partial50' || mode === 'partial10' || mode === 'eventuallater') {
+      const limit = (mode === 'partial10' || mode === 'eventuallater') ? 10 : (mode === 'partial50' ? 50 : 250);
       cells.forEach((cell, index) => { if (index < limit) cell.textContent = 'Hola mundo'; });
     } else if (mode !== 'unchanged' && (mode !== 'retry' || attempt > 1)) {
       for (const cell of cells) cell.textContent = 'Hola mundo';
     }
   }, 350);
+  if (mode === 'eventuallater') {
+    setTimeout(() => {
+      for (const cell of document.querySelectorAll('.target-sub')) cell.textContent = 'Final translation';
+    }, 1600);
+  }
   if (mode === 'ongoingloader' || mode === 'ongoingsettle') {
     let count = 0;
     const updates = setInterval(() => {

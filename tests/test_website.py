@@ -22,7 +22,8 @@ def source():
 def translator(url, chromium_path):
     return WebsiteTranslator(chromium_path, site_url=url, stage_timeout_ms=5_000,
                              translation_timeout_ms=1_500, change_wait_ms=800,
-                             retry_change_wait_ms=1_200, settle_ms=1_800, settle_timeout_ms=5_000)
+                             retry_change_wait_ms=1_200, settle_ms=1_800, settle_timeout_ms=5_000,
+                             partial_settle_ms=2_500)
 
 
 async def test_upload_select_wait_for_late_text_and_download(mock_site, chromium_path, source):
@@ -246,6 +247,25 @@ async def test_active_translation_is_not_cut_off_by_an_idle_timeout(mock_site, c
     browser.settle_timeout_ms = 2_500
     result = await browser.translate(source, "es")
     assert b"Final translation" in result.content
+
+
+async def test_long_unchanged_preview_gets_more_time_before_the_one_download(mock_site, chromium_path, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="subtranslate.website")
+    source = prepare_subtitle("".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\nOriginal line {i}\n\n" for i in range(1, 41)
+    ).encode())
+    browser = translator(mock_site + "?mode=eventuallater", chromium_path)
+    browser.settle_ms = 500
+    browser.partial_settle_ms = 2_200
+    stages = []
+    result = await browser.translate(source, "es", on_progress=stages.append)
+    assert result.changed_cues == 40 and result.content.count(b"Final translation") == 40
+    assert stages.count("uploading and parsing the subtitle") == 1 and stages.count("downloading") == 1
+    assert "changed in 10 of 40 displayed cues before download" in caplog.text
+    assert "changed in 40 of 40 displayed cues after the extra wait" in caplog.text
+    assert "Original line" not in caplog.text
 
 
 async def test_waits_until_all_uploaded_cues_are_rendered(mock_site, chromium_path):

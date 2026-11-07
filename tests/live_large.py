@@ -58,14 +58,16 @@ async def main():
         path.write_bytes(original.utf8)
         source = prepare_file_srt(path)
         # Independent public-sample jobs each use one upload and one download.
-        # Compare production's quiet time with a longer wait; this is an
-        # experiment, not evidence about a particular user's earlier file.
+        # Compare production's adaptive wait with a fixed longer quiet time;
+        # this is not evidence about a particular user's earlier file.
         for number, settle_ms in ((1, 30_000), (2, 120_000)):
             stages = []
             start = time.monotonic()
             translator = WebsiteTranslator(os.environ.get("CHROMIUM_PATH"), stage_timeout_ms=90_000,
-                                           translation_timeout_ms=300_000, settle_ms=settle_ms)
-            print(f"Separate job {number}: quiet wait {settle_ms // 1000}s", flush=True)
+                                           translation_timeout_ms=300_000, settle_ms=settle_ms,
+                                           partial_settle_ms=120_000)
+            print(f"Separate job {number}: quiet wait {settle_ms // 1000}s "
+                  "(extended to 120s of quiet if the preview looks partial)", flush=True)
             try:
                 async with asyncio.timeout(600):
                     result = await translator.translate(source, "en", on_progress=stages.append)
