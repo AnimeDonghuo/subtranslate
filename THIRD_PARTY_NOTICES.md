@@ -1,3 +1,7 @@
+The Docker image includes [Xray-core](https://github.com/XTLS/Xray-core),
+licensed under the [Mozilla Public License 2.0](https://github.com/XTLS/Xray-core/blob/main/LICENSE).
+The pinned source is available at https://github.com/XTLS/Xray-core/tree/v26.10.31.
+
 The website automation flow was informed by the MIT-licensed
 [MutennRoshii/subtitle-translator](https://github.com/MutennRoshii/subtitle-translator).
 The success indicator and the idea of retrying after unchanged text were also

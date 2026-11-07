@@ -206,6 +206,7 @@ def create_web_app(settings: Settings, *, telegram_request: BaseRequest | None =
     translator = WebsiteTranslator(
         settings.chromium_path,
         translation_timeout_ms=settings.translation_timeout_seconds * 1000,
+        website_proxies=settings.website_proxies,
     )
     service = BotService(settings, catalog, translator)
     service.install_handlers(telegram)

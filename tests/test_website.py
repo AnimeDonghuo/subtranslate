@@ -64,28 +64,72 @@ async def test_failure_before_upload_can_retry_opening_without_an_extra_upload(s
     session._close_browser.assert_awaited_once()
 
 
-async def test_batch_reuses_browser_isolates_contexts_and_recycles_it(mock_site, chromium_path, source):
+async def test_batch_uses_a_fresh_browser_for_each_translation(mock_site, chromium_path, source, monkeypatch):
+    from subtranslate.website import WebsiteSession
+
     browser = translator(mock_site, chromium_path)
+    browsers = []
+    original = WebsiteSession.browser
+
+    async def record_browser(session):
+        instance = await original(session)
+        browsers.append(instance)
+        return instance
+
+    monkeypatch.setattr(WebsiteSession, "browser", record_browser)
     stages = []
     async with browser.session() as session:
-        session.max_browser_uses = 2
-        first = await session.translate(source, "es", on_progress=stages.append)
-        first_browser = session._browser
-        assert first.cue_count == 1 and first_browser.is_connected()
-        assert not first_browser.contexts
-        second = await session.translate(source, "hi")
-        assert second.cue_count == 1 and session._browser is first_browser
-        assert not first_browser.contexts
-        third = await session.translate(source, "es")
-        second_browser = session._browser
-        assert third.cue_count == 1 and second_browser is not first_browser
-        assert not first_browser.is_connected() and not second_browser.contexts
-    assert not second_browser.is_connected()
+        for code in ("es", "hi", "es"):
+            result = await session.translate(source, code, on_progress=stages.append if not browsers else None)
+            assert result.cue_count == 1
+            assert session._browser is None
+            assert not browsers[-1].is_connected()
+    assert len(browsers) == 3 and len({id(item) for item in browsers}) == 3
     assert stages == [
         "starting the browser", "opening the subtitle site", "uploading and parsing the subtitle",
         "selecting the target language", "translating", "waiting for translation to settle",
         "downloading", "validating the downloaded file",
     ]
+
+
+async def test_translation_disposes_browser_after_failure_and_cancellation():
+    from subtranslate.website import WebsiteSession
+
+    for failure in (WebsiteError("failed"), asyncio.CancelledError()):
+        fake = SimpleNamespace(website_proxies=(), _translate_in_session=AsyncMock(side_effect=failure))
+        session = WebsiteSession(fake, SimpleNamespace())
+        session._close_browser = AsyncMock()
+        with pytest.raises(type(failure)):
+            await session.translate(object(), "es")
+        session._close_browser.assert_awaited_once()
+
+
+async def test_batch_keeps_going_with_new_browser_after_failure():
+    from unittest.mock import Mock
+
+    from subtranslate.website import WebsiteSession
+
+    instances = [SimpleNamespace(is_connected=Mock(return_value=True), close=AsyncMock()) for _ in range(3)]
+    playwright = SimpleNamespace(chromium=SimpleNamespace(launch=AsyncMock(side_effect=instances)))
+    calls = []
+    result = SimpleNamespace(possibly_incomplete=False)
+
+    async def translate_in_session(source, code, session, on_progress):
+        calls.append((code, await session.browser()))
+        if code == "hi":
+            raise WebsiteError("failed")
+        return result
+
+    fake = SimpleNamespace(chromium_path=None, website_proxies=(), _translate_in_session=translate_in_session)
+    session = WebsiteSession(fake, playwright)
+    assert await session.translate(object(), "es") is result
+    with pytest.raises(WebsiteError):
+        await session.translate(object(), "hi")
+    assert await session.translate(object(), "fr") is result
+    assert calls == list(zip(("es", "hi", "fr"), instances))
+    for instance in instances:
+        instance.close.assert_awaited_once()
+    assert session._browser is None
 
 
 async def test_session_restarts_a_disconnected_browser():

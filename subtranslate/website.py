@@ -8,7 +8,7 @@ import re
 import secrets
 import tempfile
 from collections.abc import Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -18,6 +18,7 @@ from playwright.async_api import async_playwright
 
 from .fileio import run_scan
 from .large_srt import FileSubtitle, convert_to_utf8, verify_file_srt
+from .proxies import BrowserProxy, VlessProxy
 from .subtitles import (
     MAX_OUTPUT_BYTES,
     PreparedSubtitle,
@@ -27,6 +28,7 @@ from .subtitles import (
     subtitle_for_website,
     verify_and_merge,
 )
+from .vless import ProxyBridgeError, vless_bridge
 
 logger = logging.getLogger(__name__)
 SITE_URL = "https://translatesubtitles.co/"
@@ -349,14 +351,74 @@ async def _wait_for_site_progress(page, expression: str, idle_timeout_ms: int, *
 
 
 class WebsiteSession:
-    """Reuse a browser for a batch, but isolate every language in a fresh context."""
+    """Keep batch control separate from each translation's disposable browser."""
 
-    def __init__(self, translator, playwright, *, max_browser_uses: int = 10) -> None:
+    def __init__(self, translator, playwright) -> None:
         self.translator = translator
         self.playwright = playwright
-        self.max_browser_uses = max_browser_uses
         self._browser = None
-        self._uses = 0
+        self._proxy: BrowserProxy | None = None
+
+    async def _proxy_endpoint(self, proxy: BrowserProxy | VlessProxy, stack: AsyncExitStack) -> BrowserProxy:
+        if isinstance(proxy, VlessProxy):
+            server = await stack.enter_async_context(vless_bridge(proxy))
+            return BrowserProxy(server)
+        return proxy
+
+    async def _probe_endpoint(self, endpoint: BrowserProxy) -> bool:
+        context = None
+        try:
+            async with asyncio.timeout(20):
+                browser = await self.browser()
+                context = await browser.new_context(proxy=endpoint.playwright_options(), service_workers="block")
+                await context.route("**/*", _block_unnecessary_requests)
+                page = await context.new_page()
+                response = await page.goto(self.translator.site_url, wait_until="domcontentloaded", timeout=18_000)
+                return bool(response and response.ok and await page.locator('input[type="file"]').count())
+        except (PlaywrightError, TimeoutError):
+            return False
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except PlaywrightError:
+                    logger.warning("Could not close proxy preflight context")
+
+    async def _probe_proxy(self, proxy: BrowserProxy | VlessProxy) -> bool:
+        """Test a candidate without uploading, closing any bridge afterward."""
+        try:
+            async with AsyncExitStack() as stack:
+                endpoint = await self._proxy_endpoint(proxy, stack)
+                return await self._probe_endpoint(endpoint)
+        except ProxyBridgeError:
+            return False
+
+    async def _select_proxy(self, stack: AsyncExitStack) -> None:
+        pool = self.translator.website_proxies
+        if not pool:
+            return
+        start = self.translator._proxy_cursor % len(pool)
+        for offset in range(len(pool)):
+            index = (start + offset) % len(pool)
+            candidate = AsyncExitStack()
+            try:
+                endpoint = await self._proxy_endpoint(pool[index], candidate)
+                if await self._probe_endpoint(endpoint):
+                    # Keep this exact checked bridge alive through the download.
+                    stack.push_async_callback(candidate.aclose)
+                    candidate = None
+                    self._proxy = endpoint
+                    self.translator._proxy_cursor = (index + 1) % len(pool)
+                    logger.info("Website proxy preflight succeeded")
+                    return
+            except ProxyBridgeError:
+                pass
+            finally:
+                if candidate is not None:
+                    await candidate.aclose()
+            logger.info("Website proxy preflight failed")
+        self.translator._proxy_cursor = (start + 1) % len(pool)
+        raise WebsiteError("None of the configured proxies could open the subtitle website. Please try again later.")
 
     async def _close_browser(self) -> None:
         if self._browser is not None:
@@ -366,12 +428,9 @@ class WebsiteSession:
                 logger.warning("Could not close the subtitle browser (%s)", type(exc).__name__)
             finally:
                 self._browser = None
-                self._uses = 0
 
     async def browser(self):
-        if self._browser is not None and (not self._browser.is_connected() or self._uses >= self.max_browser_uses):
-            # Recycling periodically bounds long-batch memory growth and also
-            # restarts a browser that crashed between languages.
+        if self._browser is not None and not self._browser.is_connected():
             await self._close_browser()
         if self._browser is None:
             self._browser = await self.playwright.chromium.launch(
@@ -379,7 +438,6 @@ class WebsiteSession:
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
             )
-        self._uses += 1
         return self._browser
 
     async def _translate_with_early_retry(self, source: PreparedSubtitle | FileSubtitle, language_code: str,
@@ -404,7 +462,17 @@ class WebsiteSession:
                         on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:
         # One upload, one Download file. Never reconstruct the SRT from the
         # preview or combine multiple website downloads.
-        result = await self._translate_with_early_retry(source, language_code, on_progress)
+        try:
+            async with AsyncExitStack() as stack:
+                if self.translator.website_proxies:
+                    _stage("checking website proxies", on_progress)
+                    await self._select_proxy(stack)
+                result = await self._translate_with_early_retry(source, language_code, on_progress)
+        finally:
+            # The upload and download must finish in the same browser. Dispose
+            # of it before the next queued language, even on failure/cancel.
+            self._proxy = None
+            await self._close_browser()
         if isinstance(source, PreparedSubtitle):
             suspicious = await asyncio.to_thread(obviously_untranslated_run, source, result, language_code)
             if suspicious:
@@ -435,8 +503,12 @@ class WebsiteTranslator:
         settle_ms: int = 30_000,
         settle_timeout_ms: int = 300_000,
         partial_settle_ms: int | None = None,
+        website_proxies: tuple[BrowserProxy | VlessProxy, ...] = (),
     ) -> None:
         self.chromium_path = chromium_path
+        self.website_proxies = website_proxies
+        self._proxy_cursor = 0
+        self._browser_lock = asyncio.Lock()
         # site_url is injectable for local integration tests, not user input.
         self.site_url = site_url
         self.stage_timeout_ms = stage_timeout_ms
@@ -451,18 +523,36 @@ class WebsiteTranslator:
     @asynccontextmanager
     async def session(self):
         """Open one Playwright session for one or several sequential languages."""
-        try:
-            async with async_playwright() as playwright:
-                session = WebsiteSession(self, playwright)
-                try:
-                    yield session
-                finally:
-                    await session._close_browser()
-        except (PlaywrightError, OSError) as exc:
-            logger.warning("Could not open or close the subtitle browser (%s)", type(exc).__name__)
-            if isinstance(exc, OSError) and exc.errno in {errno.ENOSPC, errno.EDQUOT}:
-                raise WebsiteError("The deployment ran out of temporary disk space; no incomplete file was sent.") from None
-            raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from None
+        async with self._browser_lock:
+            try:
+                async with async_playwright() as playwright:
+                    session = WebsiteSession(self, playwright)
+                    try:
+                        yield session
+                    finally:
+                        await session._close_browser()
+            except (PlaywrightError, OSError) as exc:
+                logger.warning("Could not open or close the subtitle browser (%s)", type(exc).__name__)
+                if isinstance(exc, OSError) and exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                    raise WebsiteError("The deployment ran out of temporary disk space; no incomplete file was sent.") from None
+                raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from None
+
+    async def configure_proxies(self, proxies: tuple[BrowserProxy | VlessProxy, ...]) -> int:
+        """Atomically replace the pool with checked entries; retain it if all fail."""
+        if not proxies:
+            async with self._browser_lock:
+                self.website_proxies = ()
+                self._proxy_cursor = 0
+            return 0
+        async with self.session() as session:
+            working = []
+            for proxy in proxies:
+                if await session._probe_proxy(proxy):
+                    working.append(proxy)
+            if working:
+                self.website_proxies = tuple(working)
+                self._proxy_cursor = 0
+            return len(working)
 
     async def translate(self, source: PreparedSubtitle | FileSubtitle, language_code: str, *,
                         on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:
@@ -495,9 +585,10 @@ class WebsiteTranslator:
                     output_path = Path(temp_dir) / f"download{site_source.extension}"
                     input_path.write_bytes(site_source.utf8)
                 browser = await session.browser()
-                context = await browser.new_context(
-                    accept_downloads=True, locale="en-US", service_workers="block"
-                )
+                context_options = {"accept_downloads": True, "locale": "en-US", "service_workers": "block"}
+                if session._proxy is not None:
+                    context_options["proxy"] = session._proxy.playwright_options()
+                context = await browser.new_context(**context_options)
                 try:
                     await context.route("**/*", _block_unnecessary_requests)
                     page = await context.new_page()

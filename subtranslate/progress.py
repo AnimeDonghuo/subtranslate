@@ -21,6 +21,8 @@ STAGES = (
     ("sending result", "Sending the file to Telegram"),
 )
 _STAGE_INFO = {name: (index, label) for index, (name, label) in enumerate(STAGES, start=1)}
+# Proxy checks are optional and share the browser preparation step.
+_STAGE_INFO["checking website proxies"] = (_STAGE_INFO["starting the browser"][0], "Checking website proxies")
 
 
 def _bar(completed: int, total: int, width: int = 10) -> str:

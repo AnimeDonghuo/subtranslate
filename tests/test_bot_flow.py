@@ -355,7 +355,7 @@ async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chrom
             assert "1/1 cue texts differ" in sent["caption"]
 
 
-async def test_sequential_batch_through_webhook_and_reused_browser(mock_site, chromium_path):
+async def test_sequential_batch_through_webhook_and_fresh_browsers(mock_site, chromium_path):
     from unittest.mock import AsyncMock, patch
 
     import subtranslate.web as bot_web

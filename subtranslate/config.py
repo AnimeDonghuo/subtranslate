@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from .proxies import BrowserProxy, VlessProxy, parse_proxy_pool
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -19,6 +21,7 @@ class Settings:
     # public Bot API's file limits. Never include either value in repr/logs.
     api_id: int | None = field(default=None, repr=False)
     api_hash: str | None = field(default=None, repr=False)
+    website_proxies: tuple[BrowserProxy | VlessProxy, ...] = field(default=(), repr=False)
 
     @property
     def webhook_url(self) -> str:
@@ -99,4 +102,5 @@ class Settings:
             allowed_user_ids=allowed,
             api_id=api_id,
             api_hash=api_hash or None,
+            website_proxies=parse_proxy_pool(os.getenv("WEBSITE_PROXIES", "")),
         )

@@ -30,6 +30,7 @@ from .large_telegram import (
     LargeTransferError,
 )
 from .progress import ProgressMessage
+from .proxies import parse_proxy_pool
 from .subtitles import (
     MAX_INPUT_BYTES,
     SubtitleError,
@@ -50,9 +51,11 @@ HELP = (
     "The site uses Google Translate; please review the result. Your subtitle text is sent to "
     "the site and Google, so don't send confidential files. You need permission to translate the file.\n\n"
     "Use this bot in a private chat. Select all may take hours; use /cancel to stop a batch. "
-    "If a job is interrupted, tap the language button again."
+    "If a job is interrupted, tap the language button again. "
+    "Allowed users can use /proxychk to configure website proxies."
 )
 PICK = "Choose the language you want for this subtitle:"
+MAX_PROXY_INPUT_BYTES = 16 * 1024
 
 
 class JobCancelled(Exception):
@@ -67,6 +70,7 @@ class BotService:
         self.queue = JobQueue(self.process_job, max_waiting=2)
         self._batch_cancellations: dict[int, asyncio.Event] = {}
         self._single_cancellations: dict[int, asyncio.Event] = {}
+        self._proxy_input_chats: set[int] = set()
         self.bot = None
 
     def install_handlers(self, application) -> None:
@@ -74,6 +78,7 @@ class BotService:
         application.add_handler(CommandHandler(["start", "help"], self.help))
         application.add_handler(CommandHandler("id", self.user_id))
         application.add_handler(CommandHandler("cancel", self.cancel_batch))
+        application.add_handler(CommandHandler("proxychk", self.proxy_command))
         application.add_handler(MessageHandler(filters.Document.ALL, self.document))
         application.add_handler(CallbackQueryHandler(self.callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.other_text))
@@ -141,8 +146,85 @@ class BotService:
         else:
             await update.effective_message.reply_text("You have no active or queued translation job.")
 
+    async def _proxy_admin_allowed(self, update: Update) -> bool:
+        if not await self._is_private_and_allowed(update):
+            return False
+        # Proxy configuration affects every user's traffic. Never let an
+        # unrestricted public bot give arbitrary users that control.
+        if self.settings.allowed_user_ids is None:
+            await update.effective_message.reply_text(
+                "Set ALLOWED_USER_IDS on the deployment before using /proxychk. "
+                "Every listed user can change the bot-wide proxy pool."
+            )
+            return False
+        return True
+
+    async def proxy_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self._proxy_admin_allowed(update):
+            return
+        chat_id = update.effective_chat.id
+        args = getattr(context, "args", None) or []
+        if args and len(args) == 1 and args[0].lower() == "direct":
+            self._proxy_input_chats.discard(chat_id)
+            await self._apply_proxy_input(update, "direct")
+        elif args and len(args) == 1 and args[0].lower() == "cancel":
+            self._proxy_input_chats.discard(chat_id)
+            await update.effective_message.reply_text("Proxy input canceled; the existing configuration is unchanged.")
+        elif args:
+            await update.effective_message.reply_text("Use /proxychk, /proxychk direct, or /proxychk cancel.")
+        else:
+            self._proxy_input_chats.add(chat_id)
+            await update.effective_message.reply_text(
+                "Send up to 10 HTTP, HTTPS, SOCKS4, SOCKS5 or VLESS links (or HTTP host:port) as text or a UTF-8 file "
+                "(one per line or comma-separated). Send direct to disable proxies, or /proxychk cancel. "
+                "Only common VLESS transports are supported. "
+                "This changes the bot-wide pool; proxy credentials sent in Telegram are not end-to-end encrypted."
+            )
+
+    async def _apply_proxy_input(self, update: Update, value: str) -> None:
+        message = update.effective_message
+        if len(value.encode("utf-8")) > MAX_PROXY_INPUT_BYTES:
+            await message.reply_text("Proxy input is too large (maximum 16 KiB). Use /proxychk to try again.")
+            return
+        if value.strip().lower() == "direct":
+            proxies = ()
+        else:
+            entries = [part.strip() for line in value.splitlines() for part in line.split(",") if part.strip()]
+            try:
+                proxies = parse_proxy_pool(",".join(entries))
+                if not proxies:
+                    raise ValueError
+            except ValueError:
+                await message.reply_text(
+                    "Invalid or unsupported proxy list. Use HTTP(S), unauthenticated SOCKS4/5, "
+                    "or a supported VLESS link. The existing pool is unchanged; use /proxychk to retry."
+                )
+                return
+        await message.reply_text("Waiting for any active batch to finish, then checking proxy settings. This may take time.")
+        try:
+            count = await self.translator.configure_proxies(proxies)
+        except WebsiteError:
+            await message.reply_text("Could not check the proxies. The existing configuration is unchanged.")
+            return
+        if not proxies:
+            await message.reply_text("Direct server connection enabled for future translations.")
+        elif count:
+            await message.reply_text(
+                f"{count} of {len(proxies)} proxies opened the upload page and are now in the bot-wide pool. "
+                "This does not guarantee translation will work."
+            )
+        else:
+            await message.reply_text("No proxies passed the website check; the existing configuration is unchanged.")
+
     async def other_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if await self._is_private_and_allowed(update):
+        if not await self._is_private_and_allowed(update):
+            return
+        chat_id = update.effective_chat.id
+        if chat_id in self._proxy_input_chats:
+            self._proxy_input_chats.discard(chat_id)
+            if await self._proxy_admin_allowed(update):
+                await self._apply_proxy_input(update, update.effective_message.text or "")
+        else:
             await update.effective_message.reply_text("Send a subtitle file as a document, then choose a language. /help")
 
     async def document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -150,6 +232,25 @@ class BotService:
             return
         message = update.effective_message
         doc = message.document
+        chat_id = update.effective_chat.id
+        if chat_id in self._proxy_input_chats:
+            self._proxy_input_chats.discard(chat_id)
+            if not await self._proxy_admin_allowed(update):
+                return
+            if doc is None or doc.file_size is None or not 0 < doc.file_size <= MAX_PROXY_INPUT_BYTES:
+                await message.reply_text("Send a non-empty UTF-8 proxy file of at most 16 KiB. Use /proxychk to retry.")
+                return
+            try:
+                telegram_file = await self.bot.get_file(doc.file_id)
+                data = await telegram_file.download_as_bytearray(read_timeout=60)
+                if len(data) != doc.file_size or len(data) > MAX_PROXY_INPUT_BYTES:
+                    raise ValueError
+                value = bytes(data).decode("utf-8-sig")
+            except (TelegramError, UnicodeError, ValueError):
+                await message.reply_text("Could not read the proxy file. Use /proxychk to retry; the pool is unchanged.")
+                return
+            await self._apply_proxy_input(update, value)
+            return
         try:
             extension = subtitle_extension(doc.file_name if doc and doc.file_name else "")
         except SubtitleError as exc:
@@ -407,7 +508,7 @@ class BotService:
                 # Parsing and translation have their own inactivity timeouts;
                 # potentially large file operations are cancellable and not
                 # given a fixed total deadline.
-                if stage in {"starting the browser", "uploading and parsing the subtitle", "translating",
+                if stage in {"starting the browser", "checking website proxies", "uploading and parsing the subtitle", "translating",
                              "waiting for translation to settle", "downloading", "validating the downloaded file"}:
                     deadline.reschedule(None)
                 else:
@@ -523,8 +624,8 @@ class BotService:
             else:
                 try:
                     progress.set_stage("starting the browser")
-                    # One browser process is reused for sequential languages;
-                    # each language gets a clean context and a fresh download.
+                    # Batch state stays here while each language uses and
+                    # disposes of its own browser and website context.
                     async with self.translator.session() as translator:
                         for number, (code, name) in enumerate(job.languages, start=1):
                             if cancel.is_set():

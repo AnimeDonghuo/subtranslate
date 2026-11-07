@@ -5,7 +5,7 @@ from subtranslate.config import Settings
 
 @pytest.fixture
 def environment(monkeypatch):
-    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH", "API_ID", "API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_API_ID", "TG_API_HASH"):
+    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH", "API_ID", "API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_API_ID", "TG_API_HASH", "WEBSITE_PROXIES"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BOT_TOKEN", "123456:example")
     monkeypatch.setenv("KOYEB_PUBLIC_DOMAIN", "demo-example.koyeb.app")
@@ -83,3 +83,28 @@ def test_rejects_timeout_over_idle_limit(environment, monkeypatch):
     monkeypatch.setenv("TRANSLATION_TIMEOUT_SECONDS", "3600")
     with pytest.raises(ValueError, match="TRANSLATION_TIMEOUT_SECONDS"):
         Settings.from_env()
+
+
+def test_proxy_configuration_and_secret_redaction(environment, monkeypatch):
+    monkeypatch.setenv("WEBSITE_PROXIES", "http://user:secret%40word@proxy.example:8080, socks5://[::1]:1080")
+    settings = Settings.from_env()
+    assert len(settings.website_proxies) == 2
+    assert settings.website_proxies[0].playwright_options() == {
+        "server": "http://proxy.example:8080", "username": "user", "password": "secret@word"
+    }
+    assert settings.website_proxies[1].server == "socks5://[::1]:1080"
+    monkeypatch.setenv("WEBSITE_PROXIES", "proxy.example:3128")
+    assert Settings.from_env().website_proxies[0].server == "http://proxy.example:3128"
+    assert "secret" not in repr(settings) and "secret" not in repr(settings.website_proxies)
+
+
+@pytest.mark.parametrize("value", [
+    "vless://secret@example.com:443", "http://secret@example.com", "http://example.com:bad",
+    "socks5://user:password@example.com:1080", "http://example.com:8080/path",
+    "http://example.com:8080,", ",".join(["http://example.com:8080"] * 11),
+])
+def test_invalid_proxy_configuration_never_exposes_input(environment, monkeypatch, value):
+    monkeypatch.setenv("WEBSITE_PROXIES", value)
+    with pytest.raises(ValueError) as error:
+        Settings.from_env()
+    assert value not in str(error.value)
