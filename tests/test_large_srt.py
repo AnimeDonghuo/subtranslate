@@ -72,7 +72,10 @@ def test_rejects_missing_extra_and_changed_timing(tmp_path):
         verify_file_srt(source, output, "es")
 
 
-def test_rejects_likely_incomplete_download_without_splitting(tmp_path):
+def test_rejects_likely_incomplete_download_without_splitting(tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="subtranslate.large_srt")
     source_path = tmp_path / "source.srt"
     raw = srt_text(40, "这是一个简单的字幕测试句子")
     source_path.write_text(raw, encoding="utf-8")
@@ -82,6 +85,8 @@ def test_rejects_likely_incomplete_download_without_splitting(tmp_path):
     output.write_text(raw.replace(first, first.replace("这是一个简单的字幕测试句子", "Translated first cue"), 1), encoding="utf-8")
     with pytest.raises(SubtitleError, match="untranslated subtitles"):
         verify_file_srt(source, output, "en")
+    assert "changed 1 of 40 cue texts" in caplog.text and "longest unchanged run 39" in caplog.text
+    assert "这是一个" not in caplog.text and "Translated first cue" not in caplog.text
 
 
 def test_untranslated_run_warning_metadata_crosses_many_cues(tmp_path):

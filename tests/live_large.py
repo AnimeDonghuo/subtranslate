@@ -6,6 +6,7 @@ an incomplete site download; it is not proof of the specific user's root cause.
 """
 
 import asyncio
+import logging
 import os
 import tempfile
 import time
@@ -51,32 +52,44 @@ def print_resource_counts():
 
 async def main():
     original = synthetic_source()
-    translator = WebsiteTranslator(os.environ.get("CHROMIUM_PATH"), stage_timeout_ms=90_000,
-                                   translation_timeout_ms=300_000)
+    failures = 0
     with tempfile.TemporaryDirectory(prefix="subtranslate-live-test-") as directory:
         path = Path(directory) / "synthetic.srt"
         path.write_bytes(original.utf8)
         source = prepare_file_srt(path)
-        # Independent calls model separate Telegram jobs: a single original
-        # upload, wait for animation and settling, then the site's Download.
-        for number in (1, 2):
+        # Independent public-sample jobs each use one upload and one download.
+        # Compare production's quiet time with a longer wait; this is an
+        # experiment, not evidence about a particular user's earlier file.
+        for number, settle_ms in ((1, 30_000), (2, 120_000)):
             stages = []
             start = time.monotonic()
-            async with asyncio.timeout(600):
-                result = await translator.translate(source, "en", on_progress=stages.append)
-            unchanged, cjk = summary(original, result)
-            if unchanged or cjk or stages.count("uploading and parsing the subtitle") != 1 or stages.count("downloading") != 1:
-                raise AssertionError(
-                    f"Job {number}: {unchanged} unchanged, {cjk} Chinese-containing cues, "
-                    f"{stages.count('uploading and parsing the subtitle')} upload(s), "
-                    f"{stages.count('downloading')} download(s)"
-                )
-            print(f"Separate job {number}: {result.cue_count} cues, all changed, "
-                  f"one website download in {time.monotonic() - start:.1f}s", flush=True)
-            result.content.unlink(missing_ok=True)
+            translator = WebsiteTranslator(os.environ.get("CHROMIUM_PATH"), stage_timeout_ms=90_000,
+                                           translation_timeout_ms=300_000, settle_ms=settle_ms)
+            print(f"Separate job {number}: quiet wait {settle_ms // 1000}s", flush=True)
+            try:
+                async with asyncio.timeout(600):
+                    result = await translator.translate(source, "en", on_progress=stages.append)
+                unchanged, cjk = summary(original, result)
+                if (unchanged or cjk or stages.count("uploading and parsing the subtitle") != 1
+                        or stages.count("downloading") != 1):
+                    raise AssertionError(
+                        f"{unchanged} unchanged, {cjk} Chinese-containing cues, "
+                        f"{stages.count('uploading and parsing the subtitle')} upload(s), "
+                        f"{stages.count('downloading')} download(s)"
+                    )
+                print(f"Separate job {number}: {result.cue_count} cues, all changed, "
+                      f"one website download in {time.monotonic() - start:.1f}s", flush=True)
+                result.content.unlink(missing_ok=True)
+            except Exception as exc:  # noqa: BLE001 - finish both independent public experiments
+                failures += 1
+                print(f"Separate job {number} failed in {time.monotonic() - start:.1f}s "
+                      f"({type(exc).__name__}): {str(exc)[:300]}", flush=True)
+    if failures:
+        raise SystemExit(f"{failures} direct website experiment(s) failed.")
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         asyncio.run(main())
     finally:

@@ -74,7 +74,7 @@ To test the **actual website** from a machine with network access, install Chrom
 python -m subtranslate.smoke tests/fixtures/sample.srt hi --output-dir .
 ```
 
-The command refuses to overwrite an existing file. An opt-in **Live website smoke test** runs small public samples and two independent synthetic 405-cue direct-download jobs under Koyeb-like limits. To request it from an unmerged branch, include `[live-site-test]` in the pushed commit message; alternatively use workflow dispatch once the workflow exists on the default branch. It does not use your Telegram bot or Koyeb deployment. Site outages and rate limits can cause failures.
+The command refuses to overwrite an existing file. An opt-in **Live website smoke test** runs small public samples and two independent synthetic 405-cue direct-download jobs under Koyeb-like limits, comparing 30-second and 120-second quiet waits. To request it from an unmerged branch, include `[live-site-test]` in the pushed commit message; alternatively use workflow dispatch once the workflow exists on the default branch. It does not use your Telegram bot or Koyeb deployment. Site outages and rate limits can cause failures.
 
 ## Troubleshooting
 

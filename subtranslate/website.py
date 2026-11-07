@@ -535,6 +535,13 @@ class WebsiteTranslator:
                         except PlaywrightError:
                             logger.info("Website completion state could not be inspected")
                         raise
+                    try:
+                        # Only indicator booleans, never subtitle content.
+                        async with asyncio.timeout(3):
+                            state = await page.evaluate(PROGRESS_DIAGNOSTICS)
+                        logger.info("Website completion state after animation: %s", state)
+                    except (PlaywrightError, TimeoutError):
+                        logger.info("Website completion state could not be inspected")
                     stage = _stage("waiting for translation to settle", on_progress)
                     # Some site versions signal success early or need a second
                     # click for very short files. Retry once only if no cue has

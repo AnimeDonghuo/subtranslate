@@ -33,6 +33,16 @@ async def test_upload_select_wait_for_late_text_and_download(mock_site, chromium
     assert not result.unchanged
 
 
+async def test_success_diagnostics_only_log_indicator_state_and_counts(mock_site, chromium_path, source, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="subtranslate.website")
+    await translator(mock_site, chromium_path).translate(source, "es")
+    assert "Website completion state after animation" in caplog.text
+    assert "Website text changed in 1 of 1 displayed cues" in caplog.text
+    assert "Hello world" not in caplog.text and "Hola mundo" not in caplog.text
+
+
 async def test_output_comes_from_download_button_not_preview(mock_site, chromium_path, source):
     result = await translator(mock_site + "?mode=download-different", chromium_path).translate(source, "es")
     assert result.content == (

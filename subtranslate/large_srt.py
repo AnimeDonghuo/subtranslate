@@ -6,6 +6,7 @@ job-scoped temporary storage until the actual downloaded file is sent.
 """
 
 import codecs
+import logging
 import re
 from contextlib import closing
 from dataclasses import dataclass
@@ -22,6 +23,8 @@ from .subtitles import (
     _comparison_key,
     _parse,
 )
+
+logger = logging.getLogger(__name__)
 
 _TIME = r"[0-9]+[,.:，．。：][0-9]+[,.:，．。：][0-9]+[,.:，．。：]?[0-9]*"
 _TIMING_LINE = re.compile(rf"^[ \t]*{_TIME} *-[ -] *> *{_TIME}[^\r\n]*$")
@@ -202,6 +205,10 @@ def verify_file_srt(source: FileSubtitle, downloaded: Path, language_code: str, 
                 suspicious = detector.add(before.content, after.content)
     if count != source.cue_count:
         raise SubtitleError("The website download has missing cues; no incomplete file was sent.")
+    # Counts only: never log subtitles or filenames. Useful for diagnosing
+    # whether a direct website download is likely to be partial.
+    logger.info("Website download changed %d of %d cue texts; longest unchanged run %d",
+                changed, count, longest)
     if suspicious:
         raise SubtitleError(
             "The website download appears to contain untranslated subtitles, so no incomplete file was sent. "
