@@ -587,12 +587,12 @@ class WebsiteTranslator:
                     counts = await page.evaluate(TEXT_CHANGE_COUNTS)
                     logger.info("Website text changed in %d of %d displayed cues before download",
                                 counts["changed"], counts["count"])
-                    if (counts["changed"] and counts["longestUnchanged"] >= 20
+                    if (counts["longestUnchanged"] >= 20
                             and self.partial_settle_ms > self.settle_ms):
-                        # Do not reconstruct the file from the preview. A long
-                        # unchanged stretch may simply be legitimate, but give
-                        # a potentially delayed translation more time before
-                        # taking the one authoritative website download.
+                        # Even zero changed cues can mean Google's translation
+                        # is still pending after the site's success animation.
+                        # It can also be a legitimate same-language result.
+                        # Give both cases more time before the single download.
                         logger.info("A long unchanged preview section remains; waiting longer before download")
                         try:
                             await _wait_for_site_progress(

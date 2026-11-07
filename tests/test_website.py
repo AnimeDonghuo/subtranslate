@@ -450,3 +450,16 @@ def test_error_categories_are_allowlisted_and_do_not_include_details():
     assert _error_category(Error("frame was detached PRIVATE_TOKEN")) == "frame_detached"
     assert _error_category(Error("net::ERR_CONNECTION_RESET PRIVATE_TOKEN")) == "network"
     assert _error_category(Error("unexpected PRIVATE_TOKEN")) == "other"
+
+
+async def test_long_unchanged_preview_waits_for_delayed_translation(mock_site, chromium_path, caplog):
+    source = prepare_subtitle("".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\nOriginal cue {i}\n\n" for i in range(1, 26)
+    ).encode())
+    browser = translator(mock_site + "?mode=delayedall", chromium_path)
+    browser.change_wait_ms = browser.retry_change_wait_ms = 150
+    browser.settle_ms = 500
+    browser.partial_settle_ms = 3500
+    result = await browser.translate(source, "es")
+    assert b"Delayed translation" in result.content
+    assert not result.unchanged
