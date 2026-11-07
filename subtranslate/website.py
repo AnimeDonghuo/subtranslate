@@ -398,7 +398,9 @@ class WebsiteSession:
         if not pool:
             return
         start = self.translator._proxy_cursor % len(pool)
-        for offset in range(len(pool)):
+        # A large checked pool can later go offline. Bound each job's delay.
+        attempts = min(len(pool), 10)
+        for offset in range(attempts):
             index = (start + offset) % len(pool)
             candidate = AsyncExitStack()
             try:
@@ -417,8 +419,8 @@ class WebsiteSession:
                 if candidate is not None:
                     await candidate.aclose()
             logger.info("Website proxy preflight failed")
-        self.translator._proxy_cursor = (start + 1) % len(pool)
-        raise WebsiteError("None of the configured proxies could open the subtitle website. Please try again later.")
+        self.translator._proxy_cursor = (start + attempts) % len(pool)
+        raise WebsiteError("None of the configured proxies checked could open the subtitle website. Please try again later.")
 
     async def _close_browser(self) -> None:
         if self._browser is not None:
@@ -537,22 +539,30 @@ class WebsiteTranslator:
                     raise WebsiteError("The deployment ran out of temporary disk space; no incomplete file was sent.") from None
                 raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from None
 
-    async def configure_proxies(self, proxies: tuple[BrowserProxy | VlessProxy, ...]) -> int:
-        """Atomically replace the pool with checked entries; retain it if all fail."""
+    async def configure_proxies(self, proxies: tuple[BrowserProxy | VlessProxy, ...], *,
+                                on_progress: Callable[[int, int], None] | None = None) -> int:
+        """Check every candidate in bounded batches, then atomically replace the pool."""
         if not proxies:
             async with self._browser_lock:
                 self.website_proxies = ()
                 self._proxy_cursor = 0
             return 0
-        async with self.session() as session:
-            working = []
-            for proxy in proxies:
-                if await session._probe_proxy(proxy):
-                    working.append(proxy)
-            if working:
+        working = []
+        # Release the browser lock regularly so queued translation jobs can run.
+        # Never create thousands of browsers or check tasks in parallel.
+        for start in range(0, len(proxies), 2):
+            async with self.session() as session:
+                for index, proxy in enumerate(proxies[start:start + 2], start=start + 1):
+                    if await session._probe_proxy(proxy):
+                        working.append(proxy)
+                    if on_progress:
+                        on_progress(index, len(working))
+            await asyncio.sleep(0)
+        if working:
+            async with self._browser_lock:
                 self.website_proxies = tuple(working)
                 self._proxy_cursor = 0
-            return len(working)
+        return len(working)
 
     async def translate(self, source: PreparedSubtitle | FileSubtitle, language_code: str, *,
                         on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:

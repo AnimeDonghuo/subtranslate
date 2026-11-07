@@ -26,8 +26,8 @@ def test_vless_reality_and_tls_websocket_parsing():
 
 
 @pytest.mark.parametrize("query", [
-    "type=xhttp&security=tls", "type=tcp&security=reality&sni=a", "type=ws&security=tls&allowInsecure=1",
-    "type=grpc&security=tls&mode=multi", "type=tcp&security=tls&encryption=other", "type=tcp&type=ws",
+    "type=quic&security=tls", "type=tcp&security=reality&sni=a", "type=ws&security=tls&allowInsecure=1",
+    "type=grpc&security=tls&mode=invalid", "type=tcp&security=tls&encryption=other", "type=tcp&type=ws",
 ])
 def test_rejects_unsupported_vless_options_without_exposing_link(query):
     value = f"vless://{UUID}@private.example:443?{query}"
@@ -39,6 +39,8 @@ def test_rejects_unsupported_vless_options_without_exposing_link(query):
 def test_grpc_vless_link():
     proxy, = parse_proxy_pool(f"vless://{UUID}@grpc.example:443?type=grpc&security=tls&serviceName=svc&mode=gun")
     assert proxy.outbound["streamSettings"]["grpcSettings"]["serviceName"] == "svc"
+    proxy, = parse_proxy_pool(f"vless://{UUID}@grpc.example:443?type=grpc&security=tls&mode=multi")
+    assert proxy.outbound["streamSettings"]["grpcSettings"]["multiMode"] is True
 
 
 async def test_vless_bridge_starts_and_stops_with_private_config(tmp_path, monkeypatch):
@@ -84,3 +86,14 @@ async def test_missing_xray_fails_without_leaking_details(monkeypatch):
         async with vless_bridge(proxy):
             pytest.fail("should not start")
     assert UUID not in str(error.value) and "private.example" not in str(error.value)
+
+
+def test_xhttp_reality_link():
+    proxy, = parse_proxy_pool(
+        f"vless://{UUID}@server.example:443?type=xhttp&security=reality&sni=example.com"
+        "&pbk=key&path=%2Fx&mode=stream-up"
+    )
+    stream = proxy.outbound["streamSettings"]
+    assert stream["network"] == "xhttp"
+    assert stream["xhttpSettings"]["mode"] == "stream-up"
+    assert stream["realitySettings"]["serverName"] == "example.com"

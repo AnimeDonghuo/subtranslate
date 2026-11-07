@@ -40,10 +40,11 @@ def parse_vless(value: str) -> VlessProxy:
         network = params.get("type", "tcp")
         security = params.get("security", "none")
         flow = params.get("flow", "")
-        if (network not in {"tcp", "raw", "ws", "grpc"} or security not in {"none", "tls", "reality"}
+        if (network not in {"tcp", "raw", "ws", "grpc", "xhttp", "splithttp"} or security not in {"none", "tls", "reality"}
                 or params.get("encryption", "none") != "none" or flow not in {"", "xtls-rprx-vision"}):
             raise ValueError
-        if security == "reality" and (not params.get("pbk") or not params.get("sni") or network not in {"tcp", "raw", "grpc"}):
+        if security == "reality" and (not params.get("pbk") or not params.get("sni")
+                                      or network not in {"tcp", "raw", "grpc", "xhttp", "splithttp"}):
             raise ValueError
         if flow and (security not in {"tls", "reality"} or network not in {"tcp", "raw"}):
             raise ValueError
@@ -51,11 +52,16 @@ def parse_vless(value: str) -> VlessProxy:
             raise ValueError
         if security == "none" and any(key in params for key in ("sni", "fp", "alpn")):
             raise ValueError
-        if network != "ws" and any(key in params for key in ("host", "path")):
+        if network not in {"ws", "xhttp", "splithttp"} and any(key in params for key in ("host", "path")):
             raise ValueError
-        if network != "grpc" and any(key in params for key in ("serviceName", "authority", "mode")):
+        if network != "grpc" and any(key in params for key in ("serviceName", "authority")):
             raise ValueError
-        if (params.get("mode", "gun") != "gun" or params.get("headerType", "none") != "none"
+        if ("mode" in params and ((network == "grpc" and params["mode"] not in {"gun", "multi"})
+                                  or (network in {"xhttp", "splithttp"} and params["mode"] not in
+                                      {"auto", "packet-up", "stream-up", "stream-one"})
+                                  or network not in {"grpc", "xhttp", "splithttp"})):
+            raise ValueError
+        if (params.get("headerType", "none") != "none"
                 or params.get("allowInsecure", "0").lower() not in {"0", "false"}):
             raise ValueError
         if "headerType" in params and network not in {"tcp", "raw"}:
@@ -65,7 +71,11 @@ def parse_vless(value: str) -> VlessProxy:
             stream["wsSettings"] = {"path": params.get("path", "/"), "host": params.get("host", "")}
         elif network == "grpc":
             stream["grpcSettings"] = {"serviceName": params.get("serviceName", ""),
-                                      "authority": params.get("authority", "")}
+                                      "authority": params.get("authority", ""),
+                                      "multiMode": params.get("mode") == "multi"}
+        elif network in {"xhttp", "splithttp"}:
+            stream["xhttpSettings"] = {"path": params.get("path", "/"), "host": params.get("host", ""),
+                                       "mode": params.get("mode", "auto")}
         if security == "tls":
             settings = {"serverName": params.get("sni", url.hostname), "allowInsecure": False}
             if params.get("fp"):

@@ -21,6 +21,25 @@ class BrowserProxy:
         return options
 
 
+def parse_proxy_candidates(value: str, limit: int = 80_000) -> tuple[tuple[BrowserProxy | VlessProxy, ...], int]:
+    """Parse a user list, skipping invalid lines without exposing their contents."""
+    result = []
+    invalid = total = 0
+    for line in value.splitlines():
+        for item in line.split(","):
+            item = item.strip()
+            if not item or item.startswith("#"):
+                continue
+            total += 1
+            if total > limit:
+                raise ValueError("Too many proxy entries")
+            try:
+                result.extend(parse_proxy_pool(item))
+            except ValueError:
+                invalid += 1
+    return tuple(result), invalid
+
+
 def parse_proxy_pool(value: str) -> tuple[BrowserProxy | VlessProxy, ...]:
     if not value.strip():
         return ()

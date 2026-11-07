@@ -30,7 +30,7 @@ from .large_telegram import (
     LargeTransferError,
 )
 from .progress import ProgressMessage
-from .proxies import parse_proxy_pool
+from .proxies import parse_proxy_candidates
 from .subtitles import (
     MAX_INPUT_BYTES,
     SubtitleError,
@@ -55,7 +55,8 @@ HELP = (
     "Allowed users can use /proxychk to configure website proxies."
 )
 PICK = "Choose the language you want for this subtitle:"
-MAX_PROXY_INPUT_BYTES = 16 * 1024
+MAX_PROXY_INPUT_BYTES = 19 * 1024 * 1024
+MAX_PROXY_ENTRIES = 80_000
 
 
 class JobCancelled(Exception):
@@ -71,6 +72,8 @@ class BotService:
         self._batch_cancellations: dict[int, asyncio.Event] = {}
         self._single_cancellations: dict[int, asyncio.Event] = {}
         self._proxy_input_chats: set[int] = set()
+        self._proxy_scan_task: asyncio.Task | None = None
+        self._proxy_scan_status: dict[str, int] = {}
         self.bot = None
 
     def install_handlers(self, application) -> None:
@@ -86,6 +89,7 @@ class BotService:
 
     async def shutdown(self) -> None:
         """Best-effort notices for jobs interrupted by a graceful shutdown."""
+        await self._cancel_proxy_scan()
         interrupted = await self.queue.close()
         if not interrupted or self.bot is None:
             return
@@ -159,62 +163,117 @@ class BotService:
             return False
         return True
 
+    async def _cancel_proxy_scan(self) -> bool:
+        task = self._proxy_scan_task
+        if task is None or task.done():
+            return False
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return True
+
     async def proxy_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._proxy_admin_allowed(update):
             return
         chat_id = update.effective_chat.id
         args = getattr(context, "args", None) or []
-        if args and len(args) == 1 and args[0].lower() == "direct":
+        command = args[0].lower() if len(args) == 1 else ""
+        if command == "direct":
             self._proxy_input_chats.discard(chat_id)
+            await self._cancel_proxy_scan()
             await self._apply_proxy_input(update, "direct")
-        elif args and len(args) == 1 and args[0].lower() == "cancel":
+        elif command == "cancel":
             self._proxy_input_chats.discard(chat_id)
-            await update.effective_message.reply_text("Proxy input canceled; the existing configuration is unchanged.")
+            canceled = await self._cancel_proxy_scan()
+            await update.effective_message.reply_text(
+                "Proxy scan canceled. If it had already finished, its checked pool may already be active." if canceled
+                else "Proxy input canceled; the existing configuration is unchanged."
+            )
+        elif command == "status":
+            task = self._proxy_scan_task
+            if task is None or task.done():
+                await update.effective_message.reply_text("No proxy scan is running.")
+            elif not self._proxy_scan_status:
+                await update.effective_message.reply_text("Preparing the proxy list.")
+            else:
+                status = self._proxy_scan_status
+                await update.effective_message.reply_text(
+                    f"Proxy scan: {status['checked']:,}/{status['total']:,} checked, "
+                    f"{status['working']:,} passed; {status['invalid']:,} invalid entries skipped."
+                )
         elif args:
-            await update.effective_message.reply_text("Use /proxychk, /proxychk direct, or /proxychk cancel.")
+            await update.effective_message.reply_text("Use /proxychk, /proxychk status, /proxychk direct, or /proxychk cancel.")
         else:
             self._proxy_input_chats.add(chat_id)
             await update.effective_message.reply_text(
-                "Send up to 10 HTTP, HTTPS, SOCKS4, SOCKS5 or VLESS links (or HTTP host:port) as text or a UTF-8 file "
-                "(one per line or comma-separated). Send direct to disable proxies, or /proxychk cancel. "
-                "Only common VLESS transports are supported. "
-                "This changes the bot-wide pool; proxy credentials sent in Telegram are not end-to-end encrypted."
+                "Send up to 80,000 HTTP, HTTPS, SOCKS4, SOCKS5 or VLESS links as text or a UTF-8 file "
+                "up to 19 MiB, one per line or comma-separated. Only test proxies you are authorized to use. "
+                "Use /proxychk status, /proxychk cancel, or /proxychk direct. "
+                "This changes the bot-wide pool; Telegram bot chats are not end-to-end encrypted."
             )
+
+    async def _run_proxy_scan(self, message, value: str) -> None:
+        heartbeat = asyncio.create_task(self._keep_active_job_awake(), name="proxy-scan-heartbeat")
+        try:
+            proxies, invalid = await asyncio.to_thread(parse_proxy_candidates, value, MAX_PROXY_ENTRIES)
+            del value
+            if not proxies:
+                await message.reply_text("No valid or supported proxy entries were found; the existing pool is unchanged.")
+                return
+            self._proxy_scan_status = {"checked": 0, "total": len(proxies), "working": 0, "invalid": invalid}
+
+            def progress(checked: int, working: int) -> None:
+                self._proxy_scan_status.update(checked=checked, working=working)
+
+            count = await self.translator.configure_proxies(proxies, on_progress=progress)
+            if count:
+                await message.reply_text(
+                    f"Proxy scan finished: {count:,} of {len(proxies):,} passed; {invalid:,} invalid entries skipped. "
+                    "The passing proxies are now in the bot-wide pool. This does not guarantee translation will work."
+                )
+            else:
+                await message.reply_text(
+                    f"No proxies passed ({len(proxies):,} checked, {invalid:,} invalid skipped); "
+                    "the existing configuration is unchanged."
+                )
+        except asyncio.CancelledError:
+            raise
+        except ValueError:
+            await message.reply_text("Proxy list exceeds 80,000 entries; the existing pool is unchanged.")
+        except TelegramError:
+            logger.warning("Could not send proxy scan status to Telegram")
+        except Exception as exc:  # noqa: BLE001 - never log endpoints or credentials
+            logger.warning("Proxy scan failed (%s)", type(exc).__name__)
+            try:
+                await message.reply_text("Could not check the proxies. The existing configuration is unchanged.")
+            except TelegramError:
+                pass
+        finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def _apply_proxy_input(self, update: Update, value: str) -> None:
         message = update.effective_message
         if len(value.encode("utf-8")) > MAX_PROXY_INPUT_BYTES:
-            await message.reply_text("Proxy input is too large (maximum 16 KiB). Use /proxychk to try again.")
+            await message.reply_text("Proxy input is too large (maximum 19 MiB). Use /proxychk to try again.")
             return
         if value.strip().lower() == "direct":
-            proxies = ()
-        else:
-            entries = [part.strip() for line in value.splitlines() for part in line.split(",") if part.strip()]
+            await self._cancel_proxy_scan()
             try:
-                proxies = parse_proxy_pool(",".join(entries))
-                if not proxies:
-                    raise ValueError
-            except ValueError:
-                await message.reply_text(
-                    "Invalid or unsupported proxy list. Use HTTP(S), unauthenticated SOCKS4/5, "
-                    "or a supported VLESS link. The existing pool is unchanged; use /proxychk to retry."
-                )
+                await self.translator.configure_proxies(())
+            except WebsiteError:
+                await message.reply_text("Could not change proxy settings; the existing pool is unchanged.")
                 return
-        await message.reply_text("Waiting for any active batch to finish, then checking proxy settings. This may take time.")
-        try:
-            count = await self.translator.configure_proxies(proxies)
-        except WebsiteError:
-            await message.reply_text("Could not check the proxies. The existing configuration is unchanged.")
-            return
-        if not proxies:
             await message.reply_text("Direct server connection enabled for future translations.")
-        elif count:
-            await message.reply_text(
-                f"{count} of {len(proxies)} proxies opened the upload page and are now in the bot-wide pool. "
-                "This does not guarantee translation will work."
-            )
-        else:
-            await message.reply_text("No proxies passed the website check; the existing configuration is unchanged.")
+            return
+        if self._proxy_scan_task is not None and not self._proxy_scan_task.done():
+            await message.reply_text("A proxy scan is already running. Use /proxychk status or /proxychk cancel.")
+            return
+        self._proxy_scan_status = {}
+        self._proxy_scan_task = asyncio.create_task(self._run_proxy_scan(message, value), name="proxy-scan")
+        await message.reply_text(
+            "Proxy scan started in the background. It may take hours or days for large lists. "
+            "Use /proxychk status or /proxychk cancel. The existing pool remains active until the scan finishes."
+        )
 
     async def other_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_private_and_allowed(update):
@@ -238,7 +297,7 @@ class BotService:
             if not await self._proxy_admin_allowed(update):
                 return
             if doc is None or doc.file_size is None or not 0 < doc.file_size <= MAX_PROXY_INPUT_BYTES:
-                await message.reply_text("Send a non-empty UTF-8 proxy file of at most 16 KiB. Use /proxychk to retry.")
+                await message.reply_text("Send a non-empty UTF-8 proxy file of at most 19 MiB. Use /proxychk to retry.")
                 return
             try:
                 telegram_file = await self.bot.get_file(doc.file_id)

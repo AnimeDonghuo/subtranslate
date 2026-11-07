@@ -20,6 +20,7 @@ async def test_command_accepts_vless_in_plain_text_without_echoing_secret():
     incoming = SimpleNamespace(effective_message=message, effective_chat=command.effective_chat,
                                effective_user=command.effective_user)
     await service.other_text(incoming, None)
+    await service._proxy_scan_task
     proxy, = translator.configure_proxies.await_args.args[0]
     assert isinstance(proxy, VlessProxy)
     assert "1 of 1" in message.reply_text.await_args.args[0]

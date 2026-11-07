@@ -89,3 +89,15 @@ async def test_selected_vless_bridge_stays_open_until_translation_finishes(monke
     assert await session.translate(object(), "es") is result
     assert state == ["started", "stopped"]
     session._probe_endpoint.assert_awaited_once()
+
+
+def test_parse_large_mixed_list_skips_invalid_and_keeps_working_vless():
+    from subtranslate.proxies import parse_proxy_candidates
+
+    entries = [f"192.0.2.1:{1000 + i % 50000}" for i in range(80_000)]
+    entries[9] = "not-a-proxy"
+    entries[11] = "vless://12345678-1234-4234-8234-123456789abc@host.test:443?security=tls"
+    proxies, invalid = parse_proxy_candidates("\n".join(entries))
+    assert len(proxies) == 79_999 and invalid == 1
+    with pytest.raises(ValueError, match="Too many"):
+        parse_proxy_candidates("\n".join(entries + ["192.0.2.1:8080"]))

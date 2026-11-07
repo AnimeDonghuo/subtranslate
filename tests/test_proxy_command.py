@@ -27,6 +27,7 @@ async def test_proxy_command_text_and_direct():
     await bot.proxy_command(command, SimpleNamespace(args=[]))
     incoming = update(text="http://user:secret@one.test:8080\nsocks5://two.test:1080")
     await bot.other_text(incoming, None)
+    await bot._proxy_scan_task
     proxies = bot.translator.configure_proxies.await_args.args[0]
     assert len(proxies) == 2 and proxies[0].password == "secret"
     assert "1 of 2" in incoming.effective_message.reply_text.await_args.args[0]
@@ -45,11 +46,13 @@ async def test_proxy_file_and_invalid_vless_leave_configuration_unchanged():
     await bot.proxy_command(update(), SimpleNamespace(args=[]))
     file_update = update(document=SimpleNamespace(file_id="id", file_size=len(data)))
     await bot.document(file_update, None)
+    await bot._proxy_scan_task
     assert bot.translator.configure_proxies.await_count == 1
     await bot.proxy_command(update(), SimpleNamespace(args=[]))
     invalid = update(text="vless://private-uuid@server.example:443?security=tls")
     await bot.other_text(invalid, None)
-    assert "Invalid or unsupported" in invalid.effective_message.reply_text.await_args.args[0]
+    await bot._proxy_scan_task
+    assert "No valid or supported" in invalid.effective_message.reply_text.await_args.args[0]
     assert "private-uuid" not in str(invalid.effective_message.reply_text.await_args_list)
     assert bot.translator.configure_proxies.await_count == 1
 
@@ -73,9 +76,9 @@ async def test_admin_required_and_no_cross_user_input():
 async def test_proxy_file_limit_and_cancel():
     bot = service()
     await bot.proxy_command(update(), SimpleNamespace(args=[]))
-    large = update(document=SimpleNamespace(file_size=16385))
+    large = update(document=SimpleNamespace(file_size=19 * 1024 * 1024 + 1))
     await bot.document(large, None)
-    assert "at most 16 KiB" in large.effective_message.reply_text.await_args.args[0]
+    assert "at most 19 MiB" in large.effective_message.reply_text.await_args.args[0]
     await bot.proxy_command(update(), SimpleNamespace(args=[]))
     await bot.proxy_command(update(), SimpleNamespace(args=["cancel"]))
     assert not bot._proxy_input_chats
@@ -111,3 +114,65 @@ async def test_direct_waits_for_active_browser_session():
     assert not task.done() and translator.website_proxies
     translator._browser_lock.release()
     assert await task == 0 and translator.website_proxies == ()
+
+
+async def test_background_scan_reports_status_and_cancels():
+    import asyncio
+
+    bot = service()
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def configure(proxies, *, on_progress=None):
+        try:
+            on_progress(1, 1)
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    bot.translator.configure_proxies = AsyncMock(side_effect=configure)
+    await bot.proxy_command(update(), SimpleNamespace(args=[]))
+    message = update(text="http://a.test:80\nhttp://b.test:80\ninvalid")
+    await bot.other_text(message, None)
+    await asyncio.wait_for(started.wait(), 2)
+    status = update()
+    await bot.proxy_command(status, SimpleNamespace(args=["status"]))
+    assert "1/2 checked, 1 passed; 1 invalid" in status.effective_message.reply_text.await_args.args[0]
+    cancel = update()
+    await bot.proxy_command(cancel, SimpleNamespace(args=["cancel"]))
+    assert stopped.is_set()
+    assert "scan canceled" in cancel.effective_message.reply_text.await_args.args[0]
+
+
+async def test_cancelled_scan_does_not_replace_previous_pool():
+    import asyncio
+
+    old = parse_proxy_pool("http://old.test:8080")
+    new = parse_proxy_pool("http://a.test:80,http://b.test:80,http://c.test:80")
+    translator = WebsiteTranslator(website_proxies=old)
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    calls = 0
+
+    async def probe(_):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            started.set()
+            await asyncio.Event().wait()
+        return True
+
+    @asynccontextmanager
+    async def fake_session():
+        try:
+            yield SimpleNamespace(_probe_proxy=probe)
+        finally:
+            closed.set()
+
+    translator.session = fake_session
+    task = asyncio.create_task(translator.configure_proxies(new))
+    await asyncio.wait_for(started.wait(), 2)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert translator.website_proxies == old and closed.is_set()
