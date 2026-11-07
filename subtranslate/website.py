@@ -294,9 +294,9 @@ class WebsiteSession:
             suspicious = await asyncio.to_thread(obviously_untranslated_run, part, result, language_code)
             if suspicious:
                 # A smaller upload can recover from sites that stop translating
-                # midway. The two-level limit keeps retries bounded.
+                # midway. The depth limit keeps repeated retries bounded.
                 smaller = []
-                if part.extension == ".srt" and len(part.cues) >= 20 and depth < 2:
+                if part.extension == ".srt" and len(part.cues) >= 20 and depth < 4:
                     smaller = await asyncio.to_thread(
                         split_srt_for_website, part, max_cues=max(1, len(part.cues) // 2)
                     )

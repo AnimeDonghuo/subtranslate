@@ -303,3 +303,15 @@ def test_obvious_wrong_script_run_is_detected_without_rejecting_names_or_same_la
         f"{i}\n00:00:01,000 --> 00:00:02,000\n很长的重复名字\n\n" for i in range(1, 26)
     ).encode())
     assert obviously_untranslated_run(repeated, verify_and_merge(repeated, repeated.utf8), "en") == 0
+
+
+def test_dense_srt_does_not_create_excessive_website_uploads():
+    from subtranslate.subtitles import split_srt_for_website
+
+    # A near-1 MB input was taking too long when the character limit divided
+    # 200-cue uploads into many tiny pieces. The cue cap remains the primary
+    # bound; obvious incomplete downloads can still be subdivided on retry.
+    source = prepare_subtitle(_many_srt(3000, "x" * 240))
+    parts = split_srt_for_website(source)
+    assert len(parts) == 15
+    assert all(len(part.cues) == 200 for part in parts)

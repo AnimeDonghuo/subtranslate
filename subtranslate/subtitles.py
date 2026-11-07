@@ -16,7 +16,7 @@ MAX_CUES = 3000
 # of a large table. Keep SRT uploads bounded; these are conservative bot
 # limits, not documented limits or guarantees from the third-party site.
 MAX_WEBSITE_PART_CUES = 200
-MAX_WEBSITE_PART_TEXT_CHARS = 20_000
+MAX_WEBSITE_PART_TEXT_CHARS = 60_000
 SUPPORTED_EXTENSIONS = frozenset({".srt", ".ass", ".sub", ".sbv", ".vtt", ".stl"})
 
 
