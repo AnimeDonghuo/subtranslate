@@ -50,6 +50,8 @@ class _RetryableWebsiteError(WebsiteError):
 def _error_category(exc: Exception) -> str:
     """Classify common Playwright failures without logging exception details."""
     detail = str(exc).lower()
+    if "page crashed" in detail or "page crash" in detail:
+        return "page_crashed"
     if (type(exc).__name__ == "TargetClosedError" or "target page, context or browser has been closed" in detail
             or "target closed" in detail):
         return "page_or_browser_closed"

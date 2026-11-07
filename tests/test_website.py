@@ -302,3 +302,14 @@ async def test_large_sub_bridge_combines_downloads_and_restores_every_frame(mock
     assert [(cue.start, cue.end) for cue in prepare_subtitle(result.content, "movie.sub").cues] == [
         (cue.start, cue.end) for cue in source.cues
     ]
+
+
+def test_error_categories_are_allowlisted_and_do_not_include_details():
+    from playwright.async_api import Error
+
+    from subtranslate.website import _error_category
+
+    assert _error_category(Error("Page crashed PRIVATE_TOKEN")) == "page_crashed"
+    assert _error_category(Error("frame was detached PRIVATE_TOKEN")) == "frame_detached"
+    assert _error_category(Error("net::ERR_CONNECTION_RESET PRIVATE_TOKEN")) == "network"
+    assert _error_category(Error("unexpected PRIVATE_TOKEN")) == "other"

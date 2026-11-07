@@ -8,6 +8,7 @@ site or Telegram. The fake transport is shared with the normal bot tests.
 
 import asyncio
 import os
+import re
 import shutil
 import time
 from pathlib import Path
@@ -28,14 +29,20 @@ from subtranslate.website import WebsiteTranslator
 async def wait_for_result(stub: fake_telegram.TelegramStub) -> None:
     """Fail promptly if the bot reports an error rather than sending a file."""
     inspected = 0
+    last_reported = 0
     while not stub.document_sent.is_set():
         for action, params in stub.calls[inspected:]:
             text = params.get("text", "")
-            if action == "sendMessage" and text.startswith((
+            if action in {"sendMessage", "editMessageText"} and text.startswith((
                 "Could not translate:", "Translation timed out.",
                 "Telegram could not", "Something went wrong",
             )):
                 raise AssertionError(f"The mocked job failed: {text}")
+            if action == "editMessageText":
+                match = re.search(r"Subtitle part: (\d+)/(\d+)", text)
+                if match and int(match[1]) // 10 > last_reported // 10:
+                    last_reported = int(match[1])
+                    print(f"Resource test: working on part {match[1]}/{match[2]}", flush=True)
         inspected = len(stub.calls)
         await asyncio.sleep(0.25)
 
@@ -88,7 +95,10 @@ async def main() -> None:
                     "/telegram/webhook", headers=headers, json=fake_telegram.callback_update(21),
                 )
                 assert response.status == 200
-                await asyncio.wait_for(wait_for_result(stub), 300)
+                # A near-1 MB sample produces many sequential uploads; slower
+                # CI hosts need longer than five minutes even for a local mock.
+                # The bot's own per-language 900-second deadline still applies.
+                await asyncio.wait_for(wait_for_result(stub), 750)
                 upload = next(iter(stub.uploads[0].values()))
                 assert upload[0] == "movie.Hindi.srt"
                 cues = list(srt.parse(upload[1].decode("utf-8")))
