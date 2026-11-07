@@ -1,18 +1,20 @@
-"""Opt-in live-site test with synthetic Chinese SRTs and separate jobs.
+"""Opt-in live-site test of one direct download per synthetic SRT job.
 
-This never uses a user's files, Telegram account, or deployment. Run under
-Koyeb-like limits in the opt-in GitHub workflow. The unchunked baseline is
-informational only: the site's behavior may change from one run to another.
+This never uses a user's files, Telegram account, or deployment. It runs under
+Koyeb-like limits in GitHub. A failure may reflect an external site outage or
+an incomplete site download; it is not proof of the specific user's root cause.
 """
 
 import asyncio
 import os
+import tempfile
 import time
 from datetime import timedelta
 from pathlib import Path
 
 import srt
 
+from subtranslate.large_srt import prepare_file_srt
 from subtranslate.subtitles import prepare_subtitle
 from subtranslate.website import WebsiteTranslator
 
@@ -27,7 +29,8 @@ def synthetic_source(count: int = 405):
 
 
 def summary(source, result):
-    output = prepare_subtitle(result.content)
+    data = result.content.read_bytes() if isinstance(result.content, Path) else result.content
+    output = prepare_subtitle(data)
     if len(output.cues) != len(source.cues):
         raise AssertionError("The site changed the cue count")
     if any((a.start, a.end) != (b.start, b.end) for a, b in zip(source.cues, output.cues)):
@@ -47,37 +50,30 @@ def print_resource_counts():
 
 
 async def main():
-    source = synthetic_source()
+    original = synthetic_source()
     translator = WebsiteTranslator(os.environ.get("CHROMIUM_PATH"), stage_timeout_ms=90_000,
-                                   translation_timeout_ms=120_000)
-    # Compare the old, single-upload behavior without ever sending it to a
-    # user. This is a diagnostic, not an assertion about the site's behavior.
-    try:
-        async with asyncio.timeout(240):
-            async with translator.session() as session:
-                raw = await translator._translate_in_session(source, "en", session, None)
-        unchanged, cjk = summary(source, raw)
-        print(f"Single-upload baseline: {len(source.cues)} cues; {unchanged} unchanged, "
-              f"{cjk} contain Chinese characters", flush=True)
-    except Exception as exc:  # noqa: BLE001 - diagnostic must not prevent the actual recovery test
-        print(f"Single-upload baseline could not complete ({type(exc).__name__})", flush=True)
-
-    # Independent translate() calls create and close distinct Playwright
-    # sessions, modeling two separate jobs rather than two batch languages.
-    for number in (1, 2):
-        stages = []
-        start = time.monotonic()
-        async with asyncio.timeout(600):
-            result = await translator.translate(source, "en", on_progress=stages.append)
-        unchanged, cjk = summary(source, result)
-        part_events = [stage for stage in stages if stage.startswith("part:")]
-        if unchanged or cjk or len(part_events) < 3:
-            raise AssertionError(
-                f"Job {number}: {unchanged} unchanged, {cjk} Chinese-containing cues, "
-                f"{len(part_events)} part events"
-            )
-        print(f"Separate job {number}: {result.cue_count} cues, all changed, "
-              f"no Chinese characters, {len(part_events)} parts in {time.monotonic() - start:.1f}s", flush=True)
+                                   translation_timeout_ms=300_000)
+    with tempfile.TemporaryDirectory(prefix="subtranslate-live-test-") as directory:
+        path = Path(directory) / "synthetic.srt"
+        path.write_bytes(original.utf8)
+        source = prepare_file_srt(path)
+        # Independent calls model separate Telegram jobs: a single original
+        # upload, wait for animation and settling, then the site's Download.
+        for number in (1, 2):
+            stages = []
+            start = time.monotonic()
+            async with asyncio.timeout(600):
+                result = await translator.translate(source, "en", on_progress=stages.append)
+            unchanged, cjk = summary(original, result)
+            if unchanged or cjk or stages.count("uploading and parsing the subtitle") != 1 or stages.count("downloading") != 1:
+                raise AssertionError(
+                    f"Job {number}: {unchanged} unchanged, {cjk} Chinese-containing cues, "
+                    f"{stages.count('uploading and parsing the subtitle')} upload(s), "
+                    f"{stages.count('downloading')} download(s)"
+                )
+            print(f"Separate job {number}: {result.cue_count} cues, all changed, "
+                  f"one website download in {time.monotonic() - start:.1f}s", flush=True)
+            result.content.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

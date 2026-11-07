@@ -4,6 +4,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 import pysubs2
 import srt
@@ -12,11 +13,6 @@ from charset_normalizer import from_bytes
 MAX_INPUT_BYTES = 1_000_000
 MAX_OUTPUT_BYTES = 5_000_000
 MAX_CUES = 3000
-# The site can report success even when it has translated only an early part
-# of a large table. Keep SRT uploads bounded; these are conservative bot
-# limits, not documented limits or guarantees from the third-party site.
-MAX_WEBSITE_PART_CUES = 200
-MAX_WEBSITE_PART_TEXT_CHARS = 60_000
 SUPPORTED_EXTENSIONS = frozenset({".srt", ".ass", ".sub", ".sbv", ".vtt", ".stl"})
 
 
@@ -40,7 +36,9 @@ class PreparedSubtitle:
 
 @dataclass(frozen=True)
 class TranslatedSubtitle:
-    content: bytes
+    # Large SRT results live in a private temporary file until Telegram has
+    # finished sending them; individual website downloads remain bytes.
+    content: bytes | Path
     cue_count: int
     unchanged: bool
     changed_cues: int | None = None
@@ -76,11 +74,7 @@ def decode_subtitle(data: bytes) -> str:
 
 def _parse(text: str, *, is_output: bool = False) -> list[srt.Subtitle]:
     try:
-        cues = []
-        for cue in srt.parse(text):
-            cues.append(cue)
-            if len(cues) > MAX_CUES:
-                raise SubtitleError(f"The file has more than {MAX_CUES:,} cues. Split it and try again.")
+        cues = list(srt.parse(text))
     except (srt.SRTParseError, ValueError, OverflowError) as exc:
         if isinstance(exc, SubtitleError):
             raise
@@ -186,12 +180,14 @@ def _parse_other(text: str, extension: str) -> list[OtherCue]:
 
 def prepare_subtitle(data: bytes, filename: str = "subtitle.srt") -> PreparedSubtitle:
     extension = subtitle_extension(filename)
-    if len(data) > MAX_INPUT_BYTES:
-        raise SubtitleError("The subtitle is too large. The limit is 1,000,000 bytes (about 1 MB).")
+    # Non-SRT formats still use their existing in-memory restoration path.
+    # Large SRTs are routed through the disk-backed parser by the bot/CLI.
+    if extension != ".srt" and len(data) > MAX_INPUT_BYTES:
+        raise SubtitleError("This non-SRT subtitle format is limited to 1 MB. Try SRT for larger files.")
     text = decode_subtitle(data)
     encoded = text.encode("utf-8")
-    if len(encoded) > MAX_INPUT_BYTES:
-        raise SubtitleError("The subtitle exceeds 1 MB after conversion to UTF-8. Split it and try again.")
+    if extension != ".srt" and len(encoded) > MAX_INPUT_BYTES:
+        raise SubtitleError("This non-SRT subtitle exceeds 1 MB after UTF-8 conversion. Try SRT instead.")
     cues = _parse(text) if extension == ".srt" else _parse_other(text, extension)
     return PreparedSubtitle(utf8=encoded, cues=cues, extension=extension)
 
@@ -215,66 +211,6 @@ def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
     if len(encoded) > MAX_INPUT_BYTES:
         raise SubtitleError("The SUB file exceeds 1 MB when prepared for translation. Split it and try again.")
     return PreparedSubtitle(utf8=encoded, cues=site_cues, extension=".srt")
-
-
-def split_srt_for_website(
-    source: PreparedSubtitle, *, max_cues: int = MAX_WEBSITE_PART_CUES,
-    max_text_chars: int = MAX_WEBSITE_PART_TEXT_CHARS,
-) -> list[PreparedSubtitle]:
-    """Create bounded, independently uploadable SRTs without changing times.
-
-    Other formats retain their existing upload path. SUB is converted to SRT
-    before this function is called. A single long cue cannot be split safely.
-    """
-    if max_cues < 1 or max_text_chars < 1:
-        raise ValueError("Subtitle part limits must be positive")
-    if source.extension != ".srt":
-        return [source]
-    groups = []
-    current = []
-    text_chars = 0
-    for cue in source.cues:
-        length = len(cue.content)
-        if current and (len(current) >= max_cues or text_chars + length > max_text_chars):
-            groups.append(current)
-            current = []
-            text_chars = 0
-        current.append(cue)
-        text_chars += length
-    if current:
-        groups.append(current)
-    if len(groups) <= 1:
-        # Preserve a small file exactly as supplied to the site.
-        return [source]
-    parts = []
-    for group in groups:
-        # Each upload starts at 1, since the site may assume sequential cue
-        # numbers. The downloaded parts are renumbered once when combined.
-        cues = [srt.Subtitle(index=index, start=cue.start, end=cue.end,
-                             content=cue.content, proprietary=cue.proprietary)
-                for index, cue in enumerate(group, start=1)]
-        encoded = srt.compose(cues, reindex=False).encode("utf-8")
-        parts.append(PreparedSubtitle(utf8=encoded, cues=cues, extension=".srt"))
-    return parts
-
-
-def combine_srt_downloads(source: PreparedSubtitle, parts: list[TranslatedSubtitle]) -> TranslatedSubtitle:
-    """Combine actual downloaded SRTs, never the website's on-page preview."""
-    if source.extension != ".srt" or not parts:
-        raise SubtitleError("The translated subtitle parts could not be combined.")
-    downloaded_cues = []
-    for part in parts:
-        downloaded_cues.extend(_parse(decode_subtitle(part.content), is_output=True))
-    if len(downloaded_cues) != len(source.cues):
-        raise SubtitleError("The downloaded subtitle parts have missing cues. Please try again.")
-    combined = []
-    for index, (original, downloaded) in enumerate(zip(source.cues, downloaded_cues), start=1):
-        if original.start != downloaded.start or original.end != downloaded.end:
-            raise SubtitleError("The downloaded subtitle parts have changed timestamps. Please try again.")
-        combined.append(srt.Subtitle(index=index, start=downloaded.start, end=downloaded.end,
-                                     content=downloaded.content, proprietary=downloaded.proprietary))
-    encoded = srt.compose(combined, reindex=False).encode("utf-8")
-    return verify_and_merge(source, encoded)
 
 
 _CJK_TARGETS = frozenset({"zh-CN", "zh-TW", "yue", "ja", "ko"})
@@ -304,44 +240,55 @@ def _cjk_letter_count(text: str) -> int:
     )
 
 
+class UntranslatedRunDetector:
+    """Incremental, conservative script-mismatch signal; not a language detector."""
+
+    def __init__(self, language_code: str):
+        self.language_code = language_code
+        self.run = self.chars = self.gap = 0
+        self.distinct: set[int] = set()
+
+    def add(self, original: str, output: str) -> int:
+        before, after = original.strip(), output.strip()
+        key = _comparison_key(before)
+        if not key or key != _comparison_key(after):
+            self.run = self.chars = self.gap = 0
+            self.distinct.clear()
+            return 0
+        clean = _plain_cue_text(before)
+        cjk = _cjk_letter_count(clean) if self.language_code not in _CJK_TARGETS else 0
+        latin = (sum("LATIN" in unicodedata.name(char, "") and char.isalpha() for char in clean)
+                 if self.language_code in _NON_LATIN_TARGETS else 0)
+        weight = cjk if cjk >= 3 else latin if latin >= 12 else 0
+        if weight:
+            self.run += 1
+            self.chars += weight
+            # Fingerprints avoid retaining potentially huge cue text in memory.
+            self.distinct.add(hash(key))
+            self.gap = 0
+            if self.run >= 5 and self.chars >= 30 and len(self.distinct) >= 3:
+                return self.run
+        else:
+            self.gap += 1
+            if self.gap > 2:
+                self.run = self.chars = self.gap = 0
+                self.distinct.clear()
+        return 0
+
+
 def obviously_untranslated_run(source: PreparedSubtitle, result: TranslatedSubtitle, language_code: str) -> int:
     """Find a strong script-mismatch signal, not a general language detector.
 
-    A run of several substantial unchanged cues in a clearly incompatible
-    script is evidence of a partial download. Names, punctuation, same-script
-    language pairs and same-language files must not be rejected merely because
-    one or two cues are unchanged. Unknown and mixed scripts can still evade
-    this conservative check; translation quality cannot be guaranteed.
+    Unknown and mixed scripts can evade this conservative check; translation
+    quality cannot be guaranteed. Names and same-language files may be unchanged.
     """
     text = decode_subtitle(result.content)
     translated = _parse(text, is_output=True) if source.extension == ".srt" else _parse_other(text, source.extension)
-    run = chars = gap = 0
-    distinct = set()
+    detector = UntranslatedRunDetector(language_code)
     for original, output in zip(source.cues, translated):
-        before = original.content.strip()
-        after = output.content.strip()
-        key = _comparison_key(before)
-        if not key or key != _comparison_key(after):
-            run = chars = gap = 0
-            distinct.clear()
-            continue
-        clean = _plain_cue_text(before)
-        cjk = _cjk_letter_count(clean) if language_code not in _CJK_TARGETS else 0
-        latin = (sum("LATIN" in unicodedata.name(char, "") and char.isalpha() for char in clean)
-                 if language_code in _NON_LATIN_TARGETS else 0)
-        weight = cjk if cjk >= 3 else latin if latin >= 12 else 0
-        if weight:
-            run += 1
-            chars += weight
-            distinct.add(key)
-            gap = 0
-            if run >= 5 and chars >= 30 and len(distinct) >= 3:
-                return run
-        else:
-            gap += 1
-            if gap > 2:
-                run = chars = gap = 0
-                distinct.clear()
+        run = detector.add(original.content, output.content)
+        if run:
+            return run
     return 0
 
 

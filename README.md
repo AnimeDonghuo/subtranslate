@@ -1,65 +1,65 @@
 # SubTranslate Telegram bot
 
-Send a subtitle file to the bot, choose a target language, and get a translated file back, for example `movie.Hindi.srt`. The bot uses [translatesubtitles.co](https://translatesubtitles.co/) to select the language, translate, and download the result. The website uses Google Translate; the bot does not require a paid translation API key.
+Send a subtitle as a Telegram document, choose a language, and receive the website's downloaded file, for example `movie.Hindi.srt`. The bot automates [translatesubtitles.co](https://translatesubtitles.co/); it does not use a different translation service.
 
-## What it does
+## How it works
 
-- Works in a **private Telegram chat**. Send the file as a **document**. The picker shows **five language buttons per page**, with Previous/Next navigation. Tap a language for a single translation, or **Select all languages** and confirm to receive one file at a time, in order. Use `/cancel` to remove queued batches and stop an active batch after its current language.
-- The bundled catalog currently contains 249 Google widget languages and the bot attempts to refresh it on startup. Every selection is checked against the site's actual dropdown; stale entries are skipped in a batch. The website detects the source language and translation quality can vary.
-- Accepts text **SRT, ASS, SBV, VTT, MicroDVD or SubViewer SUB, and Spruce STL**. Binary VobSub (`.sub`/`.idx`) and binary EBU STL are not supported. The site misparsed the tested SUB variants, so SUB cue text is temporarily converted to SRT for the website and restored to the original SUB format with its original frame numbers or timestamps. Other formats are uploaded in their original format.
-- Input is limited to **1,000,000 bytes** (also after conversion to UTF-8 or the SUB bridge) and **3,000 cues**. These are this bot's safety limits, not a guarantee about the site's limits. UTF-8 and BOM-marked UTF-16/UTF-32 are supported; other text encodings are detected on a best-effort basis. Save as UTF-8 if a file is rejected.
-- Clicks the website's **Download** button and checks every download's cue count and timestamps. For large SRT files (and SUB files using the SRT bridge), it uploads parts of at most 200 cues and normally at most 60,000 text characters, translates and downloads them one at a time, then combines the downloaded text in order with checked timings. A single cue cannot be divided; combined SRT cue numbers are regenerated. This takes longer than one upload and the combined file is not byte-identical to a single website download. Smaller, single-part UTF-8 SRTs and native VTT, SBV and text STL files retain the website's downloaded bytes. ASS restores source styles and dialogue metadata; SUB is restored to its original format. The site can alter inline formatting, comments, VTT settings or other metadata.
-- A long unchanged section raises a warning. For an obvious incompatible-script run (for example, several unchanged Chinese cues when translating to English), the bot tries smaller SRT uploads or a fresh-browser retry, and refuses the result if the problem persists. These are conservative checks, not a reliable language detector: names or already-target-language text can stay unchanged, and partial translations or wrong words can go undetected, especially for languages using the same script. The caption reports how many texts differ, not how many translations are correct. Always review machine translation.
-- A single Telegram status message shows the current processing stage and a stage bar; it does **not** claim an exact translation percentage. For multipart files it shows the current part; the total may increase if a part must be retried in smaller pieces. For Select all, it also shows how many languages have been processed and the current language. The site does not expose a reliable translation percentage or ETA.
-- Runs **one browser at a time**, with at most two jobs waiting. Sequential uploads reuse the browser for up to ten uses with a fresh isolated context each time, then recycle it to limit memory growth. An early website/upload failure is retried once with a new browser; the logs contain only a sanitized error category, exception class, stage and browser/page state. A Select all batch still translates and sends languages one at a time and occupies the worker until it finishes, is canceled, or encounters repeated failures. It can take hours and generate hundreds of messages. Temporary files are removed after each part; no database or paid translation service is needed.
+- Use a **private chat**. The language picker has five buttons per page. Choose one language, or confirm **Select all languages** to translate and send one file at a time, sequentially. `/cancel` removes your queued jobs and stops active work.
+- For an SRT, the bot uploads the **whole file once**, selects the language, clicks Translate, waits for the visible website/Google loading animations to finish and for text changes to settle, and clicks **Download**. It sends that single downloaded SRT **without assembling parts or rewriting its bytes**. The on-page preview is not the delivered file.
+- The bot checks cue count and timestamps, and refuses a download with a strong sign of missing translation or a long unchanged section mixed with changed text. An entirely unchanged result is flagged because it might already be in the selected language. These are heuristics: they can reject legitimate unchanged sections, and same-script partial translations or incorrect words can still escape detection. Always review machine translation; completeness and quality cannot be guaranteed.
+- SRT files have **no bot-imposed total byte-size or cue-count cap**. Input and downloaded files are validated incrementally on temporary disk; the browser and website still process the original file as a single upload. A single cue must fit available memory. There is no guarantee that the site, browser, Telegram, or a particular host can process every file up to 2 GB.
+- Text ASS, SBV, VTT, MicroDVD/SubViewer SUB, and Spruce STL are also accepted, with the existing **1 MB / 3,000-cue** limits. Binary VobSub and EBU STL are not supported. The SUB bridge restores original frames/timestamps, and ASS restores source styles, so these formats can require metadata restoration rather than byte-identical website output.
+- A status message shows processing stages, not a translation percentage. One browser runs at a time, with at most two jobs waiting. Browser contexts are isolated and recycled; opening the site may be retried before uploading, but a failed upload is reported rather than repeated. Website wait timeouts are renewed while cues or indicators keep changing. Logs contain only sanitized categories and counts, not subtitle text or credentials.
 
-**Privacy:** Subtitle text is sent to translatesubtitles.co and Google's widget. Do not send confidential content, and only translate files you have permission to use. See the site's [privacy policy](https://translatesubtitles.co/privacypolicy.php). The bot does not intentionally log subtitle text or tokens.
+**Privacy:** Subtitles are sent to the website and its Google Translate widget. Do not send confidential files, and translate only files you have permission to use. See the site's [privacy policy](https://translatesubtitles.co/privacypolicy.php).
 
-## Deploy on Koyeb's free instance
+## Telegram transfers and practical limits
 
-1. Create a bot with [@BotFather](https://t.me/BotFather) and keep its token private. Do not paste it into a public repository or chat.
-2. Put this repository and its changes on GitHub, then in Koyeb choose **Create App → GitHub**, select the repository and the branch containing this code, and choose the **Dockerfile** builder. The Dockerfile installs Chromium and its runtime libraries.
-3. Create a **Web Service**, select the **free** instance in **Frankfurt** or **Washington, D.C.**, expose **HTTP port 8080**, and route `/` to that port. Do not add a worker, volume, database, or paid instance.
-4. Add these environment variables in Koyeb (use a Secret for the bot token):
+The public Telegram Bot API downloads up to 20 MB and uploads up to 50 MB. To transfer larger SRTs, configure **both** `API_ID` and `API_HASH` as well as `BOT_TOKEN`. The bot then authenticates to Telegram MTProto **as the same bot**, with an in-memory session, and uses disk-backed transfers. It does not need a phone number or a user-account login. `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` and `TG_API_ID` / `TG_API_HASH` are accepted aliases. Without both credentials, smaller files continue to use the normal Bot API; larger transfers report an error.
 
-   | Variable | Value |
+Telegram still imposes its own bot file-size limits (approximately 2 GB), and a translated file may be larger than its input. MTProto transfers have automated **mock** tests but have not been verified against your Telegram account or Koyeb deployment.
+
+The deployment needs enough **temporary disk for the source, the website's downloaded result, and browser overhead at the same time**. If UTF-16 or a legacy encoding needs conversion, that can require additional space. Koyeb's [free instance](https://www.koyeb.com/docs/reference/instances#free-instances) has 512 MB RAM, 0.1 vCPU and 2 GB SSD; it cannot be assumed to accommodate a 2 GB input plus its output, and the website's full-file browser processing can exhaust RAM well before then. A larger instance/disk may be needed. Jobs can also fail or be interrupted by website outages, browser crashes, disk exhaustion, Telegram limits, scale-down, or deployment restarts. The bot does not intentionally send a detected partial download as a complete translation.
+
+## Deploy on Koyeb
+
+1. Create a bot with [@BotFather](https://t.me/BotFather). Keep its token and API credentials private; do not paste them into chat or commit them.
+2. In Koyeb, create a **Web Service** from the GitHub branch containing this code, select the **Dockerfile** builder, and expose HTTP port `8080`. The Dockerfile installs Chromium.
+3. Set these environment variables in Koyeb, using Secrets for sensitive values:
+
+   | Variable | Purpose |
    | --- | --- |
-   | `BOT_TOKEN` | Your BotFather token |
-   | `PORT` | `8080` (or match the port configured for your service) |
+   | `BOT_TOKEN` | BotFather token |
+   | `API_ID` and `API_HASH` | Telegram API credentials for transfers beyond public Bot API limits; optional for smaller files |
+   | `PORT` | `8080`, or the port configured for the service |
 
-   No Telegram API ID, API hash, or separate webhook secret is required. Webhook authentication is derived automatically from the bot token and remains stable across restarts. If upgrading an older version, you can remove `TELEGRAM_WEBHOOK_SECRET`; the bot registers the updated webhook on startup.
-5. Deploy. Koyeb provides `KOYEB_PUBLIC_DOMAIN`; the bot uses it to register `https://<your-domain>/telegram/webhook` with Telegram automatically. Check Koyeb logs for **Telegram webhook registered**. The public `GET /healthz` endpoint is a liveness check: it returns HTTP 200 even while the bot is connecting, with a JSON status showing the connection phase. `GET /readyz` returns HTTP 200 only after the webhook is registered, or 503 while connecting or after an error. Neither endpoint reveals secrets. Use `/healthz` (or `/`) for Koyeb's health check, not `/readyz`, so a slow Telegram connection does not cause a restart loop.
-6. Open your bot in Telegram, send `/start`, upload a small `.srt` (for example, `tests/fixtures/sample.srt`), and choose a language. The first request after sleep can take longer. For a private bot, send `/id`, then optionally set `ALLOWED_USER_IDS` to your numeric ID (or a comma-separated list) and redeploy.
+   Webhook authentication is derived from the bot token; no separate webhook secret is required. The old `TELEGRAM_WEBHOOK_SECRET` setting is ignored.
+4. Deploy. The bot derives its public webhook URL from `KOYEB_PUBLIC_DOMAIN`. Look for **Telegram webhook registered** in the logs. `GET /healthz` returns HTTP 200 while the service is alive, including during Telegram retries; `GET /readyz` returns HTTP 200 only once the webhook is registered. Use `/healthz` for the Koyeb liveness check.
+5. In Telegram, send `/start`, upload a small `.srt`, and choose a language. For a private bot, send `/id`, then optionally set `ALLOWED_USER_IDS` to your numeric ID and redeploy.
 
-**Check billing before deploying.** Koyeb's [instance documentation](https://www.koyeb.com/docs/reference/instances#free-instances) describes one free 512 MB / 0.1 vCPU web instance per organization, with no worker, persistent volume, or custom scaling. It [sleeps after one hour without inbound traffic](https://www.koyeb.com/docs/run-and-scale/scale-to-zero); a Telegram webhook can wake it. Koyeb's [pricing FAQ](https://www.koyeb.com/docs/faqs/pricing) says a credit card is required and the selected plan can be charged on signup. Confirm that your account is on the Starter plan, select the **free** instance, and review current pricing and billing yourself; other plans or resources may incur charges.
+**Check pricing and billing** before choosing a larger instance or additional storage. The free instance is a hobby deployment, not a durable queue. The queue and progress are in memory. A restart, crash or scale-down can interrupt a job; retry by tapping the language button or resending the document. Best-effort health requests during an active job reduce idle scale-down but do not guarantee uninterrupted processing.
 
 ### Optional settings
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WEBHOOK_BASE_URL` | Derived from `KOYEB_PUBLIC_DOMAIN` | Public HTTPS origin without a path, e.g. `https://bot.example.com`. Set this when not using Koyeb's default domain. Telegram supports webhook ports 443, 80, 88, and 8443. |
-| `ALLOWED_USER_IDS` | Unset | Comma-separated Telegram user IDs. Unset allows any user in private chat. |
-| `TRANSLATION_TIMEOUT_SECONDS` | `900` | Deadline per single language, from 60 to 1,000 seconds; a Select all batch has no fixed total deadline. |
-| `CHROMIUM_PATH` | Docker: `/usr/bin/chromium` | Local system Chromium path; if unset, Playwright uses its installed browser. |
+| `WEBHOOK_BASE_URL` | Derived from `KOYEB_PUBLIC_DOMAIN` | Public HTTPS origin without a path, e.g. `https://bot.example.com`. |
+| `ALLOWED_USER_IDS` | Unset | Comma-separated Telegram user IDs; unset allows private-chat users. |
+| `TRANSLATION_TIMEOUT_SECONDS` | `900` | Website translation inactivity timeout, 60–1,000 seconds; renewed when cue text or indicators change. Some other site operations have separate timeouts. There is no fixed total deadline for an entire SRT or Select-all batch. |
+| `CHROMIUM_PATH` | Docker: `/usr/bin/chromium` | Local Chromium executable; if unset, Playwright uses its installed browser. |
 
-The bot uses a webhook rather than polling, so Telegram requests can wake the service. The language buttons refer back to the original Telegram document instead of relying on an in-memory conversation. During an active batch, the bot makes a best-effort health request to its public URL every 20 minutes to reduce idle scale-down; this is not a guarantee. The **job queue and batch progress are in memory**: a restart, deployment, crash, or scale-down can interrupt work, and an acknowledged webhook update is not durably stored. On graceful shutdown the bot attempts to notify affected users, but a crash, forced stop or network outage can prevent that notice. If a result does not arrive, tap a language button again or resend the file. Restarting a batch begins from the first language, not where it stopped. This is a small hobby service, not a durable production queue. Large subtitles may be slow or exhaust the 512 MB instance; try splitting them if needed.
-
-## Local development and testing
+## Development and testing
 
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements-dev.txt
-python -m pytest -q
-```
-
-The browser integration tests use a **local mock website**, not the real translation service. To run those tests too, install Chromium and set `TEST_CHROMIUM_PATH`, for example:
-
-```sh
 TEST_CHROMIUM_PATH=/usr/bin/chromium python -m pytest -q
 ```
 
-The included CI workflow builds the deployment image and runs a complete **mocked** Telegram → browser → Telegram flow with a 3,000-cue, 999,786-byte file under a 512,000,000-byte memory limit, no swap, and 0.1 CPU. Its mock-only text-settling wait is shortened to keep this many-part stress test practical; production uses a longer wait for the real website. You can reproduce it locally with Docker:
+The browser tests use a **local mock**, including cases where a success message appears while an animation is still running and later subtitle text changes. The suite tests disk-backed validation above the previous SRT size and cue-count caps, incomplete downloads, cancellation and mocked MTProto authentication/transfers. These are not a real Telegram or Koyeb test.
+
+CI builds the deployment image and runs a mocked Telegram → real Chromium → Telegram flow for a 3,000-cue, 999,786-byte SRT under a 512,000,000-byte memory limit, no swap and 0.1 CPU. The mock-only settling wait is shortened; production waits longer after the animation finishes. Reproduce locally with Docker:
 
 ```sh
 docker build -t subtranslate-local .
@@ -68,31 +68,21 @@ docker run --rm --network none --memory 512000000 --memory-swap 512000000 --cpus
   --env PYTHONPATH=/app subtranslate-local python /smoke/resource_smoke.py
 ```
 
-A similar Linux cgroup check passed locally with a test Chromium binary; it is not a guarantee that the live website or every Chromium/Docker version fits. CI runs on pushes and pull requests; GitHub Actions usage is subject to your repository's quotas and billing settings.
-
-For a manual test of the **actual** website from a machine with Internet access, install Chromium or run `python -m playwright install chromium`, then:
+To test the **actual website** from a machine with network access, install Chromium or run `python -m playwright install chromium`:
 
 ```sh
-# This bundled sample contains no private information.
 python -m subtranslate.smoke tests/fixtures/sample.srt hi --output-dir .
 ```
 
-Use `CHROMIUM_PATH=/usr/bin/chromium` if using system Chromium. The command logs the current website stage and refuses to overwrite an existing output file. Use `--timeout-seconds` and `--translation-timeout-seconds` to shorten its deadlines when diagnosing a stalled site.
+The command refuses to overwrite an existing file. An opt-in **Live website smoke test** runs small public samples and two independent synthetic 405-cue direct-download jobs under Koyeb-like limits. To request it from an unmerged branch, include `[live-site-test]` in the pushed commit message; alternatively use workflow dispatch once the workflow exists on the default branch. It does not use your Telegram bot or Koyeb deployment. Site outages and rate limits can cause failures.
 
-There is also an opt-in **Live website smoke test** in GitHub Actions. To run it from an unmerged branch, include `[live-site-test]` in the pushed commit's message. Once the workflow file exists on the default branch, you can instead open **Actions → Live website smoke test (manual) → Run workflow**. It tests small public English samples in each supported format and, separately under free-instance CPU/memory limits, two independent jobs using a synthetic 405-cue Chinese SRT. It checks changed text and cue timings but cannot prove every file or language will translate correctly. It does not need a bot token or test your Telegram/Koyeb deployment. The site may block GitHub's runner or be unavailable, in which case the check will fail.
+## Troubleshooting
 
-The live site and Google widget have no documented API for this workflow and can change, rate-limit, block automated browsers, or be temporarily unavailable; the bot reports failures rather than pretending a translation succeeded. The automated tests do not connect to your Telegram bot or deployed Koyeb service.
-
-### Troubleshooting
-
-- **No response:** check the Koyeb service logs and its public HTTP route. A cold start takes time. Confirm **Telegram webhook registered**, check `/readyz`, and ensure no other deployment is changing the webhook for the same bot.
-- **Telegram initialization failed (`TimedOut`):** this indicates a network timeout, not proof of a bad token. The HTTP service starts anyway and retries Telegram with increasing delays. Wait for **Telegram webhook registered**; if it keeps timing out for several minutes, investigate the Koyeb instance's DNS and outbound HTTPS access to `api.telegram.org` (port 443) or contact Koyeb support. An HTTP 200 from `/healthz` alone does not mean the bot is ready; `/readyz` will remain 503 until registration succeeds. Do not post your bot token in logs or chat.
-- **Webhook registration keeps retrying:** check the error type in the logs and confirm the public HTTPS route and `WEBHOOK_BASE_URL` (if set). Network timeouts can also require the connectivity checks above.
-- **Telegram rejected `BOT_TOKEN` / `/readyz` reports `invalid_token`:** Telegram explicitly rejected the token. Check the BotFather token in Koyeb's secret configuration and redeploy; do not share it in chat.
-- **Website timed out / could not complete the flow:** the website, Google widget or its selectors may have changed, or may block automation. Early upload errors get one fresh-browser retry. Check the sanitized log's `error`, `category`, `browser_connected`, and `page_closed` fields; these are diagnostic clues, not proof of a cause. Try a smaller file and run the manual smoke test from an unrestricted network. The stage bar is not a translation percentage; the website's translation stage may take much longer than other steps.
-- **The translated file has a different size or untranslated sections:** translated text and line endings can have different byte sizes, but a smaller file can also be partially untranslated. Compare the actual cues; size alone is not a quality check. The bot checks timing, retries obvious partial results, and warns about long unchanged runs, but cannot guarantee every line was translated. Large SRT/SUB inputs are split into multiple website downloads and combined, so the final file is not the bytes from one download.
-- **File rejected:** send a supported text subtitle document under 1 MB, with no more than 3,000 valid cues, and save it as UTF-8. Binary VobSub/EBU STL are unsupported. A translated file with missing cues or modified timestamps is intentionally not delivered.
-- **Interrupted job:** free-instance storage and the queue are temporary. Tap the language button again; if Telegram no longer provides the original message, resend the file. A restarted Select all batch begins again from the first language.
-- **Long batch:** `/cancel` removes your queued all-language jobs and requests the active one to stop after its current language. It does not cancel individual translations.
+- **No response:** allow for cold start, check `/readyz` and look for **Telegram webhook registered**. Ensure no other deployment is changing the webhook for the same bot.
+- **Telegram startup times out:** `/healthz` remains live while initialization retries. If retries persist, check Koyeb DNS and outbound access to `api.telegram.org`; a timeout does not prove the token is wrong. Never share the token.
+- **Large transfer unavailable:** check that both API ID and hash exist in Koyeb under one of the supported variable-name pairs, and that the deployment can reach Telegram. The bot does not print those values.
+- **Website upload, parsing, or translation error:** the website can change, time out, block automation, or run out of browser resources. Failures before upload may be retried with a fresh browser; after an upload starts, a failure is reported without reuploading. The sanitized log's stage, error category, and browser state are clues, not proof of the cause. Try again later; no detected incomplete result is sent.
+- **Disk or memory exhaustion:** free-instance resources may be insufficient for the whole source, website processing and result. Consider a larger instance or disk after checking cost; there is no automatic resume.
+- **Unexpected unchanged text:** a long unchanged run is rejected as potentially partial, although it can be legitimate. The detection is not a full language or quality check and cannot establish that every cue was translated correctly.
 
 The selector flow was informed by [MutennRoshii/subtitle-translator](https://github.com/MutennRoshii/subtitle-translator); see `THIRD_PARTY_NOTICES.md`.

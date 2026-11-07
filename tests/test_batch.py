@@ -11,6 +11,7 @@ from subtranslate.bot import BotService
 from subtranslate.config import Settings
 from subtranslate.jobs import EnqueueResult, JobQueue, TranslationJob
 from subtranslate.languages import LanguageCatalog
+from subtranslate.large_srt import FileSubtitle
 from subtranslate.subtitles import TranslatedSubtitle
 from subtranslate.website import LanguageUnavailable, WebsiteError
 
@@ -37,6 +38,12 @@ def batch_service():
     return service
 
 
+def fake_result(source):
+    if isinstance(source, FileSubtitle):
+        return TranslatedSubtitle(source.path.read_bytes(), source.cue_count, False)
+    return TranslatedSubtitle(source.utf8, len(source.cues), False)
+
+
 def cancel_update():
     message = SimpleNamespace(reply_text=AsyncMock())
     return SimpleNamespace(effective_message=message, effective_chat=SimpleNamespace(id=42, type="private"),
@@ -54,7 +61,7 @@ async def test_all_languages_are_sent_one_by_one(batch_service):
         seen.append(code)
         await asyncio.sleep(0)
         active -= 1
-        return TranslatedSubtitle(source.utf8, len(source.cues), False)
+        return fake_result(source)
 
     batch_service.translator.translate.side_effect = translate
     await batch_service.process_job(JOB)
@@ -72,7 +79,7 @@ async def test_batch_skips_missing_language_and_continues(batch_service):
     async def translate(source, code, *, on_progress=None):
         if code == "es":
             raise LanguageUnavailable("Unavailable")
-        return TranslatedSubtitle(source.utf8, len(source.cues), False)
+        return fake_result(source)
 
     batch_service.translator.translate.side_effect = translate
     await batch_service.process_job(JOB)
@@ -89,6 +96,20 @@ async def test_batch_stops_after_repeated_site_failure(batch_service):
     batch_service.bot.send_document.assert_not_awaited()
     summary = batch_service.bot.edit_message_text.await_args.kwargs["text"]
     assert "Stopped" in summary and "Failed: Hindi, Spanish, French" in summary
+
+
+async def test_batch_reports_a_rejected_incomplete_download_and_continues(batch_service):
+    async def translate(source, code, *, on_progress=None):
+        if code == "hi":
+            raise WebsiteError("The download appears incomplete, so no incomplete file was sent.")
+        return fake_result(source)
+
+    batch_service.translator.translate.side_effect = translate
+    await batch_service.process_job(JOB)
+    assert batch_service.bot.send_document.await_count == 2
+    summary = batch_service.bot.edit_message_text.await_args.kwargs["text"]
+    assert "1 failed" in summary and "Failed: Hindi" in summary
+    assert "Hindi: The download appears incomplete" in summary and "no incomplete file was sent" in summary
 
 
 async def test_unexpected_source_failure_notifies_user(batch_service):
@@ -121,25 +142,24 @@ async def test_batch_stops_immediately_after_telegram_delivery_failure(batch_ser
     assert "1 failed" in batch_service.bot.edit_message_text.await_args.kwargs["text"]
 
 
-async def test_cancel_command_stops_batch_after_current_language(batch_service):
+async def test_cancel_command_stops_current_batch_without_sending_a_partial_file(batch_service):
     started = asyncio.Event()
     release = asyncio.Event()
 
     async def translate(source, code, *, on_progress=None):
         started.set()
         await release.wait()
-        return TranslatedSubtitle(source.utf8, len(source.cues), False)
+        return fake_result(source)
 
     batch_service.translator.translate.side_effect = translate
     task = asyncio.create_task(batch_service.process_job(JOB))
     await asyncio.wait_for(started.wait(), 1)
     update = cancel_update()
     await batch_service.cancel_batch(update, None)
-    assert "after the current language" in update.effective_message.reply_text.await_args.args[0]
-    release.set()
+    assert "stopping" in update.effective_message.reply_text.await_args.args[0]
     await asyncio.wait_for(task, 3)
     assert batch_service.translator.translate.await_count == 1
-    assert batch_service.bot.send_document.await_count == 1
+    batch_service.bot.send_document.assert_not_awaited()
     assert "Stopped" in batch_service.bot.edit_message_text.await_args.kwargs["text"]
 
 
@@ -158,11 +178,11 @@ async def test_cancel_is_registered_before_the_start_notice_awaits(batch_service
     await asyncio.wait_for(started.wait(), 1)
     update = cancel_update()
     await batch_service.cancel_batch(update, None)
-    assert "active batch" in update.effective_message.reply_text.await_args.args[0]
+    assert "stopping" in update.effective_message.reply_text.await_args.args[0]
     release.set()
     await asyncio.wait_for(task, 3)
     batch_service.translator.translate.assert_not_awaited()
-    assert "Stopped" in batch_service.bot.edit_message_text.await_args.kwargs["text"]
+    assert "canceled" in batch_service.bot.edit_message_text.await_args.kwargs["text"].lower()
 
 
 async def test_cancel_waiting_batches_leaves_other_jobs_in_order():

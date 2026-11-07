@@ -88,14 +88,13 @@ def test_reject_invalid_and_oversized_files():
     for data in [b"", b"Not a subtitle file", b"\x00\x01\x00\x01"]:
         with pytest.raises(SubtitleError):
             prepare_subtitle(data)
-    with pytest.raises(SubtitleError, match="large"):
-        prepare_subtitle(b"x" * (MAX_INPUT_BYTES + 1))
+    with pytest.raises(SubtitleError, match="1 MB"):
+        prepare_subtitle(b"x" * (MAX_INPUT_BYTES + 1), "movie.vtt")
 
 
-def test_cue_limit():
+def test_srt_has_no_3000_cue_limit():
     many = "".join(f"{i}\n00:00:01,000 --> 00:00:02,000\nHi\n\n" for i in range(1, MAX_CUES + 2))
-    with pytest.raises(SubtitleError, match="3,000"):
-        prepare_subtitle(many.encode())
+    assert len(prepare_subtitle(many.encode()).cues) == MAX_CUES + 1
 
 
 def test_safe_and_informative_output_names():
@@ -219,55 +218,6 @@ def _many_srt(count: int, text: str = "这是一个简单的字幕测试句子")
     ).encode("utf-8")
 
 
-def test_large_srt_parts_are_bounded_and_combined_from_actual_downloads():
-    from subtranslate.subtitles import combine_srt_downloads, split_srt_for_website
-
-    source = prepare_subtitle(_many_srt(453))
-    parts = split_srt_for_website(source)
-    assert [len(part.cues) for part in parts] == [200, 200, 53]
-    assert all(part.cues[0].index == 1 for part in parts)
-    downloads = []
-    for part in parts:
-        downloaded = part.utf8.replace("这是一个简单的字幕测试句子".encode(), b"From the Download button")
-        downloads.append(verify_and_merge(part, downloaded))
-    result = combine_srt_downloads(source, downloads)
-    parsed = list(srt.parse(result.content.decode()))
-    assert len(parsed) == 453
-    assert [cue.index for cue in parsed] == list(range(1, 454))
-    assert all(cue.content.startswith("From the Download button") for cue in parsed)
-    assert [(cue.start, cue.end) for cue in parsed] == [(cue.start, cue.end) for cue in source.cues]
-    assert result.changed_cues == 453 and not result.possibly_incomplete
-
-
-def test_one_part_preserves_original_bytes_and_character_limit_splits_without_cutting_cues():
-    from subtranslate.subtitles import split_srt_for_website
-
-    one = prepare_subtitle(_many_srt(2))
-    assert split_srt_for_website(one) == [one]
-    parts = split_srt_for_website(one, max_cues=200, max_text_chars=5)
-    assert [len(part.cues) for part in parts] == [1, 1]
-    assert parts[0].cues[0].content == one.cues[0].content
-    with pytest.raises(ValueError):
-        split_srt_for_website(one, max_cues=0)
-
-
-def test_combining_parts_rejects_missing_or_changed_times():
-    from subtranslate.subtitles import (
-        TranslatedSubtitle,
-        combine_srt_downloads,
-        split_srt_for_website,
-    )
-
-    source = prepare_subtitle(_many_srt(201))
-    parts = split_srt_for_website(source)
-    first = verify_and_merge(parts[0], parts[0].utf8)
-    with pytest.raises(SubtitleError, match="missing cues"):
-        combine_srt_downloads(source, [first])
-    altered = parts[1].utf8.replace(b"00:00:02,000", b"00:00:02,500")
-    with pytest.raises(SubtitleError, match="changed timestamps"):
-        combine_srt_downloads(source, [first, TranslatedSubtitle(altered, 1, False)])
-
-
 def test_long_unchanged_sections_are_warnings_not_assumed_failures():
     source = prepare_subtitle(_many_srt(40, "Already in the target language"))
     partial = source.utf8.replace(b"Already in the target language 0", b"Translated first cue")
@@ -303,15 +253,3 @@ def test_obvious_wrong_script_run_is_detected_without_rejecting_names_or_same_la
         f"{i}\n00:00:01,000 --> 00:00:02,000\n很长的重复名字\n\n" for i in range(1, 26)
     ).encode())
     assert obviously_untranslated_run(repeated, verify_and_merge(repeated, repeated.utf8), "en") == 0
-
-
-def test_dense_srt_does_not_create_excessive_website_uploads():
-    from subtranslate.subtitles import split_srt_for_website
-
-    # A near-1 MB input was taking too long when the character limit divided
-    # 200-cue uploads into many tiny pieces. The cue cap remains the primary
-    # bound; obvious incomplete downloads can still be subdivided on retry.
-    source = prepare_subtitle(_many_srt(3000, "x" * 240))
-    parts = split_srt_for_website(source)
-    assert len(parts) == 15
-    assert all(len(part.cues) == 200 for part in parts)

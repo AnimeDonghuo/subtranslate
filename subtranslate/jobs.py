@@ -57,11 +57,18 @@ class JobQueue:
 
     def cancel_waiting_batches(self, chat_id: int) -> int:
         """Remove this user's queued all-language jobs without stopping others."""
+        return self._cancel_waiting(chat_id, batches_only=True)
+
+    def cancel_waiting_jobs(self, chat_id: int) -> int:
+        """Remove all this user's queued jobs without stopping other users."""
+        return self._cancel_waiting(chat_id, batches_only=False)
+
+    def _cancel_waiting(self, chat_id: int, *, batches_only: bool) -> int:
         retained = []
         removed = 0
         while not self._queue.empty():
             job = self._queue.get_nowait()
-            if job.chat_id == chat_id and job.languages:
+            if job.chat_id == chat_id and (job.languages or not batches_only):
                 self._pending.discard(job.key)
                 self._queue.task_done()
                 removed += 1

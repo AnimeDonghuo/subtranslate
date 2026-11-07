@@ -16,9 +16,11 @@ async def test_smoke_uses_custom_deadlines_without_touching_network(tmp_path, mo
         def __init__(self, chromium_path, *, translation_timeout_ms):
             seen["timeout_ms"] = translation_timeout_ms
 
-        async def translate(self, prepared, language):
+        async def translate(self, prepared, language, *, on_progress=None):
             seen["language"] = language
-            return TranslatedSubtitle(prepared.utf8, len(prepared.cues), False)
+            if on_progress:
+                on_progress("translating")
+            return TranslatedSubtitle(prepared.path.read_bytes(), prepared.cue_count, False)
 
     monkeypatch.setattr(smoke, "WebsiteTranslator", FakeTranslator)
     monkeypatch.setattr(smoke.LanguageCatalog, "refresh", AsyncMock())

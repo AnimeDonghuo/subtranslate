@@ -1,11 +1,14 @@
 
-<!doctype html><html><body>
+<!doctype html><html><head><style>
+@keyframes finishLoader { from { opacity: 1; } to { opacity: 0; } }
+</style></head><body>
 <input type="file" id="file">
 <div class="popup-vip notranslate" id="vip" style="display:none;position:fixed;inset:0;background:white;z-index:10">
   <a href="#" class="close" onclick="closeVip();return false">Close</a>
 </div>
 <select class="goog-te-combo" id="lang"></select>
 <div id="loader" style="display:none">TRANSLATING</div>
+<div id="spinner-parent"><div class="goog-te-spinner-pos" style="display:none">GOOGLE ANIMATION</div></div>
 <h4 class="skiptranslate success-msg" style="display:none">Subtitle Translated!</h4>
 <a href="#decoy" id="google-brand" onclick="document.body.dataset.wrongClick='yes';return false">Translate</a>
 <a href="#translate" onclick="translateFile();return false">1. Translate</a>
@@ -53,10 +56,21 @@ function translateFile() {
   const attempt = ++translateCount;
   if (mode === 'nosignal') return;
   if (mode !== 'successonly') document.querySelector('#loader').style.display = 'block';
+  if (mode === 'cssloader') document.querySelector('#loader').style.animation = 'finishLoader 2.8s linear forwards';
+  if (mode === 'googspinner' || mode === 'hiddenancestor') {
+    document.querySelector('.goog-te-spinner-pos').style.display = 'block';
+    if (mode === 'hiddenancestor') document.querySelector('#spinner-parent').style.opacity = '0';
+  }
   setTimeout(() => {
-    if (mode !== 'stuckloader') document.querySelector('#loader').style.display = 'none';
+    if (mode !== 'stuckloader' && mode !== 'longloader' && mode !== 'cssloader' && mode !== 'ongoingloader') document.querySelector('#loader').style.display = 'none';
     document.querySelector('.success-msg').style.display = 'block';
   }, 100);
+  if (mode === 'longloader') setTimeout(() => { document.querySelector('#loader').style.display = 'none'; }, 2800);
+  if (mode === 'googspinner') setTimeout(() => { document.querySelector('.goog-te-spinner-pos').style.display = 'none'; }, 2800);
+  if (mode === 'restartloader') {
+    setTimeout(() => { document.querySelector('#loader').style.display = 'block'; }, 800);
+    setTimeout(() => { document.querySelector('#loader').style.display = 'none'; }, 2800);
+  }
   setTimeout(() => {
     const cells = document.querySelectorAll('.target-sub');
     if (mode === 'lateronly') {
@@ -69,10 +83,23 @@ function translateFile() {
       for (const cell of cells) cell.textContent = 'Hola mundo';
     }
   }, 350);
-  if (mode === 'bursts') {
+  if (mode === 'ongoingloader' || mode === 'ongoingsettle') {
+    let count = 0;
+    const updates = setInterval(() => {
+      count++;
+      for (const cell of document.querySelectorAll('.target-sub')) {
+        cell.textContent = count === 6 ? 'Final translation' : `Translation ${count}`;
+      }
+      if (count === 6) {
+        clearInterval(updates);
+        if (mode === 'ongoingloader') document.querySelector('#loader').style.display = 'none';
+      }
+    }, 600);
+  }
+  if (mode === 'bursts' || mode === 'longloader' || mode === 'googspinner' || mode === 'restartloader' || mode === 'cssloader') {
     setTimeout(() => {
       for (const cell of document.querySelectorAll('.target-sub')) cell.textContent = 'Final translation';
-    }, 1600);
+    }, mode === 'bursts' ? 1600 : (mode === 'cssloader' ? 3100 : 2400));
   }
 }
 function downloadFile() {

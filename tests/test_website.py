@@ -3,7 +3,12 @@
 These tests do not assert that the external website is currently reachable.
 """
 
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
+from playwright.async_api import TimeoutError as PlaywrightTimeout
 
 from subtranslate.subtitles import SubtitleError, prepare_subtitle
 from subtranslate.website import LanguageUnavailable, WebsiteError, WebsiteTranslator
@@ -34,6 +39,18 @@ async def test_output_comes_from_download_button_not_preview(mock_site, chromium
         b"10\n00:00:01,000 --> 00:00:02,000\nText from the downloaded file\n\n"
     )
     assert b"Hola mundo" not in result.content  # The mock's preview text.
+
+
+async def test_failure_before_upload_can_retry_opening_without_an_extra_upload(source):
+    from subtranslate.website import WebsiteSession, _RetryableWebsiteError
+
+    expected = object()
+    fake = SimpleNamespace(_translate_in_session=AsyncMock(side_effect=[_RetryableWebsiteError(), expected]))
+    session = WebsiteSession(fake, SimpleNamespace())
+    session._close_browser = AsyncMock()
+    result = await session._translate_with_early_retry(source, "es", None)
+    assert result is expected and fake._translate_in_session.await_count == 2
+    session._close_browser.assert_awaited_once()
 
 
 async def test_batch_reuses_browser_isolates_contexts_and_recycles_it(mock_site, chromium_path, source):
@@ -98,23 +115,34 @@ async def test_sub_variants_use_srt_bridge_and_keep_original_timing(mock_site, c
         assert b"00:00:03.00,00:00:04.00" in result.content
 
 
-async def test_site_upload_is_retried_once_if_its_table_never_renders(mock_site, chromium_path, source, caplog):
-    browser = translator(mock_site + "?mode=retryupload", chromium_path)
-    browser.stage_timeout_ms = 1500
-    result = await browser.translate(source, "es")
-    assert b"Hola mundo" in result.content
-    assert "displayed 0 of 1 expected cues" in caplog.text
-    assert "Hello world" not in caplog.text
+async def test_upload_timeout_is_renewed_while_cues_keep_appearing(monkeypatch):
+    from subtranslate import website
+
+    async def wait_for_next_cue(**kwargs):
+        await asyncio.sleep(0.35)
+        raise PlaywrightTimeout("not yet")
+
+    cell = SimpleNamespace(wait_for=AsyncMock(side_effect=wait_for_next_cue))
+    cells = SimpleNamespace(count=AsyncMock(side_effect=[0, 1, 2, 3]), nth=lambda _: cell)
+    page = SimpleNamespace(locator=lambda _: cells)
+    monkeypatch.setattr(website, "_close_vip_popup", AsyncMock())
+    started = asyncio.get_running_loop().time()
+    await website._wait_for_uploaded_cues(page, 3, 800)
+    assert asyncio.get_running_loop().time() - started > 0.8
 
 
-async def test_upload_timeout_after_retry_is_reported_without_private_text(mock_site, chromium_path, source, caplog):
-    browser = translator(mock_site + "?mode=noupload", chromium_path)
+@pytest.mark.parametrize("mode", ["retryupload", "noupload"])
+async def test_upload_timeout_is_reported_without_reuploading(mock_site, chromium_path, source, caplog, mode):
+    browser = translator(mock_site + "?mode=" + mode, chromium_path)
     browser.stage_timeout_ms = 1500
+    stages = []
     with pytest.raises(WebsiteError, match="timed out"):
-        await browser.translate(source, "es")
-    # Two same-context upload attempts, then the whole early flow once in a
-    # fresh browser; still bounded if the site never renders a table.
-    assert caplog.text.count("displayed 0 of 1 expected cues") == 4
+        await browser.translate(source, "es", on_progress=stages.append)
+    # The mock retryupload mode would succeed on a second upload, but the
+    # direct-only flow must report a stall instead of uploading it again.
+    assert caplog.text.count("displayed 0 of 1 expected cues") == 1
+    assert stages.count("uploading and parsing the subtitle") == 1
+    assert "downloading" not in stages
     assert "error=TimeoutError, category=timeout" in caplog.text
     assert "Hello world" not in caplog.text
 
@@ -126,6 +154,11 @@ async def test_upload_uses_a_random_name_instead_of_the_users_filename(mock_site
 
 async def test_success_message_without_loader_is_accepted(mock_site, chromium_path, source):
     result = await translator(mock_site + "?mode=successonly", chromium_path).translate(source, "hi")
+    assert b"Hola mundo" in result.content
+
+
+async def test_spinner_in_a_transparent_parent_is_not_considered_active(mock_site, chromium_path, source):
+    result = await translator(mock_site + "?mode=hiddenancestor", chromium_path).translate(source, "es")
     assert b"Hola mundo" in result.content
 
 
@@ -164,7 +197,11 @@ async def test_change_after_first_thirty_cues_does_not_trigger_a_retry(mock_site
     source = prepare_subtitle("".join(
         f"{i}\n00:00:01,000 --> 00:00:02,000\nName {i}\n\n" for i in range(1, 32)
     ).encode())
-    result = await translator(mock_site + "?mode=lateronly", chromium_path).translate(source, "es")
+    browser = translator(mock_site + "?mode=lateronly", chromium_path)
+    # Inspect the underlying one-download flow; the public method separately
+    # refuses this deliberately long unchanged run.
+    async with browser.session() as session:
+        result = await browser._translate_in_session(source, "es", session, None)
     assert b"Name 1" in result.content
     assert b"Hola mundo" in result.content
     assert b"Unexpected extra click" not in result.content
@@ -176,8 +213,29 @@ async def test_waits_for_later_translation_changes_to_settle(mock_site, chromium
 
 
 async def test_does_not_download_while_loader_is_still_visible(mock_site, chromium_path, source):
-    with pytest.raises(WebsiteError, match="finish settling"):
+    with pytest.raises(WebsiteError, match="timed out"):
         await translator(mock_site + "?mode=stuckloader", chromium_path).translate(source, "es")
+
+
+@pytest.mark.parametrize("mode", ["longloader", "googspinner", "restartloader", "cssloader"])
+async def test_waits_for_translation_animation_and_late_changes_before_download(mock_site, chromium_path, source, mode):
+    browser = translator(mock_site + "?mode=" + mode, chromium_path)
+    browser.translation_timeout_ms = 6_000
+    browser.settle_timeout_ms = 6_000
+    result = await browser.translate(source, "es")
+    # The fixture shows success and preliminary text early, but finishes its
+    # animation and updates the subtitle later. Download must wait for both.
+    assert b"Final translation" in result.content
+    assert b"Hola mundo" not in result.content
+
+
+@pytest.mark.parametrize("mode", ["ongoingloader", "ongoingsettle"])
+async def test_active_translation_is_not_cut_off_by_an_idle_timeout(mock_site, chromium_path, source, mode):
+    browser = translator(mock_site + "?mode=" + mode, chromium_path)
+    browser.translation_timeout_ms = 1_200
+    browser.settle_timeout_ms = 2_500
+    result = await browser.translate(source, "es")
+    assert b"Final translation" in result.content
 
 
 async def test_waits_until_all_uploaded_cues_are_rendered(mock_site, chromium_path):
@@ -202,7 +260,7 @@ def _large_chinese_srt(count: int):
     ).encode())
 
 
-async def test_large_srt_uses_all_downloaded_parts_not_preview(mock_site, chromium_path):
+async def test_large_srt_uses_one_actual_download_not_preview(mock_site, chromium_path):
     import srt
 
     source = _large_chinese_srt(405)
@@ -214,35 +272,81 @@ async def test_large_srt_uses_all_downloaded_parts_not_preview(mock_site, chromi
     assert [cue.index for cue in cues] == list(range(1, 406))
     assert all(cue.content == "Text from the downloaded file" for cue in cues)
     assert "Hola mundo" not in result.content.decode()  # Website preview differs.
-    assert [stage for stage in stages if stage.startswith("part:")] == ["part:1/3", "part:2/3", "part:3/3"]
+    assert stages.count("uploading and parsing the subtitle") == 1
+    assert stages.count("downloading") == 1
+    assert not any(stage.startswith("part:") for stage in stages)
     assert [(cue.start, cue.end) for cue in cues] == [(cue.start, cue.end) for cue in source.cues]
 
 
-async def test_likely_partial_part_is_split_and_downloaded_again(mock_site, chromium_path, caplog):
+async def test_disk_backed_srt_returns_the_exact_single_download(mock_site, chromium_path, tmp_path):
+    from pathlib import Path
+
+    from subtranslate.large_srt import prepare_file_srt
+
+    path = tmp_path / "private-name.srt"
+    raw = "".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\nOriginal subtitle {i}\n\n" for i in range(10, 415)
+    )
+    path.write_text(raw, encoding="utf-8")
+    source = prepare_file_srt(path)
+    stages = []
+    result = await translator(mock_site + "?mode=download-different", chromium_path).translate(
+        source, "es", on_progress=stages.append
+    )
+    assert isinstance(result.content, Path) and result.content.exists()
+    expected = "".join(
+        f"{i}\n00:00:01,000 --> 00:00:02,000\nText from the downloaded file\n\n" for i in range(10, 415)
+    ).encode()
+    assert result.content.read_bytes() == expected
+    assert result.cue_count == 405 and result.changed_cues == 405
+    assert stages.count("uploading and parsing the subtitle") == 1 and stages.count("downloading") == 1
+    assert not any(stage.startswith("part:") for stage in stages)
+
+
+async def test_disk_backed_utf16_is_uploaded_once_as_utf8(mock_site, chromium_path, tmp_path):
+    from subtranslate.large_srt import prepare_file_srt
+
+    path = tmp_path / "unicode.srt"
+    path.write_bytes("1\r\n00:00:01,000 --> 00:00:02,000\r\nこんにちは\r\n\r\n".encode("utf-16"))
+    source = prepare_file_srt(path)
+    result = await translator(mock_site + "?mode=randomname", chromium_path).translate(source, "en")
+    assert result.content.read_bytes() == b"1\n00:00:01,000 --> 00:00:02,000\nHola mundo\n\n"
+
+
+async def test_failed_disk_download_is_deleted_and_not_returned(mock_site, chromium_path, tmp_path):
+    from subtranslate.large_srt import prepare_file_srt
+
+    path = tmp_path / "source.srt"
+    path.write_text("1\n00:00:01,000 --> 00:00:02,000\nHello\n\n", encoding="utf-8")
+    source = prepare_file_srt(path)
+    with pytest.raises(SubtitleError, match="timestamps"):
+        await translator(mock_site + "?mode=badtime", chromium_path).translate(source, "es")
+    assert list(tmp_path.glob("download-*.srt")) == []
+
+
+async def test_likely_partial_download_is_refused_without_splitting(mock_site, chromium_path, caplog):
     source = _large_chinese_srt(100)
     browser = translator(mock_site + "?mode=partial50", chromium_path)
     stages = []
-    result = await browser.translate(source, "en", on_progress=stages.append)
-    assert result.cue_count == 100 and result.changed_cues == 100
-    assert result.content.count(b"Hola mundo") == 100
-    assert "likely untranslated run" in caplog.text
+    with pytest.raises(WebsiteError, match="no incomplete file was sent"):
+        await browser.translate(source, "en", on_progress=stages.append)
+    assert stages.count("uploading and parsing the subtitle") == 1
+    assert stages.count("downloading") == 1
+    assert not any(stage.startswith("part:") for stage in stages)
     assert "字幕测试" not in caplog.text
-    assert "part:1/2" in stages and "part:2/2" in stages
 
 
-async def test_likely_untranslated_small_part_is_not_delivered_after_retry(mock_site, chromium_path, caplog):
+async def test_likely_untranslated_download_is_not_delivered(mock_site, chromium_path, caplog):
     source = _large_chinese_srt(10)
     browser = translator(mock_site + "?mode=unchanged", chromium_path)
     browser.change_wait_ms = browser.retry_change_wait_ms = 150
     browser.settle_ms = 500
     with pytest.raises(WebsiteError, match="no incomplete file was sent"):
         await browser.translate(source, "en")
-    assert "retrying once" in caplog.text
     assert "字幕测试" not in caplog.text
 
 
-async def test_separate_jobs_recover_from_upload_error_in_a_fresh_browser(mock_site, chromium_path, source,
-                                                                   monkeypatch, caplog):
+async def test_a_later_job_can_retry_after_an_upload_error(mock_site, chromium_path, source, monkeypatch, caplog):
     from playwright.async_api import Error as PlaywrightError
 
     from subtranslate import website
@@ -268,8 +372,12 @@ async def test_separate_jobs_recover_from_upload_error_in_a_fresh_browser(mock_s
     monkeypatch.setattr(website.WebsiteSession, "browser", record_browser)
     browser = translator(mock_site, chromium_path)
     first = await browser.translate(source, "es")
-    second = await browser.translate(source, "es")
-    assert b"Hola mundo" in first.content and b"Hola mundo" in second.content
+    stages = []
+    with pytest.raises(WebsiteError, match="Could not complete"):
+        await browser.translate(source, "es", on_progress=stages.append)
+    third = await browser.translate(source, "es")
+    assert b"Hola mundo" in first.content and b"Hola mundo" in third.content
+    assert stages.count("uploading and parsing the subtitle") == 1 and "downloading" not in stages
     assert waits == 3 and len(browsers) == 3
     assert browsers[1] is not browsers[2]
     assert all(not instance.is_connected() for instance in browsers)
@@ -278,17 +386,16 @@ async def test_separate_jobs_recover_from_upload_error_in_a_fresh_browser(mock_s
     assert "Hello world" not in caplog.text
 
 
-async def test_same_script_partial_result_is_warned_not_claimed_as_complete(mock_site, chromium_path):
+async def test_same_script_partial_result_is_refused(mock_site, chromium_path):
     source = prepare_subtitle("".join(
         f"{i}\n00:00:01,000 --> 00:00:02,000\nAn English subtitle sentence {i}\n\n"
         for i in range(1, 41)
     ).encode())
-    result = await translator(mock_site + "?mode=partial10", chromium_path).translate(source, "es")
-    assert result.changed_cues == 10 and result.longest_unchanged_run == 30
-    assert result.possibly_incomplete
+    with pytest.raises(WebsiteError, match="remained unchanged"):
+        await translator(mock_site + "?mode=partial10", chromium_path).translate(source, "es")
 
 
-async def test_large_sub_bridge_combines_downloads_and_restores_every_frame(mock_site, chromium_path):
+async def test_sub_bridge_restores_every_frame_from_one_download(mock_site, chromium_path):
     raw = "{1}{1}23.976\n" + "".join(
         f"{{{i}}}{{{i + 1}}}Original subtitle {i}\n" for i in range(25, 230)
     )

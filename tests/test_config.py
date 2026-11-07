@@ -5,7 +5,7 @@ from subtranslate.config import Settings
 
 @pytest.fixture
 def environment(monkeypatch):
-    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH"):
+    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH", "API_ID", "API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_API_ID", "TG_API_HASH"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BOT_TOKEN", "123456:example")
     monkeypatch.setenv("KOYEB_PUBLIC_DOMAIN", "demo-example.koyeb.app")
@@ -48,6 +48,35 @@ def test_bot_token_is_still_required(environment, monkeypatch):
     monkeypatch.delenv("BOT_TOKEN")
     with pytest.raises(ValueError, match="BOT_TOKEN"):
         Settings.from_env()
+
+
+@pytest.mark.parametrize("id_key,hash_key", [
+    ("API_ID", "API_HASH"), ("TELEGRAM_API_ID", "TELEGRAM_API_HASH"), ("TG_API_ID", "TG_API_HASH"),
+])
+def test_optional_mtproto_credentials_are_read_and_never_shown(environment, monkeypatch, id_key, hash_key):
+    monkeypatch.setenv(id_key, "34567")
+    monkeypatch.setenv(hash_key, "PRIVATE_API_HASH")
+    settings = Settings.from_env()
+    assert settings.api_id == 34567 and settings.api_hash == "PRIVATE_API_HASH"
+    assert "PRIVATE_API_HASH" not in repr(settings)
+    assert "34567" not in repr(settings)
+    assert settings.bot_token not in repr(settings)
+
+
+def test_empty_primary_names_do_not_hide_configured_aliases(environment, monkeypatch):
+    monkeypatch.setenv("API_ID", "  ")
+    monkeypatch.setenv("API_HASH", "")
+    monkeypatch.setenv("TELEGRAM_API_ID", "123")
+    monkeypatch.setenv("TELEGRAM_API_HASH", "PRIVATE")
+    settings = Settings.from_env()
+    assert settings.api_id == 123 and settings.api_hash == "PRIVATE"
+
+
+def test_invalid_api_id_does_not_log_the_value(environment, monkeypatch):
+    monkeypatch.setenv("API_ID", "PRIVATE_BAD_ID")
+    with pytest.raises(ValueError) as error:
+        Settings.from_env()
+    assert "PRIVATE_BAD_ID" not in str(error.value)
 
 
 def test_rejects_timeout_over_idle_limit(environment, monkeypatch):

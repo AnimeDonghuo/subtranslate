@@ -15,6 +15,10 @@ class Settings:
     chromium_path: str | None = None
     translation_timeout_seconds: int = 900
     allowed_user_ids: frozenset[int] | None = None
+    # Optional MTProto credentials are used only for transfers beyond the
+    # public Bot API's file limits. Never include either value in repr/logs.
+    api_id: int | None = field(default=None, repr=False)
+    api_hash: str | None = field(default=None, repr=False)
 
     @property
     def webhook_url(self) -> str:
@@ -68,12 +72,24 @@ class Settings:
             raise ValueError("PORT, TRANSLATION_TIMEOUT_SECONDS and ALLOWED_USER_IDS must be integers") from exc
         if not 1 <= port <= 65535:
             raise ValueError("PORT must be between 1 and 65535")
-        # A deadline applies to each individual language, not to a whole
-        # all-language batch, which may take much longer.
+        # The timeout bounds website waits, not the entire file or batch.
         if not 60 <= timeout <= 1000:
             raise ValueError("TRANSLATION_TIMEOUT_SECONDS must be between 60 and 1000")
         if allowed is not None and (not allowed or any(value <= 0 for value in allowed)):
             raise ValueError("ALLOWED_USER_IDS must contain positive Telegram user IDs")
+        # Common environment names are accepted without ever logging their
+        # values. A missing half disables large transfers, not the webhook.
+        def first_nonempty(*names: str) -> str:
+            return next((value for name in names if (value := os.getenv(name, "").strip())), "")
+
+        api_id_text = first_nonempty("API_ID", "TELEGRAM_API_ID", "TG_API_ID")
+        api_hash = first_nonempty("API_HASH", "TELEGRAM_API_HASH", "TG_API_HASH")
+        try:
+            api_id = int(api_id_text) if api_id_text else None
+            if api_id is not None and api_id <= 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("API_ID (or TELEGRAM_API_ID) must be a positive integer") from None
         return cls(
             bot_token=token,
             webhook_base_url=base,
@@ -81,4 +97,6 @@ class Settings:
             chromium_path=os.getenv("CHROMIUM_PATH", "").strip() or None,
             translation_timeout_seconds=timeout,
             allowed_user_ids=allowed,
+            api_id=api_id,
+            api_hash=api_hash or None,
         )

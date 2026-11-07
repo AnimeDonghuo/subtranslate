@@ -12,7 +12,8 @@ from telegram.request import BaseRequest
 from subtranslate.bot import BotService
 from subtranslate.config import Settings
 from subtranslate.languages import LanguageCatalog
-from subtranslate.subtitles import verify_and_merge
+from subtranslate.large_srt import FileSubtitle
+from subtranslate.subtitles import prepare_subtitle, verify_and_merge
 from subtranslate.web import WebhookReceiver
 
 SOURCE = b"10\n00:00:01,000 --> 00:00:02,000\nHello world\n\n"
@@ -63,7 +64,12 @@ class TelegramStub(BaseRequest):
             self.next_message += 1
             result = {"message_id": self.next_message, "date": 1700000000, "chat": CHAT, "from": BOT_USER}
             if action == "sendDocument":
-                self.uploads.append(request_data.multipart_data)
+                # A real HTTP request streams file handles while the send call
+                # is active. Capture them now before the job closes the file.
+                multipart = {}
+                for key, (filename, content, mime) in request_data.multipart_data.items():
+                    multipart[key] = (filename, content.read() if hasattr(content, "read") else content, mime)
+                self.uploads.append(multipart)
                 result["document"] = {"file_id": "out", "file_unique_id": "outunique", "file_name": "result.srt"}
                 self.document_sent.set()
             else:
@@ -75,6 +81,10 @@ class TelegramStub(BaseRequest):
         return 200, json.dumps({"ok": True, "result": result}).encode()
 
 
+def in_memory_source(source):
+    return prepare_subtitle(source.path.read_bytes()) if isinstance(source, FileSubtitle) else source
+
+
 class FakeTranslator:
     @asynccontextmanager
     async def session(self):
@@ -84,7 +94,7 @@ class FakeTranslator:
         assert code == "hi"
         if on_progress:
             on_progress("translating")
-        return verify_and_merge(source, TRANSLATED)
+        return verify_and_merge(in_memory_source(source), TRANSLATED)
 
 
 def callback_update(update_id=2, code="hi", *, data=None):
@@ -192,7 +202,7 @@ async def test_select_all_returns_each_file_in_sequence_through_telegram_handler
     class MultipleTranslator(FakeTranslator):
         async def translate(self, source, code, *, on_progress=None):
             seen.append(code)
-            return verify_and_merge(source, TRANSLATED)
+            return verify_and_merge(in_memory_source(source), TRANSLATED)
 
     request = TelegramStub()
     telegram = (Application.builder().token("12345:TESTTOKEN").request(request)
@@ -287,7 +297,7 @@ async def test_webhook_job_edits_one_truthful_stage_bar_and_sends_the_file():
             on_progress("translating")
             translating.set()
             await release.wait()
-            return verify_and_merge(source, TRANSLATED)
+            return verify_and_merge(in_memory_source(source), TRANSLATED)
 
     request = TelegramStub()
     settings = Settings("12345:TESTTOKEN", "https://example.com")
@@ -326,7 +336,7 @@ async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chrom
     request = TelegramStub()
     settings = Settings("12345:TESTTOKEN", "https://example.com")
     browser = WebsiteTranslator(chromium_path, site_url=mock_site + "?mode=download-different", stage_timeout_ms=5000,
-                                translation_timeout_ms=1500, change_wait_ms=800)
+                                translation_timeout_ms=1500, change_wait_ms=800, settle_ms=800, settle_timeout_ms=5000)
     with patch.object(bot_web, "WebsiteTranslator", return_value=browser), \
          patch.object(LanguageCatalog, "refresh", new=AsyncMock()):
         async with TestClient(TestServer(bot_web.create_web_app(settings, telegram_request=request))) as client:

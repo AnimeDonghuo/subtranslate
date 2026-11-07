@@ -2,7 +2,10 @@
 
 import asyncio
 import logging
+import tempfile
+from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 
 import aiohttp
 from telegram import InputFile, Message, ReplyParameters, Update
@@ -16,8 +19,16 @@ from telegram.ext import (
 )
 
 from .config import Settings
+from .fileio import run_file_io, run_scan, wait_for_cleanup
 from .jobs import EnqueueResult, JobQueue, TranslationJob
 from .languages import LanguageCatalog, confirm_all_keyboard, language_keyboard
+from .large_srt import prepare_file_srt
+from .large_telegram import (
+    BOT_API_DOWNLOAD_BYTES,
+    BOT_API_UPLOAD_BYTES,
+    LargeTelegramTransfer,
+    LargeTransferError,
+)
 from .progress import ProgressMessage
 from .subtitles import (
     MAX_INPUT_BYTES,
@@ -31,7 +42,9 @@ from .website import LanguageUnavailable, WebsiteError, WebsiteTranslator
 logger = logging.getLogger(__name__)
 
 HELP = (
-    "👋 Send a text subtitle file (SRT, ASS, SUB, SBV, VTT or Spruce STL; up to 1 MB and 3,000 cues). "
+    "👋 Send a text subtitle file (SRT, ASS, SUB, SBV, VTT or Spruce STL). "
+    "SRT files have no bot-wide size or cue-count cap; large jobs depend on Telegram, disk space and the website. "
+    "Other formats are limited to 1 MB and 3,000 cues. "
     "Binary VobSub and EBU STL are not supported. Choose a language, or select all to translate one language at a time. "
     "I’ll use translatesubtitles.co and send each file back with the language in its name.\n\n"
     "The site uses Google Translate; please review the result. Your subtitle text is sent to "
@@ -42,6 +55,10 @@ HELP = (
 PICK = "Choose the language you want for this subtitle:"
 
 
+class JobCancelled(Exception):
+    """A user canceled the active translation or transfer."""
+
+
 class BotService:
     def __init__(self, settings: Settings, catalog: LanguageCatalog, translator: WebsiteTranslator) -> None:
         self.settings = settings
@@ -49,6 +66,7 @@ class BotService:
         self.translator = translator
         self.queue = JobQueue(self.process_job, max_waiting=2)
         self._batch_cancellations: dict[int, asyncio.Event] = {}
+        self._single_cancellations: dict[int, asyncio.Event] = {}
         self.bot = None
 
     def install_handlers(self, application) -> None:
@@ -112,16 +130,16 @@ class BotService:
         if not await self._is_private_and_allowed(update):
             return
         chat_id = update.effective_chat.id
-        removed = self.queue.cancel_waiting_batches(chat_id)
-        active = self._batch_cancellations.get(chat_id)
+        removed = self.queue.cancel_waiting_jobs(chat_id)
+        active = self._batch_cancellations.get(chat_id) or self._single_cancellations.get(chat_id)
         if active:
             active.set()
         if active or removed:
             await update.effective_message.reply_text(
-                "Canceled queued all-language jobs. An active batch will stop after the current language."
+                "Canceled queued jobs. Active work is stopping; no unfinished subtitle will be sent."
             )
         else:
-            await update.effective_message.reply_text("You have no active or queued all-language batch.")
+            await update.effective_message.reply_text("You have no active or queued translation job.")
 
     async def other_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if await self._is_private_and_allowed(update):
@@ -133,12 +151,15 @@ class BotService:
         message = update.effective_message
         doc = message.document
         try:
-            subtitle_extension(doc.file_name if doc and doc.file_name else "")
+            extension = subtitle_extension(doc.file_name if doc and doc.file_name else "")
         except SubtitleError as exc:
             await message.reply_text(str(exc))
             return
-        if doc.file_size is not None and (doc.file_size <= 0 or doc.file_size > MAX_INPUT_BYTES):
-            await message.reply_text("Please send a non-empty subtitle up to 1,000,000 bytes (about 1 MB).")
+        if doc.file_size is not None and doc.file_size <= 0:
+            await message.reply_text("Please send a non-empty subtitle file.")
+            return
+        if extension != ".srt" and doc.file_size is not None and doc.file_size > MAX_INPUT_BYTES:
+            await message.reply_text("Non-SRT formats are limited to 1 MB. Try SRT for larger files.")
             return
         # Explicitly reply to the original document. Telegram includes it in
         # callback messages, so a language selection survives Koyeb sleeping.
@@ -206,12 +227,15 @@ class BotService:
             return
         doc = original.document
         try:
-            subtitle_extension(doc.file_name or "")
+            extension = subtitle_extension(doc.file_name or "")
         except SubtitleError:
             await query.answer("Please send a supported subtitle file again.", show_alert=True)
             return
-        if doc.file_size is not None and (doc.file_size <= 0 or doc.file_size > MAX_INPUT_BYTES):
-            await query.answer("The file must be non-empty and at most 1 MB.", show_alert=True)
+        if doc.file_size is not None and doc.file_size <= 0:
+            await query.answer("The file must not be empty.", show_alert=True)
+            return
+        if extension != ".srt" and doc.file_size is not None and doc.file_size > MAX_INPUT_BYTES:
+            await query.answer("Non-SRT formats are limited to 1 MB. Try SRT for larger files.", show_alert=True)
             return
         job = TranslationJob(
             chat_id=message.chat.id,
@@ -262,81 +286,192 @@ class BotService:
             # If Telegram refuses an edit, try a normal message instead.
             await self._notice(chat_id, text)
 
-    async def _download_source(self, job: TranslationJob):
-        telegram_file = await self.bot.get_file(job.file_id)
+    @asynccontextmanager
+    async def _job_resources(self):
+        # Subtitle text and MTProto authorization must not outlive the job.
+        with tempfile.TemporaryDirectory(prefix="subtranslate-job-") as directory:
+            transport = LargeTelegramTransfer(self.settings)
+            try:
+                yield Path(directory), transport
+            finally:
+                await transport.close()
+
+    async def _download_source(self, job: TranslationJob, directory: Path, transport: LargeTelegramTransfer):
+        extension = subtitle_extension(job.file_name)
+        path = directory / "source.srt"
+        if extension == ".srt" and job.file_size is not None and job.file_size > BOT_API_DOWNLOAD_BYTES:
+            await transport.download(job, path)
+            return await run_scan(prepare_file_srt, path)
+        try:
+            telegram_file = await self.bot.get_file(job.file_id)
+        except BadRequest:
+            # Some updates do not include size; the public endpoint can reject
+            # an oversized file before returning metadata. Try the original
+            # message over MTProto if credentials are configured.
+            if extension != ".srt" or not self.settings.api_id or not self.settings.api_hash:
+                raise
+            await transport.download(job, path)
+            return await run_scan(prepare_file_srt, path)
         file_size = telegram_file.file_size if telegram_file.file_size is not None else job.file_size
-        if file_size is None or file_size <= 0 or file_size > MAX_INPUT_BYTES:
-            raise SubtitleError("The file is empty, too large, or its size could not be verified. Please resend a subtitle up to 1 MB.")
+        if file_size is not None and file_size <= 0:
+            raise SubtitleError("The subtitle file is empty.")
+        if extension != ".srt" and file_size is not None and file_size > MAX_INPUT_BYTES:
+            raise SubtitleError("Non-SRT formats are limited to 1 MB. Try SRT for larger files.")
+        if extension == ".srt" and file_size is not None and file_size > BOT_API_DOWNLOAD_BYTES:
+            await transport.download(job, path)
+            return await run_scan(prepare_file_srt, path)
         data = await telegram_file.download_as_bytearray(read_timeout=60)
-        if len(data) > MAX_INPUT_BYTES:
-            raise SubtitleError("The subtitle is too large. Please send a file up to 1 MB.")
+        if not data or (file_size is not None and len(data) != file_size):
+            raise SubtitleError("The Telegram download was empty or incomplete. Please send the file again.")
+        if job.file_size is not None and len(data) != job.file_size:
+            raise SubtitleError("The Telegram download did not match the original size. Please send it again.")
+        if extension == ".srt":
+            await run_file_io(path.write_bytes, data)
+            del data
+            return await run_scan(prepare_file_srt, path)
         return await asyncio.to_thread(prepare_subtitle, bytes(data), job.file_name)
 
-    async def _send_result(self, job: TranslationJob, name: str, result, progress: str = "") -> None:
+    async def _send_result(self, job: TranslationJob, name: str, result, transport: LargeTelegramTransfer,
+                           progress: str = "") -> None:
+        if result.possibly_incomplete:
+            raise SubtitleError("A long section of the website download remained unchanged; no potentially incomplete file was sent.")
         filename = translated_filename(job.file_name, name)
         cue_word = "cue" if result.cue_count == 1 else "cues"
         caption = f"{progress}{name} · {result.cue_count:,} {cue_word} checked"
         if result.changed_cues is not None:
             caption += (f"\n{result.changed_cues:,}/{result.cue_count:,} cue texts differ from the original. "
                         "Names or shared words may stay the same.")
-        caption += "\nFrom the website's downloads. Please review the machine translation."
+        caption += "\nFrom the website's Download button. Please review the machine translation."
         if result.unchanged:
             caption += (
                 "\n\n⚠️ The website returned unchanged text. It may already be in the target "
                 "language, or translation may have failed."
             )
-        elif result.possibly_incomplete:
-            caption += (
-                "\n\n⚠️ A long section stayed unchanged. It may already be in the target language, "
-                "or the translation may be incomplete. Please review it."
+        if isinstance(result.content, Path):
+            if result.content.stat().st_size > BOT_API_UPLOAD_BYTES:
+                await transport.send(job, result.content, filename, caption)
+            else:
+                # PTB otherwise reads an open handle into RAM at construction.
+                with result.content.open("rb") as source:
+                    await self.bot.send_document(
+                        chat_id=job.chat_id,
+                        document=InputFile(source, filename=filename, read_file_handle=False),
+                        caption=caption,
+                        reply_parameters=ReplyParameters(message_id=job.original_message_id,
+                                                         allow_sending_without_reply=True),
+                        write_timeout=120, read_timeout=120,
+                    )
+        elif len(result.content) > BOT_API_UPLOAD_BYTES:
+            # SRT downloads normally use a file. Never accidentally pass an
+            # oversized in-memory result to the public Bot API.
+            raise LargeTransferError("The translated file is too large for the ordinary Telegram upload. Please retry.")
+        else:
+            await self.bot.send_document(
+                chat_id=job.chat_id,
+                document=InputFile(BytesIO(result.content), filename=filename),
+                caption=caption,
+                reply_parameters=ReplyParameters(message_id=job.original_message_id, allow_sending_without_reply=True),
+                write_timeout=120, read_timeout=120,
             )
-        await self.bot.send_document(
-            chat_id=job.chat_id,
-            document=InputFile(BytesIO(result.content), filename=filename),
-            caption=caption,
-            reply_parameters=ReplyParameters(message_id=job.original_message_id, allow_sending_without_reply=True),
-            write_timeout=120,
-            read_timeout=120,
-        )
+
+    @staticmethod
+    async def _cancelable(awaitable, cancel: asyncio.Event):
+        if cancel.is_set():
+            awaitable.close()
+            raise JobCancelled()
+        operation = asyncio.create_task(awaitable)
+        stopped = asyncio.create_task(cancel.wait())
+        try:
+            done, _ = await asyncio.wait((operation, stopped), return_when=asyncio.FIRST_COMPLETED)
+            # If delivery finished at the same instant as cancellation, do not
+            # claim it failed: Telegram may already have delivered the file.
+            if operation in done:
+                return await operation
+            raise JobCancelled()
+        finally:
+            for task in (operation, stopped):
+                if not task.done():
+                    task.cancel()
+            cleanup = asyncio.gather(operation, stopped, return_exceptions=True)
+            # Shutdown can race with /cancel. Do not remove job files until
+            # canceled transfers/scans have actually finished cleaning up.
+            await wait_for_cleanup(cleanup)
+
+    async def _translate_with_deadline(self, translator, source, code: str, progress: ProgressMessage):
+        # No deadline for the entire job. Bound an inactive website stage and
+        # renew the watchdog when the one-upload flow advances to another stage.
+        seconds = self.settings.translation_timeout_seconds
+        loop = asyncio.get_running_loop()
+        async with asyncio.timeout(seconds) as deadline:
+            def update(stage: str) -> None:
+                # Parsing and translation have their own inactivity timeouts;
+                # potentially large file operations are cancellable and not
+                # given a fixed total deadline.
+                if stage in {"starting the browser", "uploading and parsing the subtitle", "translating",
+                             "waiting for translation to settle", "downloading", "validating the downloaded file"}:
+                    deadline.reschedule(None)
+                else:
+                    deadline.reschedule(loop.time() + seconds)
+                progress.set_stage(stage)
+
+            return await translator.translate(source, code, on_progress=update)
 
     async def process_job(self, job: TranslationJob) -> None:
         if job.languages:
             await self._process_all(job)
             return
-        progress = await ProgressMessage.start(self.bot, job.chat_id, job.language_name)
+        cancel = asyncio.Event()
+        self._single_cancellations[job.chat_id] = cancel
+        try:
+            progress = await ProgressMessage.start(self.bot, job.chat_id, job.language_name)
+        except BaseException:
+            self._single_cancellations.pop(job.chat_id, None)
+            raise
         if progress is None:
+            self._single_cancellations.pop(job.chat_id, None)
             return
+        heartbeat = asyncio.create_task(self._keep_active_job_awake(), name="job-heartbeat")
         try:
             try:
-                async with asyncio.timeout(self.settings.translation_timeout_seconds):
-                    source = await self._download_source(job)
-                    result = await self.translator.translate(source, job.language_code, on_progress=progress.set_stage)
+                async with self._job_resources() as (directory, transport):
+                    source = await self._cancelable(self._download_source(job, directory, transport), cancel)
+                    result = await self._cancelable(
+                        self._translate_with_deadline(self.translator, source, job.language_code, progress), cancel
+                    )
                     progress.set_stage("sending result")
-                    await self._send_result(job, job.language_name, result)
+                    await self._cancelable(self._send_result(job, job.language_name, result, transport), cancel)
                 cue_word = "cue" if result.cue_count == 1 else "cues"
                 if result.unchanged or result.possibly_incomplete:
                     final = (f"⚠️ Sent {job.language_name} with {result.cue_count:,} checked {cue_word}, "
                              "but some text may be untranslated. Please review the file.")
                 else:
                     final = f"✅ {job.language_name} complete. Sent the file with {result.cue_count:,} checked {cue_word}."
-            except (SubtitleError, WebsiteError) as exc:
+            except JobCancelled:
+                final = "Translation canceled. No unfinished subtitle was sent."
+            except (SubtitleError, WebsiteError, LargeTransferError) as exc:
                 final = f"Could not translate: {exc}\n\nYou can tap a language button to try again."
             except TimeoutError:
-                final = "Translation timed out. Try again or use a smaller subtitle."
+                final = "The website timed out. No incomplete file was sent; please retry."
             except TelegramError as exc:
                 logger.warning("Telegram file transfer failed (%s)", type(exc).__name__)
                 final = "Telegram could not download or send the file. Please resend it and try again."
-            except Exception as exc:  # noqa: BLE001 - notify the user on unexpected job failures
+            except OSError as exc:
+                logger.warning("Temporary subtitle storage failed (%s)", type(exc).__name__)
+                final = "Could not use temporary storage. Check available disk space; no incomplete file was sent."
+            except Exception as exc:  # noqa: BLE001 - do not log data/URLs from third parties
                 logger.error("Translation failed (%s)", type(exc).__name__)
                 final = "Something went wrong while translating. Please try again later."
             await self._finish_progress(progress, job.chat_id, final)
         finally:
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             await progress.close()
+            self._single_cancellations.pop(job.chat_id, None)
 
-    async def _keep_active_batch_awake(self) -> None:
-        # A batch is real work, but Koyeb only sees incoming HTTP traffic. Ping
+    async def _keep_active_job_awake(self) -> None:
+        # A job is real work, but Koyeb only sees incoming HTTP traffic. Ping
         # the public health route while it runs; stop immediately when it ends.
-        # This is best effort and does not make the in-memory batch durable.
+        # This is best effort and does not make the in-memory job durable.
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             while True:
@@ -345,9 +480,18 @@ class BotService:
                     async with session.get(self.settings.webhook_base_url + "/healthz") as response:
                         await response.read()
                 except (aiohttp.ClientError, TimeoutError) as exc:
-                    logger.info("Batch heartbeat unavailable (%s)", type(exc).__name__)
+                    logger.info("Job heartbeat unavailable (%s)", type(exc).__name__)
 
     async def _process_all(self, job: TranslationJob) -> None:
+        try:
+            async with self._job_resources() as (directory, transport):
+                await self._process_all_with_resources(job, directory, transport)
+        except OSError as exc:
+            logger.warning("Batch temporary storage failed (%s)", type(exc).__name__)
+            await self._notice(job.chat_id, "Could not use temporary storage. Check available disk space and retry.")
+
+    async def _process_all_with_resources(self, job: TranslationJob, directory: Path,
+                                          transport: LargeTelegramTransfer) -> None:
         cancel = asyncio.Event()
         self._batch_cancellations[job.chat_id] = cancel
         heartbeat = None
@@ -355,15 +499,21 @@ class BotService:
         delivered = skipped = failed = consecutive_failures = 0
         skipped_names: list[str] = []
         failed_names: list[str] = []
+        failure_details: list[tuple[str, str]] = []
         stopped = session_failed = repeated_failures = False
         try:
             progress = await ProgressMessage.start(self.bot, job.chat_id, "all languages", batch_total=len(job.languages))
             if progress is None:
                 return
-            heartbeat = asyncio.create_task(self._keep_active_batch_awake(), name="batch-heartbeat")
+            heartbeat = asyncio.create_task(self._keep_active_job_awake(), name="batch-heartbeat")
             try:
-                async with asyncio.timeout(self.settings.translation_timeout_seconds):
-                    source = await self._download_source(job)
+                source = await self._cancelable(self._download_source(job, directory, transport), cancel)
+            except JobCancelled:
+                await self._finish_progress(progress, job.chat_id, "Translation batch canceled. No unfinished file was sent.")
+                return
+            except (SubtitleError, LargeTransferError) as exc:
+                await self._finish_progress(progress, job.chat_id, f"Could not read the subtitle: {exc}")
+                return
             except Exception as exc:  # noqa: BLE001 - notify the user if the batch cannot start
                 logger.warning("Could not start all-language batch (%s)", type(exc).__name__)
                 await self._finish_progress(progress, job.chat_id, "Could not read the subtitle file. Please resend it and try again.")
@@ -382,33 +532,47 @@ class BotService:
                                 break
                             progress.set_language(name, number, delivered + skipped + failed)
                             progress.set_stage("starting the browser")
+                            result = None
                             try:
-                                async with asyncio.timeout(self.settings.translation_timeout_seconds):
-                                    result = await translator.translate(source, code, on_progress=progress.set_stage)
-                                    progress.set_stage("sending result")
-                                    await self._send_result(job, name, result, progress=f"{number}/{len(job.languages)} · ")
+                                result = await self._cancelable(
+                                    self._translate_with_deadline(translator, source, code, progress), cancel
+                                )
+                                progress.set_stage("sending result")
+                                await self._cancelable(
+                                    self._send_result(job, name, result, transport, progress=f"{number}/{len(job.languages)} · "),
+                                    cancel,
+                                )
                                 delivered += 1
                                 consecutive_failures = 0
+                            except JobCancelled:
+                                stopped = True
+                                break
                             except LanguageUnavailable:
                                 skipped += 1
                                 skipped_names.append(name)
                                 # A stale catalog entry is not a website outage.
                                 consecutive_failures = 0
-                            except TelegramError as exc:
+                            except (TelegramError, LargeTransferError) as exc:
                                 failed += 1
                                 failed_names.append(name)
+                                if len(failure_details) < 8 and isinstance(exc, LargeTransferError):
+                                    failure_details.append((name, str(exc)[:300]))
                                 stopped = True
                                 logger.warning("Telegram batch delivery failed (%s)", type(exc).__name__)
                                 break
                             except Exception as exc:  # noqa: BLE001 - prevent repeated failures from running all day
                                 failed += 1
                                 failed_names.append(name)
+                                if len(failure_details) < 8 and isinstance(exc, (SubtitleError, WebsiteError)):
+                                    failure_details.append((name, str(exc)[:300]))
                                 consecutive_failures += 1
                                 logger.warning("Batch language failed (%s)", type(exc).__name__)
                                 if consecutive_failures >= 3:
                                     stopped = repeated_failures = True
                                     break
                             finally:
+                                if result is not None and isinstance(result.content, Path):
+                                    result.content.unlink(missing_ok=True)
                                 progress.set_completed(delivered + skipped + failed)
                 except Exception as exc:  # noqa: BLE001 - session startup/cleanup can also fail
                     stopped = session_failed = True
@@ -422,6 +586,8 @@ class BotService:
                     summary += f"\n{label}: {', '.join(names[:8])}"
                     if len(names) > 8:
                         summary += f" and {len(names) - 8} more"
+            for name, reason in failure_details:
+                summary += f"\n{name}: {reason}"
             if repeated_failures:
                 summary += "\nThe website failed repeatedly; try again later."
             if session_failed:

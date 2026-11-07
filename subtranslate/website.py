@@ -1,11 +1,12 @@
 """Drive the public translatesubtitles.co website; this is not an API client."""
 
 import asyncio
+import errno
 import logging
+import os
 import re
 import secrets
 import tempfile
-from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -15,14 +16,14 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeout
 from playwright.async_api import async_playwright
 
+from .fileio import run_scan
+from .large_srt import FileSubtitle, convert_to_utf8, verify_file_srt
 from .subtitles import (
     MAX_OUTPUT_BYTES,
     PreparedSubtitle,
     TranslatedSubtitle,
-    combine_srt_downloads,
     obviously_untranslated_run,
     restore_subtitle_from_website,
-    split_srt_for_website,
     subtitle_for_website,
     verify_and_merge,
 )
@@ -44,7 +45,7 @@ class LanguageUnavailable(WebsiteError):
 
 
 class _RetryableWebsiteError(WebsiteError):
-    """An early browser/site failure for which a fresh browser may help."""
+    """A browser/site failure before the subtitle upload started."""
 
 
 def _error_category(exc: Exception) -> str:
@@ -66,8 +67,24 @@ def _error_category(exc: Exception) -> str:
     return "other"
 
 
+def _retain_download(source: Path, destination: Path, stop=None) -> None:
+    """Keep Playwright's actual downloaded file without a same-disk copy."""
+    try:
+        os.replace(source, destination)
+    except OSError as exc:
+        if exc.errno != errno.EXDEV:
+            raise
+        # Different filesystems cannot rename; copy in bounded chunks and
+        # let cancellation stop the copy before temporary files are removed.
+        with source.open("rb") as original, destination.open("wb") as target:
+            while chunk := original.read(1024 * 1024):
+                if stop is not None and stop.is_set():
+                    raise InterruptedError("Download copy canceled")
+                target.write(chunk)
+
+
 def _stage(name: str, on_progress: Callable[[str], None] | None = None) -> str:
-    # Stage names are fixed strings or numeric part counts; never log subtitle text or filenames.
+    # Stage names are fixed strings; never log subtitle text or filenames.
     logger.info("Subtitle website: %s", name)
     if on_progress is not None:
         try:
@@ -89,11 +106,18 @@ async def _close_vip_popup(page) -> None:
 
 async def _wait_for_uploaded_cues(page, expected_count: int, timeout_ms: int) -> None:
     """Wait for every cue while dismissing interstitials that block parsing."""
-    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_ms / 1000
+    last_count = 0
     cells = page.locator("td.notranslate.target-sub")
     while True:
         await _close_vip_popup(page)
         count = await cells.count()
+        if count > last_count:
+            # Parsing can be incremental for a large file. Bound a stall, not
+            # the total duration while more cues are actively appearing.
+            deadline = loop.time() + timeout_ms / 1000
+            last_count = count
         if count == expected_count:
             return
         if count > expected_count:
@@ -144,25 +168,49 @@ async def _block_unnecessary_requests(route) -> None:
 # wait for an already-hidden loader, which can report success immediately. Watch
 # for an actual visible -> hidden transition, or a newly visible success message.
 PROGRESS_WATCH = r"""() => {
-    const visible = (el) => !!(el && el.getClientRects().length &&
-        getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).opacity !== '0');
-    const success = () => document.querySelector('h4.skiptranslate.success-msg');
+    const visible = (el) => {
+        if (!el || !el.getClientRects().length) return false;
+        for (let node = el; node; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
+        }
+        return true;
+    };
+    const busy = () => Array.from(document.querySelectorAll('#loader, .goog-te-spinner-pos')).some(visible);
+    const success = () => visible(document.querySelector('h4.skiptranslate.success-msg'));
+    let lastBusy = busy(), lastSuccess = success();
     const state = window.__subtranslateWatch = {
-        successInitiallyVisible: visible(success()),
-        loaderSeen: false,
+        successInitiallyVisible: lastSuccess,
+        loaderSeen: lastBusy,
         loaderFinished: false,
         lastTextChange: performance.now(),
+        lastIndicatorChange: performance.now(),
+    };
+    // Polling calls this too: CSS animations can change visibility without
+    // a DOM mutation, so the quiet period must start when they actually stop.
+    state.sampleIndicators = () => {
+        const loading = busy(), succeeded = success();
+        if (loading !== lastBusy || succeeded !== lastSuccess) {
+            state.lastIndicatorChange = performance.now();
+            lastBusy = loading;
+            lastSuccess = succeeded;
+        }
+        if (loading) {
+            state.loaderSeen = true;
+            state.loaderFinished = false;
+        } else if (state.loaderSeen) {
+            state.loaderFinished = true;
+        }
+        return {loading, succeeded};
     };
     const observer = new MutationObserver((mutations) => {
-        const loader = document.querySelector('#loader');
-        if (visible(loader)) state.loaderSeen = true;
-        else if (state.loaderSeen) state.loaderFinished = true;
+        state.sampleIndicators();
         for (const mutation of mutations) {
             const el = mutation.target.nodeType === Node.ELEMENT_NODE ?
                 mutation.target : mutation.target.parentElement;
             if (el && el.closest && el.closest('td.notranslate.target-sub')) {
                 state.lastTextChange = performance.now();
-                break; // One timestamp per mutation batch is enough, even for thousands of cues.
+                break;
             }
         }
     });
@@ -172,22 +220,34 @@ PROGRESS_WATCH = r"""() => {
 
 PROGRESS_FINISHED = r"""() => {
     const state = window.__subtranslateWatch;
-    if (!state) return false;
-    const el = document.querySelector('h4.skiptranslate.success-msg');
-    const success = !!(el && el.getClientRects().length &&
-        getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).opacity !== '0');
-    return state.loaderFinished || (!state.successInitiallyVisible && success);
+    if (!state) return null;
+    const {loading, succeeded} = state.sampleIndicators();
+    // A success message is not enough while a translation animation is
+    // still visible. If no loader is present, accept a new success message.
+    return {
+        ready: !loading && (state.loaderFinished || (!state.successInitiallyVisible && succeeded)),
+        textChange: state.lastTextChange,
+        indicatorChange: state.lastIndicatorChange,
+    };
 }"""
 
 PROGRESS_DIAGNOSTICS = r"""() => {
-    const visible = (el) => !!(el && el.getClientRects().length &&
-        getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).opacity !== '0');
+    const visible = (el) => {
+        if (!el || !el.getClientRects().length) return false;
+        for (let node = el; node; node = node.parentElement) {
+            const style = getComputedStyle(node);
+            if (style.visibility === 'hidden' || style.display === 'none' || Number(style.opacity) === 0) return false;
+        }
+        return true;
+    };
     const loader = document.querySelector('#loader');
+    const spinner = document.querySelector('.goog-te-spinner-pos');
     const success = document.querySelector('h4.skiptranslate.success-msg');
     const state = window.__subtranslateWatch;
     return {
         loaderPresent: !!loader,
         loaderVisible: visible(loader),
+        spinnerVisible: visible(spinner),
         successPresent: !!success,
         successVisible: visible(success),
         successInitiallyVisible: state?.successInitiallyVisible ?? null,
@@ -197,30 +257,88 @@ PROGRESS_DIAGNOSTICS = r"""() => {
 }"""
 
 CACHE_INITIAL_CUES = r"""() => {
-    // Keep this only in the page: it is used to detect changes, never to
-    // construct the output file. Avoid transferring all subtitle text twice.
+    // Keep only lightweight fingerprints in the page. The preview is never
+    // used to construct the output; this merely detects any changed cue.
+    const hash = window.__subtranslateHash = (text) => {
+        let value = 2166136261;
+        for (let i = 0; i < text.length; i++) value = Math.imul(value ^ text.charCodeAt(i), 16777619);
+        return value >>> 0;
+    };
     const cells = document.querySelectorAll('td.notranslate.target-sub');
-    window.__subtranslateBefore = Array.from(cells, el => (el.textContent || '').trim());
+    const before = window.__subtranslateBefore = new Uint32Array(cells.length * 2);
+    cells.forEach((el, index) => {
+        const text = (el.textContent || '').trim();
+        before[index * 2] = text.length;
+        before[index * 2 + 1] = hash(text);
+    });
     return cells.length;
 }"""
 
 TEXT_CHANGED = r"""() => {
-    const before = window.__subtranslateBefore;
-    if (!before) return false;
+    const before = window.__subtranslateBefore, hash = window.__subtranslateHash;
+    if (!before || !hash) return false;
     const after = document.querySelectorAll('td.notranslate.target-sub');
-    return before.some((text, index) => {
-        const current = (after[index]?.textContent || '').trim();
-        return current && current !== text;
+    for (let index = 0; index < after.length; index++) {
+        const text = (after[index]?.textContent || '').trim();
+        if (text && (text.length !== before[index * 2] || hash(text) !== before[index * 2 + 1])) return true;
+    }
+    return false;
+}"""
+
+TEXT_CHANGE_COUNTS = r"""() => {
+    const before = window.__subtranslateBefore, hash = window.__subtranslateHash;
+    const cells = document.querySelectorAll('td.notranslate.target-sub');
+    if (!before || !hash) return {count: cells.length, changed: 0};
+    let changed = 0;
+    cells.forEach((cell, index) => {
+        const text = (cell.textContent || '').trim();
+        if (text && (text.length !== before[index * 2] || hash(text) !== before[index * 2 + 1])) changed++;
     });
+    return {count: cells.length, changed};
 }"""
 
 TEXT_STABLE = r"""(settleMs) => {
-    const loader = document.querySelector('#loader');
-    const loading = !!(loader && loader.getClientRects().length &&
-        getComputedStyle(loader).visibility !== 'hidden' && getComputedStyle(loader).opacity !== '0');
-    return window.__subtranslateWatch && !loading &&
-        performance.now() - window.__subtranslateWatch.lastTextChange >= settleMs;
+    const state = window.__subtranslateWatch;
+    if (!state) return null;
+    const {loading, succeeded} = state.sampleIndicators();
+    const finished = state.loaderFinished || (!state.successInitiallyVisible && succeeded);
+    // Wait for both indicators and all table text to stay quiet. This avoids
+    // downloading during a late or temporarily hidden translation animation.
+    return {
+        ready: finished && !loading && performance.now() -
+            Math.max(state.lastTextChange, state.lastIndicatorChange) >= settleMs,
+        textChange: state.lastTextChange,
+        indicatorChange: state.lastIndicatorChange,
+    };
 }"""
+
+
+async def _wait_for_site_progress(page, expression: str, idle_timeout_ms: int, *, arg=None,
+                                  interval: float = 0.25) -> None:
+    """Bound inactivity, not the total time while the website keeps updating."""
+    loop = asyncio.get_running_loop()
+    idle_seconds = idle_timeout_ms / 1000
+    deadline = loop.time() + idle_seconds
+    previous = None
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            raise PlaywrightTimeout("The subtitle website stopped making progress")
+        try:
+            async with asyncio.timeout(remaining):
+                state = await page.evaluate(expression, arg) if arg is not None else await page.evaluate(expression)
+        except TimeoutError:
+            # This also covers an unresponsive browser's JS execution thread.
+            raise PlaywrightTimeout("The subtitle website stopped making progress") from None
+        if state is None:
+            raise PlaywrightError("The subtitle website's progress state disappeared")
+        marker = (state["textChange"], state["indicatorChange"])
+        if previous is not None and marker != previous:
+            deadline = loop.time() + idle_seconds
+        previous = marker
+        if state["ready"]:
+            return
+        await asyncio.sleep(min(interval, max(0, deadline - loop.time())))
 
 
 class WebsiteSession:
@@ -257,70 +375,44 @@ class WebsiteSession:
         self._uses += 1
         return self._browser
 
-    async def _translate_part(self, source: PreparedSubtitle, language_code: str,
-                              on_progress: Callable[[str], None] | None) -> TranslatedSubtitle:
-        # Once the site has started translating, do not blindly repeat that
-        # operation. Early upload/navigation failures are safe to retry once
-        # with a new browser and isolated context.
+    async def _translate_with_early_retry(self, source: PreparedSubtitle | FileSubtitle, language_code: str,
+                                          on_progress: Callable[[str], None] | None) -> TranslatedSubtitle:
+        # A failed browser launch/navigation may be retried before any file
+        # is uploaded. Never retry once the single upload has begun.
         for attempt in range(2):
             try:
                 return await self.translator._translate_in_session(source, language_code, self, on_progress)
             except _RetryableWebsiteError:
                 if attempt:
                     raise WebsiteError(
-                        "The subtitle website could not open or upload the file after retrying. "
+                        "The subtitle website could not be opened after retrying. "
                         "It may have timed out or be unavailable; please try again later."
                     ) from None
-                logger.info("Retrying the early website flow with a fresh browser")
+                logger.info("Retrying website opening before upload with a fresh browser")
                 await self._close_browser()
                 await asyncio.sleep(1)
         raise AssertionError("unreachable")
 
-    async def translate(self, source: PreparedSubtitle, language_code: str, *,
+    async def translate(self, source: PreparedSubtitle | FileSubtitle, language_code: str, *,
                         on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:
-        # Use the site's Download button for every part. Bounded SRT uploads
-        # reduce the chance of a successful-looking but partial large result.
-        site_source = await asyncio.to_thread(subtitle_for_website, source)
-        first_parts = await asyncio.to_thread(split_srt_for_website, site_source)
-        pending = deque((part, 0) for part in first_parts)
-        total = len(pending)
-        completed = 0
-        downloads = []
-        while pending:
-            part, depth = pending.popleft()
-            if total > 1:
-                _stage(f"part:{completed + 1}/{total}", on_progress)
-            result = await self._translate_part(part, language_code, on_progress)
-            suspicious = await asyncio.to_thread(obviously_untranslated_run, part, result, language_code)
+        # One upload, one Download file. Never reconstruct the SRT from the
+        # preview or combine multiple website downloads.
+        result = await self._translate_with_early_retry(source, language_code, on_progress)
+        if isinstance(source, PreparedSubtitle):
+            suspicious = await asyncio.to_thread(obviously_untranslated_run, source, result, language_code)
             if suspicious:
-                # A smaller upload can recover from sites that stop translating
-                # midway. The depth limit keeps repeated retries bounded.
-                smaller = []
-                if part.extension == ".srt" and len(part.cues) >= 20 and depth < 4:
-                    smaller = await asyncio.to_thread(
-                        split_srt_for_website, part, max_cues=max(1, len(part.cues) // 2)
-                    )
-                if len(smaller) > 1:
-                    logger.warning("Website download has a likely untranslated run (%d cues); splitting the part", suspicious)
-                    total += len(smaller) - 1
-                    pending.extendleft((subpart, depth + 1) for subpart in reversed(smaller))
-                    await self._close_browser()
-                    continue
-                logger.warning("Website download has a likely untranslated run (%d cues); retrying once", suspicious)
-                await self._close_browser()
-                result = await self._translate_part(part, language_code, on_progress)
-                if await asyncio.to_thread(obviously_untranslated_run, part, result, language_code):
-                    raise WebsiteError(
-                        "The website left a section in the original language after retrying, "
-                        "so no incomplete file was sent. Please try again later or use a smaller subtitle."
-                    )
-            downloads.append(result)
-            completed += 1
-        if len(downloads) == 1:
-            site_result = downloads[0]  # Keep the site's actual bytes for a single SRT download.
-        else:
-            site_result = await asyncio.to_thread(combine_srt_downloads, site_source, downloads)
-        return await asyncio.to_thread(restore_subtitle_from_website, source, site_result)
+                raise WebsiteError(
+                    "The website download appears to contain untranslated subtitles, "
+                    "so no incomplete file was sent. Please try again later."
+                )
+        if result.possibly_incomplete:
+            if isinstance(result.content, Path):
+                result.content.unlink(missing_ok=True)
+            raise WebsiteError(
+                "A long section of the website download remained unchanged and may be untranslated, "
+                "so no potentially incomplete file was sent. Please try again later."
+            )
+        return result
 
 
 class WebsiteTranslator:
@@ -333,8 +425,8 @@ class WebsiteTranslator:
         translation_timeout_ms: int = 900_000,
         change_wait_ms: int = 8_000,
         retry_change_wait_ms: int = 30_000,
-        settle_ms: int = 5_000,
-        settle_timeout_ms: int = 60_000,
+        settle_ms: int = 30_000,
+        settle_timeout_ms: int = 300_000,
     ) -> None:
         self.chromium_path = chromium_path
         # site_url is injectable for local integration tests, not user input.
@@ -358,26 +450,40 @@ class WebsiteTranslator:
                     await session._close_browser()
         except (PlaywrightError, OSError) as exc:
             logger.warning("Could not open or close the subtitle browser (%s)", type(exc).__name__)
-            raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from exc
+            if isinstance(exc, OSError) and exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                raise WebsiteError("The deployment ran out of temporary disk space; no incomplete file was sent.") from None
+            raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from None
 
-    async def translate(self, source: PreparedSubtitle, language_code: str, *,
+    async def translate(self, source: PreparedSubtitle | FileSubtitle, language_code: str, *,
                         on_progress: Callable[[str], None] | None = None) -> TranslatedSubtitle:
         async with self.session() as session:
             return await session.translate(source, language_code, on_progress=on_progress)
 
-    async def _translate_in_session(self, source: PreparedSubtitle, language_code: str, session: WebsiteSession,
+    async def _translate_in_session(self, source: PreparedSubtitle | FileSubtitle, language_code: str,
+                                    session: WebsiteSession,
                                     on_progress: Callable[[str], None] | None) -> TranslatedSubtitle:
         stage = _stage("starting the browser", on_progress)
         browser = page = None
         browser_connected = page_closed = None
+        output_path = None
+        keep_output = False
         try:
-            site_source = subtitle_for_website(source)
+            site_source = source if isinstance(source, FileSubtitle) else subtitle_for_website(source)
+            expected_cues = site_source.cue_count if isinstance(site_source, FileSubtitle) else len(site_source.cues)
             with tempfile.TemporaryDirectory(prefix="subtranslate-") as temp_dir:
-                # Avoid predictable upload names if the third-party site stores
-                # uploads by filename. Never send the user's original filename.
+                # Never upload the user's original filename. A symlink avoids
+                # copying a potentially huge UTF-8 SRT merely to randomize it.
                 input_path = Path(temp_dir) / f"subtitle-{secrets.token_hex(12)}{site_source.extension}"
-                output_path = Path(temp_dir) / f"download{site_source.extension}"
-                input_path.write_bytes(site_source.utf8)
+                if isinstance(site_source, FileSubtitle):
+                    output_directory = site_source.work_directory or site_source.path.parent
+                    output_path = output_directory / f"download-{secrets.token_hex(12)}.srt"
+                    if site_source.encoding == "utf-8-sig":
+                        input_path.symlink_to(site_source.path.resolve())
+                    else:
+                        await run_scan(convert_to_utf8, site_source, input_path)
+                else:
+                    output_path = Path(temp_dir) / f"download{site_source.extension}"
+                    input_path.write_bytes(site_source.utf8)
                 browser = await session.browser()
                 context = await browser.new_context(
                     accept_downloads=True, locale="en-US", service_workers="block"
@@ -392,15 +498,8 @@ class WebsiteTranslator:
                     stage = _stage("uploading and parsing the subtitle", on_progress)
                     await page.locator('input[type="file"]').first.set_input_files(str(input_path))
                     # The uploaded file is parsed on the website's next page.
-                    try:
-                        await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
-                    except PlaywrightTimeout:
-                        # Transient uploads sometimes never render their table.
-                        # Retry only before translation has started.
-                        logger.info("Retrying the subtitle upload once")
-                        await page.goto(self.site_url, wait_until="domcontentloaded", timeout=self.stage_timeout_ms)
-                        await page.locator('input[type="file"]').first.set_input_files(str(input_path))
-                        await _wait_for_uploaded_cues(page, len(site_source.cues), self.stage_timeout_ms)
+                    # If it stalls, report the problem instead of reuploading.
+                    await _wait_for_uploaded_cues(page, expected_cues, self.stage_timeout_ms)
                     selector = page.locator("select.goog-te-combo").first
                     await selector.locator("option").nth(1).wait_for(state="attached", timeout=self.stage_timeout_ms)
                     await _close_vip_popup(page)
@@ -408,7 +507,7 @@ class WebsiteTranslator:
                     # into Python. Names or numbers can remain unchanged, so
                     # compare every cue when deciding whether to retry.
                     initial_count = await page.evaluate(CACHE_INITIAL_CUES)
-                    if initial_count != len(site_source.cues):
+                    if initial_count != expected_cues:
                         raise WebsiteError("The website parsed a different number of cues. Please try again.")
 
                     stage = _stage("selecting the target language", on_progress)
@@ -427,9 +526,7 @@ class WebsiteTranslator:
                     translate_button = await _button(page, "Translate", 1)
                     await translate_button.click()
                     try:
-                        await page.wait_for_function(
-                            PROGRESS_FINISHED, timeout=self.translation_timeout_ms, polling=250
-                        )
+                        await _wait_for_site_progress(page, PROGRESS_FINISHED, self.translation_timeout_ms)
                     except PlaywrightTimeout:
                         try:
                             # Only booleans about the UI, never subtitle content.
@@ -462,22 +559,33 @@ class WebsiteTranslator:
                             except PlaywrightTimeout:
                                 pass
                     try:
-                        await page.wait_for_function(
-                            TEXT_STABLE, arg=self.settle_ms, timeout=self.settle_timeout_ms, polling=500
+                        await _wait_for_site_progress(
+                            page, TEXT_STABLE, self.settle_timeout_ms, arg=self.settle_ms, interval=0.5
                         )
                     except PlaywrightTimeout:
                         raise WebsiteError("The website's translation did not finish settling. Please try again.")
 
+                    # Counts only, not subtitle text. These help distinguish
+                    # an early-looking site completion from a changed output.
+                    counts = await page.evaluate(TEXT_CHANGE_COUNTS)
+                    logger.info("Website text changed in %d of %d displayed cues before download",
+                                counts["changed"], counts["count"])
                     stage = _stage("downloading", on_progress)
                     await _close_vip_popup(page)
                     download_button = await _button(page, "Download", 2)
                     async with page.expect_download(timeout=self.stage_timeout_ms) as download_info:
                         await download_button.click()
                     download = await download_info.value
-                    await download.save_as(str(output_path))
-                    if output_path.stat().st_size > MAX_OUTPUT_BYTES:
-                        raise WebsiteError("The site returned an unexpectedly large file. Please try again.")
-                    downloaded = output_path.read_bytes()
+                    if isinstance(site_source, FileSubtitle):
+                        # Playwright has already completed this file. Keep its
+                        # actual bytes on disk without loading or recreating it.
+                        browser_path = await download.path()
+                        await run_scan(_retain_download, browser_path, output_path)
+                    else:
+                        await download.save_as(str(output_path))
+                        if output_path.stat().st_size > MAX_OUTPUT_BYTES:
+                            raise WebsiteError("The site returned an unexpectedly large file. Please try again.")
+                        downloaded = output_path.read_bytes()
                 finally:
                     # Capture state before closing the context; afterward a
                     # healthy page would always appear closed. No URLs, file
@@ -492,6 +600,10 @@ class WebsiteTranslator:
                 # sending broken subtitles to the user. SUB inputs use an SRT
                 # bridge; restore their original frames/timing afterward.
                 stage = _stage("validating the downloaded file", on_progress)
+                if isinstance(site_source, FileSubtitle):
+                    verified = await run_scan(verify_file_srt, site_source, output_path, language_code)
+                    keep_output = True
+                    return verified
                 verified = await asyncio.to_thread(verify_and_merge, site_source, downloaded)
                 return await asyncio.to_thread(restore_subtitle_from_website, source, verified)
         except LanguageUnavailable:
@@ -509,11 +621,16 @@ class WebsiteTranslator:
                 "Subtitle website interaction failed while %s (error=%s, category=%s, browser_connected=%s, page_closed=%s)",
                 stage, type(exc).__name__, category, browser_connected, page_closed,
             )
-            if stage in {"starting the browser", "opening the subtitle site", "uploading and parsing the subtitle"}:
+            if stage in {"starting the browser", "opening the subtitle site"}:
                 raise _RetryableWebsiteError("The early website flow failed.") from None
             if isinstance(exc, PlaywrightTimeout):
                 raise WebsiteError("The subtitle website timed out. Please try again later or use a smaller file.") from None
             raise WebsiteError("Could not complete the subtitle website flow. It may be unavailable or have changed.") from None
         except OSError as exc:
             logger.warning("A local file or browser error occurred while %s (error=%s)", stage, type(exc).__name__)
+            if exc.errno in {errno.ENOSPC, errno.EDQUOT}:
+                raise WebsiteError("The deployment ran out of temporary disk space; no incomplete file was sent.") from None
             raise WebsiteError("The browser could not process the subtitle file. Please try again later.") from None
+        finally:
+            if isinstance(source, FileSubtitle) and output_path is not None and not keep_output:
+                output_path.unlink(missing_ok=True)

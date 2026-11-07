@@ -95,21 +95,20 @@ async def test_hanging_edit_is_bounded_and_terminal_update_can_recover():
     assert progress._task.done()
 
 
-async def test_part_progress_and_reset_for_next_batch_language():
+async def test_download_stage_has_a_heartbeat_for_long_transfers():
+    edited = asyncio.Event()
+
+    async def edit(**kwargs):
+        edited.set()
+
     bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=21)),
-                          edit_message_text=AsyncMock())
-    progress = await ProgressMessage.start(bot, 42, "all languages", batch_total=2, edit_interval=0.01)
+                          edit_message_text=AsyncMock(side_effect=edit))
+    progress = await ProgressMessage.start(bot, 42, "Hindi", edit_interval=0, heartbeat_interval=0.02)
     try:
-        progress.set_language("English", current=1, completed=0)
-        progress.set_stage("part:2/7")
-        progress.set_stage("uploading and parsing the subtitle")
-        text = progress.render()
-        assert "Subtitle part: 2/7 (processed sequentially)" in text
-        assert "Uploading and checking" in text
-        progress.set_stage("part:not-numbers")
-        progress.set_stage("part:9/2")
-        assert "Subtitle part: 2/7" in progress.render()
-        progress.set_language("Hindi", current=2, completed=1)
-        assert "Subtitle part:" not in progress.render()
+        progress.started_at -= 61
+        await asyncio.wait_for(edited.wait(), 1)
+        text = bot.edit_message_text.await_args.kwargs["text"]
+        assert "Downloading your subtitle" in text and "Elapsed: 1:" in text
+        assert "Subtitle part:" not in text
     finally:
         await progress.close()

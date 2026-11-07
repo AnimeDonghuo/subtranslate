@@ -8,7 +8,6 @@ site or Telegram. The fake transport is shared with the normal bot tests.
 
 import asyncio
 import os
-import re
 import shutil
 import time
 from pathlib import Path
@@ -29,20 +28,14 @@ from subtranslate.website import WebsiteTranslator
 async def wait_for_result(stub: fake_telegram.TelegramStub) -> None:
     """Fail promptly if the bot reports an error rather than sending a file."""
     inspected = 0
-    last_reported = 0
     while not stub.document_sent.is_set():
         for action, params in stub.calls[inspected:]:
             text = params.get("text", "")
             if action in {"sendMessage", "editMessageText"} and text.startswith((
-                "Could not translate:", "Translation timed out.",
+                "Could not translate:", "The website timed out.",
                 "Telegram could not", "Something went wrong",
             )):
                 raise AssertionError(f"The mocked job failed: {text}")
-            if action == "editMessageText":
-                match = re.search(r"Subtitle part: (\d+)/(\d+)", text)
-                if match and int(match[1]) // 10 > last_reported // 10:
-                    last_reported = int(match[1])
-                    print(f"Resource test: working on part {match[1]}/{match[2]}", flush=True)
         inspected = len(stub.calls)
         await asyncio.sleep(0.25)
 
@@ -52,7 +45,7 @@ async def main() -> None:
     if not chromium:
         raise RuntimeError("Set TEST_CHROMIUM_PATH or CHROMIUM_PATH to a Chromium executable")
 
-    # Near the bot's byte and cue ceilings, without storing a large fixture.
+    # A previously problematic size, without storing a large fixture.
     cue_text = "x" * 240
     fake_telegram.SOURCE = "".join(
         f"{index}\n00:00:01,000 --> 00:00:02,000\nOriginal subtitle cue {index}: {cue_text}"
@@ -73,7 +66,6 @@ async def main() -> None:
     async with TestServer(mock) as mock_server:
         stub = fake_telegram.TelegramStub()
         settings = Settings("12345:TESTTOKEN", "https://example.com")
-        # Hundreds of long synthetic cues now require many bounded uploads.
         # Keep the real browser/cgroup stress, but shorten the mock-only
         # settling wait (the fixture changes its text after 350 ms). Production
         # keeps its longer wait for the real, unpredictable website.
@@ -95,9 +87,8 @@ async def main() -> None:
                     "/telegram/webhook", headers=headers, json=fake_telegram.callback_update(21),
                 )
                 assert response.status == 200
-                # A near-1 MB sample produces many sequential uploads; slower
-                # CI hosts need longer than five minutes even for a local mock.
-                # The bot's own per-language 900-second deadline still applies.
+                # The real browser uploads the complete sample once; allow
+                # slow CI hosts time to render and download the whole table.
                 await asyncio.wait_for(wait_for_result(stub), 750)
                 upload = next(iter(stub.uploads[0].values()))
                 assert upload[0] == "movie.Hindi.srt"

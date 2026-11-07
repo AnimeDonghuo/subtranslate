@@ -40,8 +40,6 @@ class ProgressMessage:
         self.batch_total = batch_total
         self.batch_completed = 0
         self.batch_current = 0
-        self.part_current = 0
-        self.part_total = 0
         self.stage = "downloading the original"
         self.edit_interval = edit_interval
         self.heartbeat_interval = heartbeat_interval
@@ -66,8 +64,6 @@ class ProgressMessage:
                 lines.append(f"Current: {self.language} ({self.batch_current}/{self.batch_total})")
         else:
             lines.append(f"Translating to {self.language}")
-        if self.part_total > 1:
-            lines.append(f"Subtitle part: {self.part_current}/{self.part_total} (processed sequentially)")
         lines.extend((
             f"[{_bar(index, len(STAGES))}] Step {index}/{len(STAGES)}",
             f"Stage: {label}",
@@ -95,17 +91,7 @@ class ProgressMessage:
 
     def set_stage(self, stage: str) -> None:
         if self._terminal is None:
-            if stage.startswith("part:"):
-                # Internal progress events carry only bounded numeric counts.
-                try:
-                    current, total = map(int, stage[5:].split("/", 1))
-                except ValueError:
-                    return
-                if not 1 <= current <= total:
-                    return
-                self.part_current, self.part_total = current, total
-            else:
-                self.stage = stage
+            self.stage = stage
             self._event.set()
 
     def set_language(self, name: str, current: int, completed: int) -> None:
@@ -113,7 +99,6 @@ class ProgressMessage:
             self.language = name
             self.batch_current = current
             self.batch_completed = completed
-            self.part_current = self.part_total = 0
             self._event.set()
 
     def set_completed(self, completed: int) -> None:
@@ -126,9 +111,8 @@ class ProgressMessage:
             try:
                 await asyncio.wait_for(self._event.wait(), timeout=self.heartbeat_interval)
             except TimeoutError:
-                # Keep long website waits visibly alive without claiming an ETA.
-                if self.stage not in {"translating", "waiting for translation to settle"}:
-                    continue
+                # Keep long transfers and website stages visibly alive without claiming an ETA.
+                pass
             delay = self.edit_interval - (asyncio.get_running_loop().time() - self._last_edit)
             if delay > 0:
                 await asyncio.sleep(delay)

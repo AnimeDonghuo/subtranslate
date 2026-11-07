@@ -52,7 +52,7 @@ async def test_invalid_srt_is_rejected_before_upload_to_site(service):
 async def test_checks_downloaded_size_even_if_metadata_claims_it_is_small(service):
     service.bot.get_file.return_value = telegram_file(b"x" * (MAX_INPUT_BYTES + 1), size=10)
     await service.process_job(JOB)
-    assert "too large" in last_notice(service)
+    assert "incomplete" in last_notice(service)
     service.translator.translate.assert_not_awaited()
     service.bot.send_document.assert_not_awaited()
 
@@ -83,6 +83,55 @@ async def test_timeout_is_reported_and_browser_coroutine_cancelled(service):
     assert cancelled.is_set()
     assert "timed out" in last_notice(service)
     service.bot.send_document.assert_not_awaited()
+
+
+@pytest.mark.parametrize("stage", [
+    "starting the browser", "uploading and parsing the subtitle", "translating",
+    "waiting for translation to settle", "downloading", "validating the downloaded file",
+])
+async def test_large_or_active_stages_have_no_fixed_total_deadline(service, stage):
+    service.settings = Settings("12345:TESTTOKEN", "https://example.com", translation_timeout_seconds=0.05)
+    service.bot.get_file.return_value = telegram_file(VALID_SRT)
+
+    async def slow_stage(source, code, *, on_progress=None):
+        on_progress(stage)
+        await asyncio.sleep(0.1)
+        return TranslatedSubtitle(VALID_SRT, 1, unchanged=False)
+
+    service.translator.translate.side_effect = slow_stage
+    await service.process_job(JOB)
+    service.bot.send_document.assert_awaited_once()
+
+
+async def test_cancel_single_during_delivery_cleans_up_without_claiming_completion(service):
+    service.bot.get_file.return_value = telegram_file(VALID_SRT)
+    started = asyncio.Event()
+    canceled = asyncio.Event()
+    paths = []
+
+    async def translate(source, code, *, on_progress=None):
+        paths.append(source.path)
+        return TranslatedSubtitle(source.path, 1, unchanged=False, changed_cues=1)
+
+    async def slow_send(**kwargs):
+        try:
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            canceled.set()
+
+    service.translator.translate.side_effect = translate
+    service.bot.send_document.side_effect = slow_send
+    task = asyncio.create_task(service.process_job(JOB))
+    await asyncio.wait_for(started.wait(), 2)
+    update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=AsyncMock()),
+                             effective_chat=SimpleNamespace(id=42, type="private"),
+                             effective_user=SimpleNamespace(id=42))
+    await service.cancel_batch(update, None)
+    await asyncio.wait_for(task, 3)
+    assert canceled.is_set() and not paths[0].exists() and not paths[0].parent.exists()
+    assert "canceled" in last_notice(service).lower()
+    assert not service._single_cancellations
 
 
 async def test_telegram_transfer_error_is_reported(service):
@@ -127,14 +176,12 @@ async def test_job_does_not_run_when_status_cannot_be_delivered(service):
     service.translator.translate.assert_not_awaited()
 
 
-async def test_possible_partial_result_has_explicit_warning(service):
+async def test_possible_partial_result_is_not_sent_as_complete(service):
     service.bot.get_file.return_value = telegram_file(VALID_SRT)
     service.translator.translate.return_value = TranslatedSubtitle(
         VALID_SRT, 50, unchanged=False, changed_cues=5, longest_unchanged_run=45,
     )
     await service.process_job(JOB)
-    caption = service.bot.send_document.await_args.kwargs["caption"]
-    assert "A long section stayed unchanged" in caption
-    assert "may be incomplete" in caption
-    assert "may be untranslated" in last_notice(service)
-    assert "complete" not in last_notice(service)
+    service.bot.send_document.assert_not_awaited()
+    assert "long section" in last_notice(service).lower()
+    assert "no potentially incomplete file was sent" in last_notice(service)
