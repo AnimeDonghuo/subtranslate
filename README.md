@@ -21,20 +21,20 @@ Telegram still imposes its own bot file-size limits (approximately 2 GB), and a 
 
 The deployment needs enough **temporary disk for the source, the website's downloaded result, and browser overhead at the same time**. If UTF-16 or a legacy encoding needs conversion, that can require additional space. Koyeb's [free instance](https://www.koyeb.com/docs/reference/instances#free-instances) has 512 MB RAM, 0.1 vCPU and 2 GB SSD; it cannot be assumed to accommodate a 2 GB input plus its output, and the website's full-file browser processing can exhaust RAM well before then. A larger instance/disk may be needed. Jobs can also fail or be interrupted by website outages, browser crashes, disk exhaustion, Telegram limits, scale-down, or deployment restarts. The bot does not intentionally send a detected partial download as a complete translation.
 
-## Deploy on Koyeb
+## Deploy on Koyeb or Railway
 
 1. Create a bot with [@BotFather](https://t.me/BotFather). Keep its token and API credentials private; do not paste them into chat or commit them.
-2. In Koyeb, create a **Web Service** from the GitHub branch containing this code, select the **Dockerfile** builder, and expose HTTP port `8080`. The Dockerfile installs Chromium.
-3. Set these environment variables in Koyeb, using Secrets for sensitive values:
+2. In Koyeb or Railway, deploy this repository. On Koyeb, select the **Dockerfile** builder and expose HTTP port `8080`. On Railway, the Dockerfile is auto-detected and `PORT` is automatically configured.
+3. Set these environment variables:
 
    | Variable | Purpose |
    | --- | --- |
    | `BOT_TOKEN` | BotFather token |
    | `API_ID` and `API_HASH` | Telegram API credentials for transfers beyond public Bot API limits; optional for smaller files |
-   | `PORT` | `8080`, or the port configured for the service |
+   | `PORT` | `8080` on Koyeb, or dynamically injected by Railway |
 
-   Webhook authentication is derived from the bot token; no separate webhook secret is required. The old `TELEGRAM_WEBHOOK_SECRET` setting is ignored.
-4. Deploy. The bot derives its public webhook URL from `KOYEB_PUBLIC_DOMAIN`. Look for **Telegram webhook registered** in the logs. `GET /healthz` returns HTTP 200 while the service is alive, including during Telegram retries; `GET /readyz` returns HTTP 200 only once the webhook is registered. Use `/healthz` for the Koyeb liveness check.
+   Webhook authentication is derived from the bot token; no separate webhook secret is required. The bot automatically derives its public webhook URL from `KOYEB_PUBLIC_DOMAIN` on Koyeb or `RAILWAY_PUBLIC_DOMAIN` / `RAILWAY_STATIC_URL` on Railway.
+4. Deploy. Look for **Telegram webhook registered** in the logs. `GET /healthz` returns HTTP 200 while the service is alive, including during Telegram retries; `GET /readyz` returns HTTP 200 only once the webhook is registered. Use `/healthz` for health checks.
 5. In Telegram, send `/start`, upload a small `.srt`, and choose a language. For a private bot, send `/id`, then optionally set `ALLOWED_USER_IDS` to your numeric ID and redeploy.
 
 **Check pricing and billing** before choosing a larger instance or additional storage. The free instance is a hobby deployment, not a durable queue. The queue and progress are in memory. A restart, crash or scale-down can interrupt a job; retry by tapping the language button or resending the document. Best-effort health requests during an active job reduce idle scale-down but do not guarantee uninterrupted processing.
@@ -43,7 +43,7 @@ The deployment needs enough **temporary disk for the source, the website's downl
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `WEBHOOK_BASE_URL` | Derived from `KOYEB_PUBLIC_DOMAIN` | Public HTTPS origin without a path, e.g. `https://bot.example.com`. |
+| `WEBHOOK_BASE_URL` | Derived from `KOYEB_PUBLIC_DOMAIN` / `RAILWAY_PUBLIC_DOMAIN` | Public HTTPS origin without a path, e.g. `https://bot.example.com`. |
 | `ALLOWED_USER_IDS` | Unset | Comma-separated Telegram user IDs; unset allows private-chat users. |
 | `TRANSLATION_TIMEOUT_SECONDS` | `900` | Website translation inactivity timeout, 60–1,000 seconds; renewed when cue text or indicators change. Some other site operations have separate timeouts. There is no fixed total deadline for an entire SRT or Select-all batch. |
 | `CHROMIUM_PATH` | Docker: `/usr/bin/chromium` | Local Chromium executable; if unset, Playwright uses its installed browser. |

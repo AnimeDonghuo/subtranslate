@@ -5,7 +5,7 @@ from subtranslate.config import Settings
 
 @pytest.fixture
 def environment(monkeypatch):
-    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH", "API_ID", "API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_API_ID", "TG_API_HASH", "WEBSITE_PROXIES"):
+    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH", "API_ID", "API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_API_ID", "TG_API_HASH", "WEBSITE_PROXIES"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BOT_TOKEN", "123456:example")
     monkeypatch.setenv("KOYEB_PUBLIC_DOMAIN", "demo-example.koyeb.app")
@@ -17,6 +17,18 @@ def test_koyeb_domain_and_allowlist(environment, monkeypatch):
     assert settings.webhook_url == "https://demo-example.koyeb.app/telegram/webhook"
     assert settings.allowed_user_ids == frozenset({123, 456})
     assert settings.port == 8080
+
+
+def test_railway_domain(environment, monkeypatch):
+    monkeypatch.delenv("KOYEB_PUBLIC_DOMAIN", raising=False)
+    monkeypatch.setenv("RAILWAY_PUBLIC_DOMAIN", "subtranslate.up.railway.app")
+    settings = Settings.from_env()
+    assert settings.webhook_url == "https://subtranslate.up.railway.app/telegram/webhook"
+
+    monkeypatch.delenv("RAILWAY_PUBLIC_DOMAIN", raising=False)
+    monkeypatch.setenv("RAILWAY_STATIC_URL", "https://subtranslate-static.up.railway.app")
+    settings2 = Settings.from_env()
+    assert settings2.webhook_url == "https://subtranslate-static.up.railway.app/telegram/webhook"
 
 
 @pytest.mark.parametrize("url", ["http://example.com", "https://example.com/foo", "https://user:pass@example.com", "https://example.com:9999", "https://example.com?x=y"])

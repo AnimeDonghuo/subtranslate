@@ -46,6 +46,14 @@ class Settings:
             koyeb_domain = os.getenv("KOYEB_PUBLIC_DOMAIN", "").strip()
             if koyeb_domain:
                 base = f"https://{koyeb_domain}"
+            else:
+                railway_domain = (
+                    os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip()
+                    or os.getenv("RAILWAY_STATIC_URL", "").strip()
+                )
+                if railway_domain:
+                    clean_domain = railway_domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+                    base = f"https://{clean_domain}"
         base = base.rstrip("/")
         try:
             parsed = urlsplit(base)
@@ -64,7 +72,7 @@ class Settings:
         except ValueError:
             valid_base = False
         if not valid_base:
-            raise ValueError("Set WEBHOOK_BASE_URL to a public HTTPS origin, or use Koyeb's KOYEB_PUBLIC_DOMAIN")
+            raise ValueError("Set WEBHOOK_BASE_URL to a public HTTPS origin, or use Koyeb's KOYEB_PUBLIC_DOMAIN or Railway's RAILWAY_PUBLIC_DOMAIN")
 
         try:
             port = int(os.getenv("PORT", "8080"))

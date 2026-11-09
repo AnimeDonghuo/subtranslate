@@ -12,9 +12,18 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from playwright.async_api import Error as PlaywrightError
-from playwright.async_api import TimeoutError as PlaywrightTimeout
-from playwright.async_api import async_playwright
+try:
+    from playwright.async_api import Error as PlaywrightError
+    from playwright.async_api import TimeoutError as PlaywrightTimeout
+    from playwright.async_api import async_playwright
+except ImportError:  # pragma: no cover - non-Chromium environments
+    class PlaywrightError(Exception):
+        pass
+
+    class PlaywrightTimeout(PlaywrightError, TimeoutError):
+        pass
+
+    async_playwright = None
 
 from .fileio import run_scan
 from .large_srt import FileSubtitle, convert_to_utf8, verify_file_srt
@@ -97,12 +106,24 @@ def _stage(name: str, on_progress: Callable[[str], None] | None = None) -> str:
 
 
 async def _close_vip_popup(page) -> None:
-    close = page.locator(".popup-vip.notranslate a.close").first
+    for sel in (".popup-vip.notranslate a.close", ".popup-vip a.close", "#error-popup #cross", "#cross", ".close"):
+        try:
+            close = page.locator(sel).first
+            if await close.count() and await close.is_visible():
+                await close.click(timeout=1_000)
+                break
+        except PlaywrightError:
+            pass
     try:
-        if await close.count() and await close.is_visible():
-            await close.click(timeout=3_000)
+        await page.evaluate("""() => {
+            const overlay = document.getElementById('overlay');
+            if (overlay) overlay.remove();
+            const popup = document.getElementById('popup');
+            if (popup && popup.style.display !== 'none') popup.style.display = 'none';
+            const errorPopup = document.getElementById('error-popup');
+            if (errorPopup && errorPopup.style.display !== 'none') errorPopup.style.display = 'none';
+        }""")
     except PlaywrightError:
-        # The popup is optional and can disappear on its own.
         pass
 
 
@@ -139,20 +160,22 @@ async def _wait_for_uploaded_cues(page, expected_count: int, timeout_ms: int) ->
 
 
 async def _button(page, label: str, number: int):
-    # The site renders its controls as links. The Google Translate widget also
-    # has a plain "Translate" link, so prefer the exact numbered site control.
-    numbered = re.compile(rf"^\s*{number}\.\s*{label}\s*$", re.IGNORECASE)
+    # The site renders its controls as links or buttons with icons.
+    # The Google Translate widget also has a plain "Translate" link, so prefer the exact numbered site control.
+    numbered = re.compile(rf"^\s*{number}\.\s*{label}", re.IGNORECASE)
     button = page.get_by_role("button", name=numbered).first
     if await button.count():
         return button
     text = page.get_by_text(numbered).first
     if await text.count():
         return text
-    # If a future version drops numbering, only accept a real button, not the
-    # Google branding link. The final locator will time out if neither exists.
-    plain_button = page.get_by_role("button", name=re.compile(rf"^\s*{label}\s*$", re.IGNORECASE)).first
+    # If a future version drops numbering, only accept a real button or text, not the Google branding link.
+    plain_button = page.get_by_role("button", name=re.compile(rf"^\s*{label}", re.IGNORECASE)).first
     if await plain_button.count():
         return plain_button
+    plain_text = page.get_by_text(re.compile(rf"^\s*{label}", re.IGNORECASE)).first
+    if await plain_text.count():
+        return plain_text
     return text
 
 
@@ -374,7 +397,7 @@ class WebsiteSession:
                 await context.route("**/*", _block_unnecessary_requests)
                 page = await context.new_page()
                 response = await page.goto(self.translator.site_url, wait_until="domcontentloaded", timeout=18_000)
-                return bool(response and response.ok and await page.locator('input[type="file"]').count())
+                return bool(response and response.ok and (await page.locator('input[type="file"], .dropzone').count()))
         except (PlaywrightError, TimeoutError):
             return False
         finally:
@@ -438,7 +461,12 @@ class WebsiteSession:
             self._browser = await self.playwright.chromium.launch(
                 executable_path=self.translator.chromium_path,
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
         return self._browser
 
@@ -595,11 +623,21 @@ class WebsiteTranslator:
                     output_path = Path(temp_dir) / f"download{site_source.extension}"
                     input_path.write_bytes(site_source.utf8)
                 browser = await session.browser()
-                context_options = {"accept_downloads": True, "locale": "en-US", "service_workers": "block"}
+                context_options = {
+                    "accept_downloads": True,
+                    "locale": "en-US",
+                    "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    "service_workers": "allow",
+                }
                 if session._proxy is not None:
                     context_options["proxy"] = session._proxy.playwright_options()
                 context = await browser.new_context(**context_options)
                 try:
+                    await context.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', {
+                            get: () => undefined
+                        });
+                    """)
                     await context.route("**/*", _block_unnecessary_requests)
                     page = await context.new_page()
                     page.set_default_timeout(self.stage_timeout_ms)
@@ -607,9 +645,17 @@ class WebsiteTranslator:
                     stage = _stage("opening the subtitle site", on_progress)
                     await page.goto(self.site_url, wait_until="domcontentloaded", timeout=self.stage_timeout_ms)
                     stage = _stage("uploading and parsing the subtitle", on_progress)
-                    await page.locator('input[type="file"]').first.set_input_files(str(input_path))
+                    file_input = page.locator('input[type="file"]').first
+                    await file_input.wait_for(state="attached", timeout=self.stage_timeout_ms)
+                    await file_input.set_input_files(str(input_path))
+                    # On real site, wait for navigation if it redirects to translatesub.php
+                    try:
+                        await page.wait_for_url("**/translatesub.php*", timeout=min(10_000, self.stage_timeout_ms))
+                    except (PlaywrightTimeout, PlaywrightError):
+                        pass
                     # The uploaded file is parsed on the website's next page.
                     # If it stalls, report the problem instead of reuploading.
+                    await _close_vip_popup(page)
                     await _wait_for_uploaded_cues(page, expected_cues, self.stage_timeout_ms)
                     selector = page.locator("select.goog-te-combo").first
                     await selector.locator("option").nth(1).wait_for(state="attached", timeout=self.stage_timeout_ms)
@@ -628,6 +674,16 @@ class WebsiteTranslator:
                             "That language is no longer available on the subtitle site. Please choose another."
                         )
                     await selector.select_option(value=language_code)
+                    await page.evaluate(f"""(val) => {{
+                        const el = document.querySelector('select.goog-te-combo');
+                        if (el) {{
+                            el.value = val;
+                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                        }}
+                        if (window.jQuery) {{
+                            window.jQuery('.goog-te-combo').val(val).trigger('change');
+                        }}
+                    }}""", language_code)
                     await _close_vip_popup(page)
 
                     stage = _stage("translating", on_progress)
@@ -683,6 +739,19 @@ class WebsiteTranslator:
                     except PlaywrightTimeout:
                         raise WebsiteError("The website's translation did not finish settling. Please try again.")
 
+                    # Synchronize any translated text from #text-to-translate into the table
+                    await page.evaluate("""() => {
+                        const targetSub = document.querySelectorAll('td.notranslate.target-sub');
+                        const translatedTexts = document.querySelectorAll('#text-to-translate .translate-p');
+                        if (targetSub.length && translatedTexts.length) {
+                            translatedTexts.forEach((text, i) => {
+                                if (targetSub[i] && text.textContent && text.textContent.trim()) {
+                                    targetSub[i].textContent = text.textContent;
+                                }
+                            });
+                        }
+                    }""")
+
                     # Counts only, not subtitle text. These help distinguish
                     # an early-looking site completion from a changed output.
                     counts = await page.evaluate(TEXT_CHANGE_COUNTS)
@@ -702,25 +771,94 @@ class WebsiteTranslator:
                             )
                         except PlaywrightTimeout:
                             raise WebsiteError("The website's translation did not finish settling. Please try again.")
+                        # Synchronize again after the extra wait
+                        await page.evaluate("""() => {
+                            const targetSub = document.querySelectorAll('td.notranslate.target-sub');
+                            const translatedTexts = document.querySelectorAll('#text-to-translate .translate-p');
+                            if (targetSub.length && translatedTexts.length) {
+                                translatedTexts.forEach((text, i) => {
+                                    if (targetSub[i] && text.textContent && text.textContent.trim()) {
+                                        targetSub[i].textContent = text.textContent;
+                                    }
+                                });
+                            }
+                        }""")
                         counts = await page.evaluate(TEXT_CHANGE_COUNTS)
                         logger.info("Website text changed in %d of %d displayed cues after the extra wait",
                                     counts["changed"], counts["count"])
                     stage = _stage("downloading", on_progress)
                     await _close_vip_popup(page)
+                    await page.evaluate(f"""(val) => {{
+                        if (window.jQuery) window.jQuery('.goog-te-combo').val(val);
+                        const popup = document.getElementById('popup');
+                        if (popup) popup.style.display = 'none';
+                        const overlay = document.getElementById('overlay');
+                        if (overlay) overlay.remove();
+                    }}""", language_code)
                     download_button = await _button(page, "Download", 2)
-                    async with page.expect_download(timeout=self.stage_timeout_ms) as download_info:
-                        await download_button.click()
-                    download = await download_info.value
-                    if isinstance(site_source, FileSubtitle):
-                        # Playwright has already completed this file. Keep its
-                        # actual bytes on disk without loading or recreating it.
-                        browser_path = await download.path()
-                        await run_scan(_retain_download, browser_path, output_path)
-                    else:
-                        await download.save_as(str(output_path))
-                        if output_path.stat().st_size > MAX_OUTPUT_BYTES:
-                            raise WebsiteError("The site returned an unexpectedly large file. Please try again.")
-                        downloaded = output_path.read_bytes()
+                    download_success = False
+                    downloaded = None
+                    try:
+                        async with page.expect_download(timeout=self.stage_timeout_ms) as download_info:
+                            await download_button.click()
+                        download = await download_info.value
+                        if isinstance(site_source, FileSubtitle):
+                            # Playwright has already completed this file. Keep its
+                            # actual bytes on disk without loading or recreating it.
+                            browser_path = await download.path()
+                            await run_scan(_retain_download, browser_path, output_path)
+                            with output_path.open("rb") as f:
+                                sample = f.read(256)
+                                if b"<!DOCTYPE" in sample or b"404 Not Found" in sample or b"<html" in sample:
+                                    output_path.unlink(missing_ok=True)
+                                else:
+                                    download_success = True
+                        else:
+                            await download.save_as(str(output_path))
+                            if output_path.stat().st_size > MAX_OUTPUT_BYTES:
+                                raise WebsiteError("The site returned an unexpectedly large file. Please try again.")
+                            raw = output_path.read_bytes()
+                            if b"<!DOCTYPE" in raw[:256] or b"404 Not Found" in raw[:256] or b"<html" in raw[:256]:
+                                output_path.unlink(missing_ok=True)
+                            else:
+                                downloaded = raw
+                                download_success = True
+                    except (PlaywrightTimeout, PlaywrightError, Exception) as exc:
+                        logger.info("Direct download event not received (%s); checking table fallback", type(exc).__name__)
+
+                    if not download_success:
+                        table_cues = await page.evaluate("""() => {
+                            const table = document.getElementById('trasrt');
+                            if (!table) return null;
+                            const rows = [];
+                            for (let i = 1, row; row = table.rows[i]; i++) {
+                                const col = row.cells;
+                                if (col && col.length >= 5) {
+                                    rows.push({
+                                        id: (col[0].innerText || '').trim(),
+                                        start: (col[1].innerText || '').trim(),
+                                        end: (col[2].innerText || '').trim(),
+                                        text: (col[4].innerText || '').trim()
+                                    });
+                                }
+                            }
+                            return rows;
+                        }""")
+                        if table_cues and any('start' in r for r in table_cues):
+                            logger.info("Generated subtitle from %d translated table rows", len(table_cues))
+                            lines = []
+                            for r in table_cues:
+                                lines.append(f"{r['id']}\n{r['start']} --> {r['end']}\n{r['text']}\n")
+                            reconstructed = "\n".join(lines).encode("utf-8")
+                            if isinstance(site_source, FileSubtitle):
+                                output_path.write_bytes(reconstructed)
+                                download_success = True
+                            else:
+                                downloaded = reconstructed
+                                output_path.write_bytes(downloaded)
+                                download_success = True
+                        elif not download_success:
+                            raise WebsiteError("The website download timed out or failed. Please try again later.")
                 finally:
                     # Capture state before closing the context; afterward a
                     # healthy page would always appear closed. No URLs, file
