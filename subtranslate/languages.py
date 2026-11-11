@@ -64,13 +64,33 @@ class LanguageCatalog:
             logger.info("Language catalog refresh unavailable; using bundled languages")
 
 
-def language_keyboard(catalog: LanguageCatalog, page: int = 0) -> tuple[InlineKeyboardMarkup, int, int]:
-    """Show five languages at a time, with navigation and an all-languages option."""
+def language_keyboard(catalog: LanguageCatalog, page: int = 0, *,
+                      presets: tuple[str, ...] = ()) -> tuple[InlineKeyboardMarkup, int, int]:
+    """Show five languages at a time, with navigation and an all-languages option.
+
+    When the user has saved preset languages, one extra green button offers
+    that whole set; it behaves like the normal language buttons, one language
+    at a time. Language buttons are blue, and the heavy "select all" action is
+    red, so the colours match what each button does.
+    """
     languages = catalog.items()
     page_count = max(1, math.ceil(len(languages) / PAGE_SIZE))
     page = max(0, min(page, page_count - 1))
     shown = languages[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
-    rows = [[InlineKeyboardButton(name, callback_data=f"lang:{code}")] for code, name in shown]
+    rows = []
+    available = []
+    for code in presets:
+        if catalog.get(code) and code not in available:
+            available.append(code)
+    if available:
+        # One extra button that reuses every saved language for this user,
+        # exactly like tapping the language buttons one after another.
+        rows.append([InlineKeyboardButton(
+            f"⭐ Saved languages to use ({len(available)})",
+            callback_data="preset:start", style="success",
+        )])
+    rows.extend([[InlineKeyboardButton(name, callback_data=f"lang:{code}", style="primary")]
+                 for code, name in shown])
     navigation = []
     if page > 0:
         navigation.append(InlineKeyboardButton("‹ Previous", callback_data=f"page:{page - 1}"))
@@ -78,12 +98,13 @@ def language_keyboard(catalog: LanguageCatalog, page: int = 0) -> tuple[InlineKe
         navigation.append(InlineKeyboardButton("Next ›", callback_data=f"page:{page + 1}"))
     if navigation:
         rows.append(navigation)
-    rows.append([InlineKeyboardButton("🌐 Select all languages", callback_data=f"all:confirm:{page}")])
+    rows.append([InlineKeyboardButton("🌐 Select all languages",
+                                      callback_data=f"all:confirm:{page}", style="danger")])
     return InlineKeyboardMarkup(rows), page + 1, page_count
 
 
 def confirm_all_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Yes, translate all", callback_data="all:start")],
-        [InlineKeyboardButton("‹ Back to languages", callback_data=f"page:{page}")],
+        [InlineKeyboardButton("Yes, translate all", callback_data="all:start", style="danger")],
+        [InlineKeyboardButton("‹ Back to languages", callback_data=f"page:{page}", style="primary")],
     ])

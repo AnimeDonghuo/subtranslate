@@ -19,6 +19,10 @@ class TranslationJob:
     language_code: str
     language_name: str
     languages: tuple[tuple[str, str], ...] = ()
+    # Sender details are used only for /stats, /leaderboard and the log channel.
+    user_id: int | None = None
+    user_name: str = ""
+    username: str = ""
 
     @property
     def key(self) -> tuple[int, int, str]:

@@ -15,6 +15,7 @@ from telegram.request import BaseRequest
 from .bot import BotService
 from .config import Settings
 from .languages import LanguageCatalog
+from .store import Database
 from .website import WebsiteTranslator
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,13 @@ async def _connect_telegram(telegram: Application, service: BotService, settings
                             state: TelegramState) -> None:
     """Start the bot without blocking the HTTP listener or losing updates."""
     delay = 3
+    # Access mode, bans and authorization must be loaded before any Telegram
+    # update is accepted. MongoDB failures degrade to memory instead of failing.
+    try:
+        await service.store.start()
+    except Exception as exc:  # noqa: BLE001 - bookkeeping must never stop the bot
+        logger.warning("Settings store startup failed (%s); continuing with in-memory settings",
+                       type(exc).__name__)
     logger.info("Connecting to Telegram in the background")
     while True:
         try:
@@ -208,7 +216,18 @@ def create_web_app(settings: Settings, *, telegram_request: BaseRequest | None =
         translation_timeout_ms=settings.translation_timeout_seconds * 1000,
         website_proxies=settings.website_proxies,
     )
-    service = BotService(settings, catalog, translator)
+    store = Database(
+        default_mode=settings.default_access_mode,
+        uri=settings.mongodb_uri,
+        database=settings.mongodb_database,
+        storage_limit_mb=settings.mongodb_storage_limit_mb,
+    )
+    service = BotService(settings, catalog, translator, store=store)
+    if settings.api_id and settings.api_hash:
+        # Never log the credentials themselves.
+        logger.info("Large-file Telegram transfers enabled (MTProto, up to about 2 GB)")
+    else:
+        logger.info("Large-file transfers disabled; set API_ID and API_HASH to exceed the Bot API limits")
     service.install_handlers(telegram)
     state = TelegramState()
     receiver = WebhookReceiver(settings.webhook_secret, telegram.bot, update_queue, accepting=state.accepting)
@@ -243,6 +262,10 @@ def create_web_app(settings: Settings, *, telegram_request: BaseRequest | None =
             await service.shutdown()
         except Exception as exc:  # noqa: BLE001 - still attempt to close the bot
             logger.warning("Subtitle service cleanup failed (%s)", _error_kind(exc))
+        try:
+            await store.close()
+        except Exception as exc:  # noqa: BLE001 - cleanup must not block shutdown
+            logger.warning("Settings store cleanup failed (%s)", _error_kind(exc))
         # Also close a bot that failed or was canceled during initialization.
         await _shutdown_telegram(telegram)
 

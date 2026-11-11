@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import os
+import re
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -17,11 +18,26 @@ class Settings:
     chromium_path: str | None = None
     translation_timeout_seconds: int = 900
     allowed_user_ids: frozenset[int] | None = None
+    # Owners always have access, can never be banned, and are the only users
+    # allowed to change access rules, bans and other users' authorization.
+    owner_ids: frozenset[int] = frozenset()
+    # Optional MongoDB persistence for per-user presets, bans, access rules
+    # and usage counters. Without it the bot keeps an in-memory copy.
+    mongodb_uri: str = field(default="", repr=False)
+    mongodb_database: str = "subtranslate"
+    mongodb_storage_limit_mb: int = 512
+    # Optional channel that receives a copy of every delivered subtitle.
+    log_channel_id: int | None = None
     # Optional MTProto credentials are used only for transfers beyond the
     # public Bot API's file limits. Never include either value in repr/logs.
     api_id: int | None = field(default=None, repr=False)
     api_hash: str | None = field(default=None, repr=False)
     website_proxies: tuple[BrowserProxy | VlessProxy, ...] = field(default=(), repr=False)
+
+    @property
+    def default_access_mode(self) -> str:
+        """Keep the historic behaviour when no runtime mode is stored yet."""
+        return "private" if self.allowed_user_ids else "public"
 
     @property
     def webhook_url(self) -> str:
@@ -93,6 +109,34 @@ class Settings:
         def first_nonempty(*names: str) -> str:
             return next((value for name in names if (value := os.getenv(name, "").strip())), "")
 
+        owner_text = first_nonempty("OWNER_ID", "OWNER_IDS")
+        try:
+            owners = frozenset(
+                int(value) for value in owner_text.replace(" ", "").split(",") if value
+            )
+        except ValueError:
+            raise ValueError("OWNER_ID must contain numeric Telegram user IDs") from None
+        if any(value <= 0 for value in owners):
+            raise ValueError("OWNER_ID must contain positive Telegram user IDs")
+
+        log_channel_text = first_nonempty("LOG_CHANNEL_ID")
+        try:
+            log_channel_id = int(log_channel_text) if log_channel_text else None
+            if log_channel_id == 0:
+                raise ValueError
+        except ValueError:
+            raise ValueError("LOG_CHANNEL_ID must be an integer Telegram chat ID") from None
+
+        database_name = os.getenv("MONGODB_DB", "subtranslate").strip() or "subtranslate"
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", database_name):
+            raise ValueError("MONGODB_DB must be 1-64 letters, digits, underscores or hyphens")
+        try:
+            storage_limit = int(os.getenv("MONGODB_STORAGE_LIMIT_MB", "512"))
+        except ValueError:
+            raise ValueError("MONGODB_STORAGE_LIMIT_MB must be an integer") from None
+        if not 0 <= storage_limit <= 1_000_000:
+            raise ValueError("MONGODB_STORAGE_LIMIT_MB must be between 0 and 1,000,000")
+
         api_id_text = first_nonempty("API_ID", "TELEGRAM_API_ID", "TG_API_ID")
         api_hash = first_nonempty("API_HASH", "TELEGRAM_API_HASH", "TG_API_HASH")
         try:
@@ -108,6 +152,11 @@ class Settings:
             chromium_path=os.getenv("CHROMIUM_PATH", "").strip() or None,
             translation_timeout_seconds=timeout,
             allowed_user_ids=allowed,
+            owner_ids=owners,
+            mongodb_uri=os.getenv("MONGODB_URI", "").strip(),
+            mongodb_database=database_name,
+            mongodb_storage_limit_mb=storage_limit,
+            log_channel_id=log_channel_id,
             api_id=api_id,
             api_hash=api_hash or None,
             website_proxies=parse_proxy_pool(os.getenv("WEBSITE_PROXIES", "")),

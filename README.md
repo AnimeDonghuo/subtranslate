@@ -1,6 +1,6 @@
 # SubTranslate Telegram bot
 
-Send a subtitle as a Telegram document, choose a language, and receive the website's downloaded file, for example `movie.Hindi.srt`. The bot automates [translatesubtitles.co](https://translatesubtitles.co/); it does not use a different translation service.
+Send a subtitle as a Telegram document, choose a language, and receive the website's downloaded file, for example `movie.Hindi.srt`. The bot automates a public subtitle-translation website (its URL lives in `subtranslate/website.py`); it does not use a different translation service. **Bot messages never name that website**, so users only see "the translation service" or "the website".
 
 ## How it works
 
@@ -11,11 +11,11 @@ Send a subtitle as a Telegram document, choose a language, and receive the websi
 - Text ASS, SBV, VTT, MicroDVD/SubViewer SUB, and Spruce STL are also accepted, with the existing **1 MB / 3,000-cue** limits. Binary VobSub and EBU STL are not supported. The SUB bridge restores original frames/timestamps, and ASS restores source styles, so these formats can require metadata restoration rather than byte-identical website output.
 - A status message shows processing stages, not a translation percentage. One browser runs at a time, with at most two jobs waiting. Each translation gets a fresh browser and isolated context, which are closed after the download or a failure; the batch and queue remain in the bot process. This does not change the server's IP address or prevent the website from recognizing or rate-limiting requests. Opening the site may be retried before uploading, but a failed upload is reported rather than repeated. Website wait timeouts are renewed while cues or indicators keep changing. Logs contain only sanitized categories and counts, not subtitle text or credentials.
 
-**Privacy:** Subtitles are sent to the website and its Google Translate widget. Do not send confidential files, and translate only files you have permission to use. See the site's [privacy policy](https://translatesubtitles.co/privacypolicy.php).
+**Privacy:** Subtitles are sent to the website and its Google Translate widget. Do not send confidential files, and translate only files you have permission to use. The site's privacy policy is linked in its footer. The bot keeps a copy of every delivered file in the optional log channel (see below).
 
 ## Telegram transfers and practical limits
 
-The public Telegram Bot API downloads up to 20 MB and uploads up to 50 MB. To transfer larger SRTs, configure **both** `API_ID` and `API_HASH` as well as `BOT_TOKEN`. The bot then authenticates to Telegram MTProto **as the same bot**, with an in-memory session, and uses disk-backed transfers. It does not need a phone number or a user-account login. `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` and `TG_API_ID` / `TG_API_HASH` are accepted aliases. Without both credentials, smaller files continue to use the normal Bot API; larger transfers report an error.
+The public Telegram Bot API downloads up to 20 MB and uploads up to 50 MB. To bypass those limits, configure **both** `API_ID` and `API_HASH` as well as `BOT_TOKEN`. The bot then authenticates to Telegram MTProto **as the same bot**, with an in-memory session, and uses disk-backed transfers above the Bot API thresholds — up to Telegram's own bot cap of **about 2 GB per file**. It does not need a phone number or a user-account login. `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` and `TG_API_ID` / `TG_API_HASH` are accepted aliases. Without both credentials, smaller files continue to use the normal Bot API and larger transfers report an error. Files above 2 GB are refused before any upload with a clear message, and the startup log states whether the large-file path is enabled. The log channel copy uses the same MTProto path for large files.
 
 Telegram still imposes its own bot file-size limits (approximately 2 GB), and a translated file may be larger than its input. MTProto transfers have automated **mock** tests but have not been verified against your Telegram account or Koyeb deployment.
 
@@ -30,8 +30,11 @@ The deployment needs enough **temporary disk for the source, the website's downl
    | Variable | Purpose |
    | --- | --- |
    | `BOT_TOKEN` | BotFather token |
+   | `OWNER_ID` | Your numeric Telegram user ID (comma-separated for several owners). Owners always have access, cannot be banned, and are the only users who can run `/ban`, `/auth`, `/public`, `/private` and `/stats` |
    | `API_ID` and `API_HASH` | Telegram API credentials for transfers beyond public Bot API limits; optional for smaller files |
    | `PORT` | `8080` on Koyeb, or dynamically injected by Railway |
+   | `MONGODB_URI` | Optional MongoDB connection string (`mongodb+srv://...`). Stores presets, bans, access rules and usage counters |
+   | `LOG_CHANNEL_ID` | Optional channel ID (e.g. `-1001234567890`) that receives a copy of every delivered subtitle with the sender's ID, name and username |
 
    Webhook authentication is derived from the bot token; no separate webhook secret is required. The bot automatically derives its public webhook URL from `KOYEB_PUBLIC_DOMAIN` on Koyeb or `RAILWAY_PUBLIC_DOMAIN` / `RAILWAY_STATIC_URL` on Railway.
 4. Deploy. Look for **Telegram webhook registered** in the logs. `GET /healthz` returns HTTP 200 while the service is alive, including during Telegram retries; `GET /readyz` returns HTTP 200 only once the webhook is registered. Use `/healthz` for health checks.
@@ -49,6 +52,10 @@ The deployment needs enough **temporary disk for the source, the website's downl
 | `CHROMIUM_PATH` | Docker: `/usr/bin/chromium` | Local Chromium executable; if unset, Playwright uses its installed browser. |
 | `WEBSITE_PROXIES` | Unset | Optional comma-separated pool of up to 10 proxies for the website browser only. Store it as a Koyeb Secret; see below. |
 | `XRAY_PATH` | `xray` on PATH | Xray executable used for VLESS links. Included in the Docker image. |
+| `OWNER_IDS` | Unset | Alias for `OWNER_ID`; comma-separated numeric IDs. |
+| `MONGODB_DB` | `subtranslate` | Database name (letters, digits, `_` and `-`, up to 64 characters). |
+| `MONGODB_STORAGE_LIMIT_MB` | `512` | Plan quota reported as free space by `/stats`; `0` uses the server's own volume figures. |
+| `LOG_CHANNEL_ID` | Unset | Channel that receives a copy of each delivered subtitle. Add the bot as an administrator with "Post messages". |
 
 ### Optional website proxy pool
 
@@ -63,6 +70,33 @@ Before each translation, the bot tests proxies in rotation by opening the site's
 For VLESS links the Docker image includes a pinned Xray binary. The bot starts a temporary local-only SOCKS bridge for each check or translation and stops it afterward; its configuration file is private and temporary. Non-Docker installations must install a compatible `xray` executable on PATH (or set `XRAY_PATH`). Supported VLESS links use a UUID, `encryption=none`, TCP/raw, WebSocket, gRPC or XHTTP, and `security=none`, `tls`, or `reality` (Reality requires `sni` and `pbk`). Common `flow`, TLS and transport parameters are supported; unsupported options and transports are rejected, not silently ignored. TLS certificate verification is always enabled. `security=none` does not encrypt the VLESS connection. Check your provider's configuration and use a trusted endpoint; not every VLESS link is supported or guaranteed to work. Xray consumes additional memory on top of Chromium.
 
 A proxy operator can observe your traffic and may be able to inspect subtitle data, especially if they control TLS or the destination. Use only providers you trust. Proxies do not guarantee anonymity or prevent site tracking, rate limits, outages, or failed translations; respect the website's terms.
+
+## Users, settings and moderation
+
+The bot supports many users at once. Settings and moderation state live in **MongoDB** when `MONGODB_URI` is set, and in memory otherwise. Either way the bot starts and translates: if the database is unreachable it logs a warning, keeps working, and `/stats` shows `in-memory (MongoDB not connected)`. Nothing about the translation flow depends on the database.
+
+`MONGODB_URI` works with a free **Atlas** cluster (M0, 512 MB) from Railway or Koyeb; the database is outbound traffic only, so no extra port or container is needed. Create the cluster, add a database user, allow your host's IPs (`0.0.0.0/0` for a hobby deployment), and paste the `mongodb+srv://` string into Railway/Koyeb as a secret.
+
+| Command | Who | What it does |
+| --- | --- | --- |
+| `/start` | everyone | Welcome screen with the rules, the permission/18+ warning and shortcut buttons |
+| `/help` | everyone | Interactive help: every topic opens from a button in the same message |
+| `/ussetting` | everyone | Personal settings. **Preset languages**: select any number of languages (selected ones show ✅), then **💾 Save**. Once a user has saved presets, the language picker shows **one extra green button — ⭐ Saved languages to use (N)** — which translates that whole set one file at a time, exactly like the normal language buttons |
+| `/stats` | everyone | Owners see users, active users, bans, authorized users, mode, translations (today/week/month/year) and MongoDB space used/free; other users see their own totals and monthly rank |
+| `/leaderboard` | everyone | Top 10 users by translated subtitles with **Today / Week / Month / Year** buttons, plus the caller's rank |
+| `/public` | owner | Anyone in a private chat may use the bot (banned users still cannot) |
+| `/private` | owner | Only owners, `ALLOWED_USER_IDS` and `/auth`-ed users may use the bot |
+| `/auth <id>` · `/unauth <id>` | owner | Add or remove an authorized user |
+| `/ban <id>` · `/release <id>` | owner | Block a user everywhere until released. A ban always applies, in public and private mode |
+| `/banlist` | owner | Banned users as `name (@username) · id` with the ban date, newest first |
+
+**Button colours.** Keyboards use the Bot API 9.4 `style` field: **green** for a recommended or positive action (how to translate, save, use saved languages), **blue** for normal choices (language buttons, selecting presets), and **red** for heavy or destructive actions (select all languages, clear presets, owner tools). Clients older than February 2026 simply show them unstyled.
+
+Defaults stay compatible with earlier releases: with no `ALLOWED_USER_IDS` the bot is **public**, and with `ALLOWED_USER_IDS` set it is **private**. The mode chosen with `/public` or `/private` is stored in MongoDB and survives restarts.
+
+**Log channel.** Set `LOG_CHANNEL_ID` and promote the bot to administrator in that channel. After each successful delivery the bot posts the translated file with a caption containing the sender's name, `@username` (or "not set"), numeric ID, target language, original and delivered filename, and cue count. If the channel refuses the copy (missing rights, oversized file), the delivery to the user still succeeds and the failure is logged.
+
+**Practical limits.** Usage counters are one small document per delivered subtitle. `/leaderboard` and `/stats` use indexed queries, so they stay fast on a free Atlas cluster; the 512 MB quota is usually reached by years of heavy use, not weeks. Without MongoDB, counters are kept in memory only and reset on restart.
 
 ## Development and testing
 
@@ -99,6 +133,7 @@ The command refuses to overwrite an existing file. An opt-in **Live website smok
 - **Large transfer unavailable:** check that both API ID and hash exist in Koyeb under one of the supported variable-name pairs, and that the deployment can reach Telegram. The bot does not print those values.
 - **Website upload, parsing, or translation error:** the website can change, time out, block automation, or run out of browser resources. Failures before upload may be retried with a fresh browser; after an upload starts, a failure is reported without reuploading. The sanitized log's stage, error category, and browser state are clues, not proof of the cause. Try again later; no detected incomplete result is sent.
 - **Disk or memory exhaustion:** free-instance resources may be insufficient for the whole source, website processing and result. Consider a larger instance or disk after checking cost; there is no automatic resume.
+- **MongoDB warnings:** `MongoDB unavailable` means the bot fell back to in-memory settings — translations still work, but bans/presets/access mode reset on restart. Check the connection string, the database user and the Atlas IP allowlist. The string is never logged.
 - **Unexpected unchanged text:** a long unchanged run is rejected as potentially partial, although it can be legitimate. The detection is not a full language or quality check and cannot establish that every cue was translated correctly.
 
 The selector flow was informed by [MutennRoshii/subtitle-translator](https://github.com/MutennRoshii/subtitle-translator); see `THIRD_PARTY_NOTICES.md`.

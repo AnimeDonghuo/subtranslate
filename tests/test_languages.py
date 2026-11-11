@@ -51,3 +51,33 @@ def test_remote_catalog_validation_and_merge():
     assert catalog.get("a/b") is None
     assert catalog.get("evil") is None
     assert catalog.get("hi") == "Hindi"
+
+
+def test_saved_languages_button_appears_once_and_buttons_are_coloured():
+    catalog = LanguageCatalog()
+    keyboard, _current, _pages = language_keyboard(catalog, presets=("hi", "es"))
+    rows = keyboard.inline_keyboard
+    buttons = [button for row in rows for button in row]
+    saved = [button for button in buttons if button.callback_data == "preset:start"]
+    assert len(saved) == 1
+    assert saved[0].text == "⭐ Saved languages to use (2)"
+    assert saved[0].style == "success"
+    # The saved set is one button, not one row per language.
+    assert not any(button.text.startswith("⭐ Hindi") for button in buttons)
+    languages = [button for button in buttons if button.callback_data.startswith("lang:")]
+    assert len(languages) == PAGE_SIZE and all(button.style == "primary" for button in languages)
+    select_all = next(button for button in buttons if button.callback_data.startswith("all:confirm:"))
+    assert select_all.style == "danger"
+    # Unknown or removed saved codes never add a button.
+    unknown, _current, _pages = language_keyboard(catalog, presets=("nope",))
+    assert not any(button.callback_data == "preset:start"
+                   for row in unknown.inline_keyboard for button in row)
+    # Colours never replace the callback contract.
+    assert all(button.callback_data and len(button.callback_data.encode()) <= 64 for button in buttons)
+
+
+def test_confirm_all_buttons_are_coloured():
+    keyboard = confirm_all_keyboard(3)
+    styles = {button.text: button.style for row in keyboard.inline_keyboard for button in row}
+    assert styles["Yes, translate all"] == "danger"
+    assert styles["‹ Back to languages"] == "primary"

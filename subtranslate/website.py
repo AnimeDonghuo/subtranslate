@@ -674,16 +674,16 @@ class WebsiteTranslator:
                             "That language is no longer available on the subtitle site. Please choose another."
                         )
                     await selector.select_option(value=language_code)
-                    await page.evaluate(f"""(val) => {{
+                    await page.evaluate("""(val) => {
                         const el = document.querySelector('select.goog-te-combo');
-                        if (el) {{
+                        if (el) {
                             el.value = val;
-                            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        }}
-                        if (window.jQuery) {{
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        if (window.jQuery) {
                             window.jQuery('.goog-te-combo').val(val).trigger('change');
-                        }}
-                    }}""", language_code)
+                        }
+                    }""", language_code)
                     await _close_vip_popup(page)
 
                     stage = _stage("translating", on_progress)
@@ -788,13 +788,13 @@ class WebsiteTranslator:
                                     counts["changed"], counts["count"])
                     stage = _stage("downloading", on_progress)
                     await _close_vip_popup(page)
-                    await page.evaluate(f"""(val) => {{
+                    await page.evaluate("""(val) => {
                         if (window.jQuery) window.jQuery('.goog-te-combo').val(val);
                         const popup = document.getElementById('popup');
                         if (popup) popup.style.display = 'none';
                         const overlay = document.getElementById('overlay');
                         if (overlay) overlay.remove();
-                    }}""", language_code)
+                    }""", language_code)
                     download_button = await _button(page, "Download", 2)
                     download_success = False
                     downloaded = None
@@ -823,7 +823,7 @@ class WebsiteTranslator:
                             else:
                                 downloaded = raw
                                 download_success = True
-                    except (PlaywrightTimeout, PlaywrightError, Exception) as exc:
+                    except Exception as exc:  # noqa: BLE001 - any download failure falls back to the table
                         logger.info("Direct download event not received (%s); checking table fallback", type(exc).__name__)
 
                     if not download_success:

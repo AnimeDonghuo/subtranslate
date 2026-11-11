@@ -5,7 +5,12 @@ from subtranslate.config import Settings
 
 @pytest.fixture
 def environment(monkeypatch):
-    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN", "RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL", "PORT", "ALLOWED_USER_IDS", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH", "API_ID", "API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_API_ID", "TG_API_HASH", "WEBSITE_PROXIES"):
+    for key in ("BOT_TOKEN", "TELEGRAM_WEBHOOK_SECRET", "WEBHOOK_BASE_URL", "KOYEB_PUBLIC_DOMAIN",
+                "RAILWAY_PUBLIC_DOMAIN", "RAILWAY_STATIC_URL", "PORT", "ALLOWED_USER_IDS",
+                "OWNER_ID", "OWNER_IDS", "LOG_CHANNEL_ID", "MONGODB_URI", "MONGODB_DB",
+                "MONGODB_STORAGE_LIMIT_MB", "TRANSLATION_TIMEOUT_SECONDS", "CHROMIUM_PATH",
+                "API_ID", "API_HASH", "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_API_ID",
+                "TG_API_HASH", "WEBSITE_PROXIES"):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("BOT_TOKEN", "123456:example")
     monkeypatch.setenv("KOYEB_PUBLIC_DOMAIN", "demo-example.koyeb.app")
@@ -120,3 +125,63 @@ def test_invalid_proxy_configuration_never_exposes_input(environment, monkeypatc
     with pytest.raises(ValueError) as error:
         Settings.from_env()
     assert value not in str(error.value)
+
+
+def test_owner_log_channel_and_mongodb_settings(environment, monkeypatch):
+    monkeypatch.setenv("OWNER_IDS", "111, 222")
+    monkeypatch.setenv("LOG_CHANNEL_ID", "-1001234567890")
+    monkeypatch.setenv("MONGODB_URI", "mongodb+srv://user:secret@cluster.example/db")
+    monkeypatch.setenv("MONGODB_DB", "subtranslate_prod")
+    settings = Settings.from_env()
+    assert settings.owner_ids == frozenset({111, 222})
+    assert settings.log_channel_id == -1001234567890
+    assert settings.mongodb_database == "subtranslate_prod"
+    assert settings.mongodb_storage_limit_mb == 512
+    # Credentials must never be printable or logged.
+    assert "secret" not in repr(settings)
+    assert "cluster.example" not in repr(settings)
+    assert settings.mongodb_uri.startswith("mongodb+srv://")
+
+    monkeypatch.setenv("OWNER_ID", "333")  # the singular alias wins
+    assert Settings.from_env().owner_ids == frozenset({333})
+
+
+@pytest.mark.parametrize("value", ["abc", "0", "-5", "12,xx"])
+def test_invalid_owner_ids_are_rejected_without_echoing_them(environment, monkeypatch, value):
+    monkeypatch.setenv("OWNER_ID", value)
+    with pytest.raises(ValueError) as error:
+        Settings.from_env()
+    assert value not in str(error.value)
+
+
+@pytest.mark.parametrize("value", ["not-a-number", "0"])
+def test_invalid_log_channel_is_rejected(environment, monkeypatch, value):
+    monkeypatch.setenv("LOG_CHANNEL_ID", value)
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize("value", ["bad/name", "has space", "x" * 65])
+def test_invalid_mongodb_database_names_are_rejected(environment, monkeypatch, value):
+    monkeypatch.setenv("MONGODB_DB", value)
+    with pytest.raises(ValueError):
+        Settings.from_env()
+
+
+def test_empty_mongodb_database_uses_the_default(environment, monkeypatch):
+    monkeypatch.setenv("MONGODB_DB", "")
+    assert Settings.from_env().mongodb_database == "subtranslate"
+
+
+def test_mongodb_storage_limit_must_be_sane(environment, monkeypatch):
+    monkeypatch.setenv("MONGODB_STORAGE_LIMIT_MB", "-1")
+    with pytest.raises(ValueError):
+        Settings.from_env()
+    monkeypatch.setenv("MONGODB_STORAGE_LIMIT_MB", "1024")
+    assert Settings.from_env().mongodb_storage_limit_mb == 1024
+
+
+def test_default_access_mode_follows_the_allowlist(environment, monkeypatch):
+    assert Settings.from_env().default_access_mode == "public"
+    monkeypatch.setenv("ALLOWED_USER_IDS", "5")
+    assert Settings.from_env().default_access_mode == "private"

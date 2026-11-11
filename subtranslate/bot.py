@@ -1,6 +1,7 @@
 """Telegram interaction and job processing."""
 
 import asyncio
+import html
 import logging
 import tempfile
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from telegram.ext import (
     filters,
 )
 
+from .admin import install_admin_handlers
 from .config import Settings
 from .fileio import run_file_io, run_scan, wait_for_cleanup
 from .jobs import EnqueueResult, JobQueue, TranslationJob
@@ -29,8 +31,10 @@ from .large_telegram import (
     LargeTelegramTransfer,
     LargeTransferError,
 )
+from .menus import install_menu_handlers
 from .progress import ProgressMessage
 from .proxies import parse_proxy_candidates
+from .store import Database
 from .subtitles import (
     MAX_INPUT_BYTES,
     SubtitleError,
@@ -42,18 +46,6 @@ from .website import LanguageUnavailable, WebsiteError, WebsiteTranslator
 
 logger = logging.getLogger(__name__)
 
-HELP = (
-    "👋 Send a text subtitle file (SRT, ASS, SUB, SBV, VTT or Spruce STL). "
-    "SRT files have no bot-wide size or cue-count cap; large jobs depend on Telegram, disk space and the website. "
-    "Other formats are limited to 1 MB and 3,000 cues. "
-    "Binary VobSub and EBU STL are not supported. Choose a language, or select all to translate one language at a time. "
-    "I’ll use translatesubtitles.co and send each file back with the language in its name.\n\n"
-    "The site uses Google Translate; please review the result. Your subtitle text is sent to "
-    "the site and Google, so don't send confidential files. You need permission to translate the file.\n\n"
-    "Use this bot in a private chat. Select all may take hours; use /cancel to stop a batch. "
-    "If a job is interrupted, tap the language button again. "
-    "Allowed users can use /proxychk to configure website proxies."
-)
 PICK = "Choose the language you want for this subtitle:"
 MAX_PROXY_INPUT_BYTES = 19 * 1024 * 1024
 MAX_PROXY_ENTRIES = 80_000
@@ -64,10 +56,15 @@ class JobCancelled(Exception):
 
 
 class BotService:
-    def __init__(self, settings: Settings, catalog: LanguageCatalog, translator: WebsiteTranslator) -> None:
+    def __init__(self, settings: Settings, catalog: LanguageCatalog, translator: WebsiteTranslator,
+                 store: Database | None = None) -> None:
         self.settings = settings
         self.catalog = catalog
         self.translator = translator
+        # Without MongoDB the store keeps everything in memory, so the bot
+        # still starts and translates when the database is not configured.
+        self.store = store or Database(default_mode=settings.default_access_mode)
+        self._preset_drafts: dict[int, set[str]] = {}
         self.queue = JobQueue(self.process_job, max_waiting=2)
         self._batch_cancellations: dict[int, asyncio.Event] = {}
         self._single_cancellations: dict[int, asyncio.Event] = {}
@@ -78,10 +75,13 @@ class BotService:
 
     def install_handlers(self, application) -> None:
         self.bot = application.bot
-        application.add_handler(CommandHandler(["start", "help"], self.help))
         application.add_handler(CommandHandler("id", self.user_id))
         application.add_handler(CommandHandler("cancel", self.cancel_batch))
         application.add_handler(CommandHandler("proxychk", self.proxy_command))
+        # Menus and owner commands use specific callback patterns. They are
+        # registered before the catch-all job callback so it cannot swallow them.
+        install_menu_handlers(self, application)
+        install_admin_handlers(self, application)
         application.add_handler(MessageHandler(filters.Document.ALL, self.document))
         application.add_handler(CallbackQueryHandler(self.callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.other_text))
@@ -111,8 +111,46 @@ class BotService:
         except TimeoutError:
             logger.warning("Timed out notifying users of interrupted translations")
 
+    def _is_owner(self, user_id: int | None) -> bool:
+        return bool(user_id) and user_id in self.settings.owner_ids
+
     def _permitted(self, user_id: int | None) -> bool:
-        return bool(user_id) and (self.settings.allowed_user_ids is None or user_id in self.settings.allowed_user_ids)
+        """Owners and authorized users always pass; a ban always applies."""
+        if not user_id:
+            return False
+        if user_id in self.settings.owner_ids:
+            return True
+        if self.store.is_banned(user_id):
+            return False
+        if self.settings.allowed_user_ids and user_id in self.settings.allowed_user_ids:
+            return True
+        if self.store.is_authorized(user_id):
+            return True
+        return self.store.mode == "public"
+
+    async def _remember(self, user) -> None:
+        """Keep the sender's current name for /banlist and the leaderboard."""
+        if user is None:
+            return
+        await self.store.touch_user(user.id, getattr(user, "full_name", "") or "",
+                                    getattr(user, "username", "") or "")
+
+    def cancel_user_work(self, chat_id: int) -> tuple[int, bool]:
+        """Drop this chat's queued jobs and signal its active job to stop."""
+        removed = self.queue.cancel_waiting_jobs(chat_id)
+        cancel = self._batch_cancellations.get(chat_id) or self._single_cancellations.get(chat_id)
+        if cancel is not None:
+            cancel.set()
+        return removed, cancel is not None
+
+    def preset_draft(self, user_id: int) -> set[str]:
+        return self._preset_drafts.setdefault(user_id, set())
+
+    def drop_preset_draft(self, user_id: int) -> None:
+        self._preset_drafts.pop(user_id, None)
+
+    async def _preset_codes(self, user_id: int | None) -> tuple[str, ...]:
+        return await self.store.presets(user_id)
 
     async def _is_private_and_allowed(self, update: Update) -> bool:
         message, chat, user = update.effective_message, update.effective_chat, update.effective_user
@@ -121,14 +159,44 @@ class BotService:
         if chat.type != "private":
             await message.reply_text("Please send subtitle files to me in a private chat.")
             return False
+        await self._remember(user)
+        if self.store.is_banned(user.id) and not self._is_owner(user.id):
+            await message.reply_text(
+                "🚫 You are banned from using this bot. Contact the owner if you believe "
+                "this is a mistake."
+            )
+            return False
         if not self._permitted(user.id):
-            await message.reply_text("This bot is restricted to its owner.")
+            await message.reply_text(
+                "🔒 This bot is currently private. Ask the owner to authorize your Telegram "
+                "user ID (send /id to see it)."
+            )
             return False
         return True
 
-    async def help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if await self._is_private_and_allowed(update):
-            await update.effective_message.reply_text(HELP)
+    async def ensure_allowed(self, update: Update) -> bool:
+        """Public entry point used by the menu and owner modules."""
+        return await self._is_private_and_allowed(update)
+
+    async def ensure_callback_allowed(self, query) -> bool:
+        """The button equivalent of ensure_allowed, without leaking details."""
+        user = query.from_user
+        message = query.message
+        if user is None:
+            await query.answer("Please use the bot in a private chat.", show_alert=True)
+            return False
+        if isinstance(message, Message) and (message.chat.type != "private"
+                                             or message.chat.id != user.id):
+            await query.answer("Please use the bot in a private chat.", show_alert=True)
+            return False
+        await self._remember(user)
+        if self.store.is_banned(user.id) and not self._is_owner(user.id):
+            await query.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return False
+        if not self._permitted(user.id):
+            await query.answer("🔒 This bot is currently private.", show_alert=True)
+            return False
+        return True
 
     async def user_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Allow an owner to discover their ID before configuring the allowlist.
@@ -139,10 +207,7 @@ class BotService:
         if not await self._is_private_and_allowed(update):
             return
         chat_id = update.effective_chat.id
-        removed = self.queue.cancel_waiting_jobs(chat_id)
-        active = self._batch_cancellations.get(chat_id) or self._single_cancellations.get(chat_id)
-        if active:
-            active.set()
+        removed, active = self.cancel_user_work(chat_id)
         if active or removed:
             await update.effective_message.reply_text(
                 "Canceled queued jobs. Active work is stopping; no unfinished subtitle will be sent."
@@ -155,7 +220,7 @@ class BotService:
             return False
         # Proxy configuration affects every user's traffic. Never let an
         # unrestricted public bot give arbitrary users that control.
-        if self.settings.allowed_user_ids is None:
+        if self.settings.allowed_user_ids is None and not self._is_owner(update.effective_user.id):
             await update.effective_message.reply_text(
                 "Set ALLOWED_USER_IDS on the deployment before using /proxychk. "
                 "Every listed user can change the bot-wide proxy pool."
@@ -323,7 +388,9 @@ class BotService:
             return
         # Explicitly reply to the original document. Telegram includes it in
         # callback messages, so a language selection survives Koyeb sleeping.
-        markup, page, pages = language_keyboard(self.catalog)
+        markup, page, pages = language_keyboard(
+            self.catalog, presets=await self._preset_codes(update.effective_user.id)
+        )
         await message.reply_text(
             f"{PICK}\n\nPage {page}/{pages}",
             reply_markup=markup,
@@ -334,19 +401,17 @@ class BotService:
         query = update.callback_query
         if not query:
             return
+        if not await self.ensure_callback_allowed(query):
+            return
         message = query.message
         user = query.from_user
-        if not isinstance(message, Message) or message.chat.type != "private" or message.chat.id != user.id:
-            await query.answer("Please use the bot in a private chat.", show_alert=True)
-            return
-        if not self._permitted(user.id):
-            await query.answer("This bot is restricted to its owner.", show_alert=True)
-            return
         data = query.data or ""
         if data.startswith("page:"):
             try:
                 page_number = int(data.removeprefix("page:"))
-                markup, current, total = language_keyboard(self.catalog, page_number)
+                markup, current, total = language_keyboard(
+                    self.catalog, page_number, presets=await self._preset_codes(user.id)
+                )
             except ValueError:
                 await query.answer("Please choose a language again.", show_alert=True)
                 return
@@ -372,6 +437,17 @@ class BotService:
         if data == "all:start":
             languages = tuple(self.catalog.items())
             code, name = "*", "all languages"
+        elif data == "preset:start":
+            saved = await self._preset_codes(user.id)
+            languages = tuple((value, self.catalog.get(value)) for value in saved
+                              if self.catalog.get(value))
+            if not languages:
+                await query.answer(
+                    "You have no saved preset languages yet. Open /ussetting to add some.",
+                    show_alert=True,
+                )
+                return
+            code, name = "*", "preset languages"
         elif data.startswith("lang:"):
             code = data.removeprefix("lang:")
             name = self.catalog.get(code)
@@ -406,6 +482,9 @@ class BotService:
             language_code=code,
             language_name=name,
             languages=languages,
+            user_id=user.id,
+            user_name=getattr(user, "full_name", "") or "",
+            username=getattr(user, "username", "") or "",
         )
         status = self.queue.submit(job)
         if status is EnqueueResult.DUPLICATE:
@@ -415,8 +494,10 @@ class BotService:
         else:
             await query.answer(f"Queued for {name}")
             if languages:
+                label = (f"your {len(languages)} saved languages" if data == "preset:start"
+                         else f"{len(languages)} languages")
                 await message.reply_text(
-                    f"Queued {len(languages)} languages. A stage bar will appear when the batch starts. "
+                    f"Queued {label}. A stage bar will appear when the batch starts. "
                     "I’ll send each file one by one. This may take hours; use /cancel to stop."
                 )
             else:
@@ -533,6 +614,69 @@ class BotService:
                 reply_parameters=ReplyParameters(message_id=job.original_message_id, allow_sending_without_reply=True),
                 write_timeout=120, read_timeout=120,
             )
+        await self._after_delivery(job, name, filename, result, transport)
+
+    async def _after_delivery(self, job: TranslationJob, name: str, filename: str, result,
+                              transport: LargeTelegramTransfer | None = None) -> None:
+        """Record usage and keep a copy for the owner's log channel."""
+        size = (result.content.stat().st_size if isinstance(result.content, Path)
+                else len(result.content))
+        if job.user_id:
+            await self.store.record_translation(
+                user_id=job.user_id, name=job.user_name, username=job.username,
+                language_code=job.language_code, language_name=name,
+                cue_count=result.cue_count, filename=filename, size=size,
+            )
+        await self._log_channel_copy(job, name, filename, result, size, transport)
+
+    async def _log_channel_copy(self, job: TranslationJob, name: str, filename: str,
+                                result, size: int,
+                                transport: LargeTelegramTransfer | None = None) -> None:
+        # Best effort: a missing or full log channel never affects delivery.
+        channel = self.settings.log_channel_id
+        if channel is None:
+            return
+        username = f"@{html.escape(job.username)}" if job.username else "not set"
+        caption = (
+            "📥 <b>Translated subtitle delivered</b>\n\n"
+            f"👤 Name: {html.escape(job.user_name or 'Unknown')}\n"
+            f"🆔 User ID: <code>{job.user_id or 'unknown'}</code>\n"
+            f"🔗 Username: {username}\n"
+            f"🌐 Language: {html.escape(name)}\n"
+            f"📄 File: {html.escape(job.file_name or 'subtitle')} → {html.escape(filename)}\n"
+            f"🎬 Cues: {result.cue_count:,}"
+        )
+        try:
+            if isinstance(result.content, Path) and size > BOT_API_UPLOAD_BYTES:
+                # The Bot API cannot upload this, so reuse the 2 GB MTProto path.
+                if transport is None:
+                    raise LargeTransferError("The large-file transport is unavailable.")
+                await transport.send_file_to(channel, result.content, filename, caption)
+            elif isinstance(result.content, Path):
+                with result.content.open("rb") as source:
+                    await self.bot.send_document(
+                        chat_id=channel,
+                        document=InputFile(source, filename=filename, read_file_handle=False),
+                        caption=caption, parse_mode="HTML", read_timeout=120, write_timeout=120,
+                    )
+            elif size > BOT_API_UPLOAD_BYTES:
+                raise LargeTransferError("The file is too large for the log channel copy.")
+            else:
+                await self.bot.send_document(
+                    chat_id=channel,
+                    document=InputFile(BytesIO(result.content), filename=filename),
+                    caption=caption, parse_mode="HTML", read_timeout=120, write_timeout=120,
+                )
+        except (TelegramError, OSError, LargeTransferError) as exc:
+            logger.warning("Log channel copy failed (%s)", type(exc).__name__)
+            try:
+                await self.bot.send_message(
+                    chat_id=channel,
+                    text=caption + "\n\n⚠️ The file copy could not be sent to this channel.",
+                    parse_mode="HTML",
+                )
+            except TelegramError as notice_error:
+                logger.info("Log channel notice failed (%s)", type(notice_error).__name__)
 
     @staticmethod
     async def _cancelable(awaitable, cancel: asyncio.Event):
@@ -662,7 +806,10 @@ class BotService:
         failure_details: list[tuple[str, str]] = []
         stopped = session_failed = repeated_failures = False
         try:
-            progress = await ProgressMessage.start(self.bot, job.chat_id, "all languages", batch_total=len(job.languages))
+            progress = await ProgressMessage.start(
+                self.bot, job.chat_id, job.language_name or "all languages",
+                batch_total=len(job.languages),
+            )
             if progress is None:
                 return
             heartbeat = asyncio.create_task(self._keep_active_job_awake(), name="batch-heartbeat")

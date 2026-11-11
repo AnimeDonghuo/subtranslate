@@ -2,6 +2,9 @@ aiohttp==3.14.5
 charset-normalizer==3.5.2
 # Native MTProto encryption avoids the prohibitively slow pure-Python path.
 cryptg==0.6.1
+# Optional MongoDB persistence for presets, bans, access rules and counters.
+# dnspython comes with it, so mongodb+srv:// Atlas connection strings work.
+pymongo==4.15.5
 # The Playwright driver is pinned for memory use; Chromium comes from Debian.
 playwright==1.52.0
 python-telegram-bot==22.8

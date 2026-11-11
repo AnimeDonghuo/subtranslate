@@ -29,10 +29,21 @@ _transport_logger.propagate = False
 # Limits of the public, remotely hosted Bot API, not limits for an SRT job.
 BOT_API_DOWNLOAD_BYTES = 20_000_000
 BOT_API_UPLOAD_BYTES = 50_000_000
+# Telegram's own bot limit over MTProto, which API_ID/API_HASH unlock.
+TELEGRAM_MAX_BYTES = 2_000_000_000
 
 
 class LargeTransferError(Exception):
     """A safe, user-facing transfer failure; never include secrets or paths."""
+
+
+def ensure_telegram_size(size: int | None) -> None:
+    """Refuse a file Telegram itself cannot transfer, before any upload."""
+    if size is not None and size > TELEGRAM_MAX_BYTES:
+        raise LargeTransferError(
+            "Telegram bots can transfer at most about 2 GB per file. "
+            "Split the subtitle and try again."
+        )
 
 
 class LargeTelegramTransfer:
@@ -42,6 +53,8 @@ class LargeTelegramTransfer:
         self._started = False
         self._message = None
         self._message_key = None
+        self._peer_key = None
+        self._peer_value = None
 
     async def start(self) -> None:
         if self._started:
@@ -104,6 +117,8 @@ class LargeTelegramTransfer:
 
     async def download(self, job: TranslationJob, path: Path) -> None:
         message = await self._original(job)
+        ensure_telegram_size(message.document.size if message.document else None)
+        ensure_telegram_size(job.file_size)
         try:
             saved = await self.client.download_media(message, file=str(path))
             if not saved or not path.is_file():
@@ -129,6 +144,7 @@ class LargeTelegramTransfer:
 
     async def send(self, job: TranslationJob, path: Path, filename: str, caption: str) -> None:
         message = await self._original(job)
+        ensure_telegram_size(path.stat().st_size)
         try:
             peer = await message.get_input_chat()
             if peer is None:
@@ -150,6 +166,43 @@ class LargeTelegramTransfer:
                 "limit or the connection may have failed; please try again."
             ) from None
 
+    async def _peer(self, chat_id: int):
+        """Resolve a chat once; the log channel is not in the bot's update stream."""
+        if self._peer_key == chat_id and self._peer_value is not None:
+            return self._peer_value
+        try:
+            peer = await self.client.get_input_entity(chat_id)
+        except Exception:  # noqa: BLE001 - retry after refreshing the dialog cache
+            async for _dialog in self.client.iter_dialogs(limit=None):
+                pass
+            peer = await self.client.get_input_entity(chat_id)
+        self._peer_key = chat_id
+        self._peer_value = peer
+        return peer
+
+    async def send_file_to(self, chat_id: int, path: Path, filename: str, caption: str) -> None:
+        """Copy one file to another chat (the log channel) over MTProto."""
+        await self.start()
+        ensure_telegram_size(path.stat().st_size)
+        try:
+            peer = await self._peer(chat_id)
+            # Upload explicitly so large files stream in 512 KiB chunks.
+            handle = await self.client.upload_file(str(path), part_size_kb=512, file_name=filename)
+            await self.client.send_file(
+                peer, file=handle, force_document=True,
+                attributes=[DocumentAttributeFilename(filename)],
+                caption=caption, parse_mode="html",
+            )
+        except asyncio.CancelledError:
+            raise
+        except LargeTransferError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - may include chat or caption data
+            logger.warning("Large log-channel upload failed (%s)", type(exc).__name__)
+            raise LargeTransferError(
+                "Telegram could not copy the file to the log channel."
+            ) from None
+
     async def close(self) -> None:
         if self.client is not None:
             try:
@@ -159,3 +212,5 @@ class LargeTelegramTransfer:
         self._started = False
         self._message = None
         self._message_key = None
+        self._peer_key = None
+        self._peer_value = None
