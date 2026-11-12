@@ -158,6 +158,8 @@ async def test_picker_navigation_and_select_all_enqueue_with_real_telegram_handl
     settings = Settings("12345:TESTTOKEN", "https://example.com")
     catalog = LanguageCatalog()
     service = BotService(settings, catalog, FakeTranslator())
+    # Select-all is premium-only, so this account needs premium.
+    await service.store.grant_premium(42, 1)
     service.install_handlers(telegram)
     await telegram.initialize()
     try:
@@ -211,6 +213,8 @@ async def test_select_all_returns_each_file_in_sequence_through_telegram_handler
     catalog = LanguageCatalog()
     catalog._languages = {"hi": "Hindi", "es": "Spanish", "fr": "French"}
     service = BotService(settings, catalog, MultipleTranslator())
+    # Select-all is premium-only, so this account needs premium.
+    await service.store.grant_premium(42, 1)
     service.install_handlers(telegram)
     await telegram.initialize()
     service.queue.start()

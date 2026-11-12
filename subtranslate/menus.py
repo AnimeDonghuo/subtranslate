@@ -13,6 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
+from .config import FREE_PRESET_LIMIT
 from .tasks import render_task
 
 logger = logging.getLogger(__name__)
@@ -38,8 +39,17 @@ START_TEXT = (
 SETTINGS_TEXT = (
     "⚙️ <b>Your settings</b>\n\n"
     "🌐 <b>Preset languages</b>: {summary}\n\n"
-    "Presets appear at the top of the language picker, so your usual languages are one "
-    "tap away. Select as many as you like, then tap 💾 Save."
+    "{limit_note}\n\n"
+    "Presets appear as one ⭐ button at the top of the language picker, so your usual "
+    "languages are one tap away. Select them, then tap 💾 Save."
+)
+
+PREMIUM_NOTE = (
+    "⭐ <b>Premium is active</b>: unlimited presets and 🌐 Select all languages are unlocked."
+)
+FREE_NOTE = (
+    f"Free accounts can save up to <b>{FREE_PRESET_LIMIT}</b> preset languages. "
+    "Premium lifts that limit and unlocks 🌐 Select all languages — ask the owner."
 )
 
 TOPICS: dict[str, tuple[str, str]] = {
@@ -53,7 +63,8 @@ TOPICS: dict[str, tuple[str, str]] = {
         "• SRT files have no bot-wide size limit; Telegram, disk space and the translation "
         "service still apply.\n"
         "• Other formats are limited to 1 MB and 3,000 cues.\n"
-        "• One translation runs at a time, with up to two queued.\n"
+        "• Up to two translations run at once; extra jobs wait in the queue. When the "
+        "server is short of memory the bot drops back to one at a time.\n"
         "• Use /status to see each running or queued task, and /cancel_id &lt;n&gt; to stop one.\n"
         "• Use /cancel to stop your queued jobs and active work.\n"
         "• If a job fails or is interrupted, tap the language button again."
@@ -78,12 +89,13 @@ TOPICS: dict[str, tuple[str, str]] = {
         "The picker shows five languages per page with Previous/Next buttons. "
         "249 languages are available, including regional variants such as "
         "Portuguese (Portugal) and Chinese (Traditional).\n\n"
-        "⭐ <b>Saved languages</b>: open /ussetting, select any number of languages with ✅ and "
-        "tap 💾 Save. After that, the language picker shows one extra green button, "
+        "⭐ <b>Saved languages</b>: open /ussetting, select languages with ✅ and "
+        "tap 💾 Save (free accounts: up to 10). After that, the language picker shows one extra green button, "
         "⭐ Saved languages to use — tap it and your saved set is translated one file at a "
         "time, just like pressing the language buttons.\n\n"
-        "🌐 <b>Select all languages</b> translates every language sequentially. This can "
-        "take many hours and send many files."
+        "🌐 <b>Select all languages</b> is exclusive to the owner and premium users "
+        "(🔒 button for everyone else); ask the owner for premium. It translates every "
+        "language sequentially and can take many hours and send many files."
         ),
     ),
     "settings": (
@@ -126,6 +138,9 @@ TOPICS: dict[str, tuple[str, str]] = {
         "📊 <b>Statistics</b>\n"
         "/stats — full bot statistics\n"
         "/leaderboard — top 10 users, with today/week/month/year buttons\n\n"
+        "⭐ <b>Premium</b>\n"
+        "/addpremium &lt;id&gt; &lt;days&gt; — unlimited presets and 🌐 Select all languages\n"
+        "/removepremium &lt;id&gt; — end premium access\n\n"
         "📣 <b>Messaging</b>\n"
         "/broadcast &lt;text&gt; — send a message to every known user (or reply to a message)\n\n"
         "Every delivered subtitle is copied to LOG_CHANNEL_ID with the sender's ID, name "
@@ -175,7 +190,8 @@ def help_menu_text() -> str:
     return ("ℹ️ <b>Help</b>\n\n"
             "Choose a topic below. Every topic opens in this message; use /start for the "
             "quick tour.\n\n"
-            "Commands: /start · /help · /ussetting · /stats · /leaderboard · /cancel")
+            "Commands: /start · /help · /ussetting · /status · /cancel_id · /stats · "
+            "/leaderboard · /cancel")
 
 
 def _settings_summary(names: list[str]) -> str:
@@ -222,13 +238,19 @@ def preset_list_keyboard(service, draft: set[str], page: int) -> tuple[InlineKey
     return InlineKeyboardMarkup(rows), page + 1, page_count
 
 
-def preset_list_text(service, draft: set[str], page: int, pages: int) -> str:
+def preset_list_text(service, draft: set[str], page: int, pages: int,
+                     *, limit: int | None = None) -> str:
     names = [name for code, name in service.catalog.items() if code in draft]
     summary = _settings_summary(names)
+    counter = f"{len(draft)}/{limit} free slots used" if limit else f"{len(draft)} selected · premium"
+    note = ("Free accounts can save up to "
+            f"{limit} languages; premium saves as many as you like." if limit else
+            "Premium: save as many languages as you like.")
     return (f"🌐 <b>Preset languages</b> — page {page}/{pages}\n\n"
-            f"{summary}\n\n"
+            f"{summary}\n"
+            f"<i>{counter}</i>\n\n"
             "Tap a language to select or deselect it; selected languages show ✅. "
-            "Then tap 💾 Save.")
+            f"Then tap 💾 Save.\n\n{note}")
 
 
 def _draft_names(service, codes: set[str]) -> list[str]:
@@ -293,7 +315,9 @@ async def user_settings(service, update: Update, context: ContextTypes.DEFAULT_T
     draft = set(await service.store.presets(user.id))
     service.preset_draft(user.id).clear()
     service.preset_draft(user.id).update(draft)
-    text = SETTINGS_TEXT.format(summary=_settings_summary(_draft_names(service, draft)))
+    note = PREMIUM_NOTE if await service.is_premium(user.id) else FREE_NOTE
+    text = SETTINGS_TEXT.format(summary=_settings_summary(_draft_names(service, draft)),
+                                limit_note=note)
     await update.effective_message.reply_text(
         text, parse_mode="HTML", reply_markup=settings_keyboard(len(draft)),
     )
@@ -307,12 +331,16 @@ async def settings_callback(service, update: Update, context: ContextTypes.DEFAU
     data = query.data or ""
     draft = service.preset_draft(user.id)
 
+    premium = await service.is_premium(user.id)
+
     if data == "us:open":
         saved = set(await service.store.presets(user.id))
         draft.clear()
         draft.update(saved)
         await query.answer()
-        await _edit(query, SETTINGS_TEXT.format(summary=_settings_summary(_draft_names(service, saved))),
+        note = PREMIUM_NOTE if premium else FREE_NOTE
+        await _edit(query, SETTINGS_TEXT.format(summary=_settings_summary(_draft_names(service, saved)),
+                                                limit_note=note),
                     settings_keyboard(len(saved)))
         return
 
@@ -323,11 +351,19 @@ async def settings_callback(service, update: Update, context: ContextTypes.DEFAU
             page = 0
         await query.answer()
         keyboard, current, pages = preset_list_keyboard(service, draft, page)
-        await _edit(query, preset_list_text(service, draft, current, pages), keyboard)
+        await _edit(query, preset_list_text(service, draft, current, pages,
+                                            limit=None if premium else FREE_PRESET_LIMIT), keyboard)
         return
 
     if data.startswith("us:t:"):
         code = data.removeprefix("us:t:")
+        if (code not in draft and len(draft) >= FREE_PRESET_LIMIT and not premium):
+            await query.answer(
+                f"Free accounts can save up to {FREE_PRESET_LIMIT} preset languages. "
+                "Ask the owner for premium to save more.",
+                show_alert=True,
+            )
+            return
         if not service.catalog.get(code):
             await query.answer("That language is unavailable.", show_alert=True)
             return
@@ -341,29 +377,35 @@ async def settings_callback(service, update: Update, context: ContextTypes.DEFAU
         languages = [value for value, _ in service.catalog.items()]
         index = languages.index(code) if code in languages else 0
         keyboard, current, pages = preset_list_keyboard(service, draft, index // PRESET_PAGE_SIZE)
-        await _edit(query, preset_list_text(service, draft, current, pages), keyboard)
+        await _edit(query, preset_list_text(service, draft, current, pages,
+                                            limit=None if premium else FREE_PRESET_LIMIT), keyboard)
         return
 
     if data == "us:clear":
         draft.clear()
         await query.answer("All presets cleared; tap Save to keep this.")
         keyboard, current, pages = preset_list_keyboard(service, draft, 0)
-        await _edit(query, preset_list_text(service, draft, current, pages), keyboard)
+        await _edit(query, preset_list_text(service, draft, current, pages,
+                                            limit=None if premium else FREE_PRESET_LIMIT), keyboard)
         return
 
     if data == "us:back":
         await query.answer()
-        await _edit(query, SETTINGS_TEXT.format(summary=_settings_summary(_draft_names(service, draft))),
+        note = PREMIUM_NOTE if premium else FREE_NOTE
+        await _edit(query, SETTINGS_TEXT.format(summary=_settings_summary(_draft_names(service, draft)),
+                                                limit_note=note),
                     settings_keyboard(len(draft)))
         return
 
     if data == "us:save":
         codes = [code for code, _name in service.catalog.items() if code in draft]
+        if not premium:
+            codes = codes[:FREE_PRESET_LIMIT]
         await service.store.set_presets(user.id, codes)
         service.drop_preset_draft(user.id)
         await query.answer("Saved ✅")
         await _edit(query, f"✅ <b>Saved</b>\n\n{_settings_summary(_draft_names(service, set(codes)))}.\n\n"
-                           "These languages now appear at the top of your language picker.",
+                           "The ⭐ Saved languages button in the language picker now uses these.",
                     settings_keyboard(len(codes)))
         return
 

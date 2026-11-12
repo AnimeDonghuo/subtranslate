@@ -90,8 +90,14 @@ The bot supports many users at once. Settings and moderation state live in **Mon
 | `/public` | owner | Anyone in a private chat may use the bot (banned users still cannot) |
 | `/private` | owner | Only owners, `ALLOWED_USER_IDS` and `/auth`-ed users may use the bot |
 | `/auth <id>` · `/unauth <id>` | owner | Add or remove an authorized user |
+| `/addpremium <id> <days>` | owner | Gives that user premium for N days (default 30, max 3650): unlimited preset languages and the 🌐 Select all languages button. The user is notified |
+| `/removepremium <id>` | owner | Ends premium immediately; the user drops back to 10 presets and the 🔒 locked select-all button |
 | `/ban <id>` · `/release <id>` | owner | Block a user everywhere until released. A ban always applies, in public and private mode |
 | `/banlist` | owner | Banned users as `name (@username) · id` with the ban date, newest first |
+
+**Free limits.** Owners and premium users have no limits. Everyone else can save **10 preset languages** (`/ussetting` shows `7/10 free slots used`), and their language picker shows `🔒 Select all languages · premium` instead of the working button — tapping it explains how to ask the owner. Premium is stored per user in MongoDB with an expiry date, so it survives restarts. Owners are always premium.
+
+**Concurrency and flood control.** `MAX_CONCURRENT_JOBS` (default 2) jobs run at once; extra jobs wait in the queue and `/status` lists them. Before a second worker takes a job it checks `MemAvailable`: below `MIN_FREE_MB` (default 250) it keeps the extra work queued, so a 512 MB Koyeb/Railway instance degrades to one job instead of being killed. The bot also uses PTB's `AIORateLimiter` (about 20 messages/second) which pauses every request during a Telegram `RetryAfter` flood wait, and `/broadcast` sleeps out the wait and retries instead of dropping users.
 
 **Button colours.** Keyboards use the Bot API 9.4 `style` field: **green** for a recommended or positive action (how to translate, save, use saved languages), **blue** for normal choices (language buttons, selecting presets), and **red** for heavy or destructive actions (select all languages, clear presets, owner tools). Clients older than February 2026 simply show them unstyled.
 

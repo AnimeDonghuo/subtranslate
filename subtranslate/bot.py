@@ -21,7 +21,7 @@ from telegram.ext import (
 )
 
 from .admin import install_admin_handlers
-from .config import Settings
+from .config import FREE_PRESET_LIMIT, Settings
 from .fileio import run_file_io, run_scan, wait_for_cleanup
 from .jobs import EnqueueResult, JobQueue, TranslationJob
 from .languages import LanguageCatalog, confirm_all_keyboard, language_keyboard
@@ -49,6 +49,10 @@ from .website import LanguageUnavailable, WebsiteError, WebsiteTranslator
 logger = logging.getLogger(__name__)
 
 PICK = "Choose the language you want for this subtitle:"
+PREMIUM_ALERT = (
+    "🔒 Select all languages is for the bot owner and premium users. "
+    "Ask the owner to enable premium with /addpremium."
+)
 MAX_PROXY_INPUT_BYTES = 19 * 1024 * 1024
 MAX_PROXY_ENTRIES = 80_000
 
@@ -69,9 +73,13 @@ class BotService:
         self._preset_drafts: dict[int, set[str]] = {}
         # Live task numbers for /status and /cancel_id (never persisted).
         self.tasks = TaskRegistry()
-        self.queue = JobQueue(self.process_job, max_waiting=2)
-        self._batch_cancellations: dict[int, asyncio.Event] = {}
-        self._single_cancellations: dict[int, asyncio.Event] = {}
+        self.queue = JobQueue(
+            self.process_job, max_waiting=2,
+            max_concurrent=settings.max_concurrent_jobs, min_free_mb=settings.min_free_mb,
+        )
+        # A chat can have two jobs running at once, so each map holds a set.
+        self._batch_cancellations: dict[int, set[asyncio.Event]] = {}
+        self._single_cancellations: dict[int, set[asyncio.Event]] = {}
         self._proxy_input_chats: set[int] = set()
         self._proxy_scan_task: asyncio.Task | None = None
         self._proxy_scan_status: dict[str, int] = {}
@@ -118,6 +126,14 @@ class BotService:
     def _is_owner(self, user_id: int | None) -> bool:
         return bool(user_id) and user_id in self.settings.owner_ids
 
+    async def is_premium(self, user_id: int | None) -> bool:
+        """Owners always count as premium; premium lifts the free limits."""
+        if not user_id:
+            return False
+        if user_id in self.settings.owner_ids:
+            return True
+        return await self.store.is_premium(user_id)
+
     def _permitted(self, user_id: int | None) -> bool:
         """Owners and authorized users always pass; a ban always applies."""
         if not user_id:
@@ -139,13 +155,26 @@ class BotService:
         await self.store.touch_user(user.id, getattr(user, "full_name", "") or "",
                                     getattr(user, "username", "") or "")
 
+    def _track_cancel(self, mapping: dict[int, set[asyncio.Event]], chat_id: int,
+                      cancel: asyncio.Event) -> None:
+        mapping.setdefault(chat_id, set()).add(cancel)
+
+    def _untrack_cancel(self, mapping: dict[int, set[asyncio.Event]], chat_id: int,
+                        cancel: asyncio.Event) -> None:
+        events = mapping.get(chat_id)
+        if events is None:
+            return
+        events.discard(cancel)
+        if not events:
+            mapping.pop(chat_id, None)
+
     def cancel_user_work(self, chat_id: int) -> tuple[int, bool]:
-        """Drop this chat's queued jobs and signal its active job to stop."""
+        """Drop this chat's queued jobs and stop every job it is running."""
         removed = self.queue.cancel_waiting_jobs(chat_id)
-        cancel = self._batch_cancellations.get(chat_id) or self._single_cancellations.get(chat_id)
-        if cancel is not None:
+        events = set(self._batch_cancellations.get(chat_id, ()))             | set(self._single_cancellations.get(chat_id, ()))
+        for cancel in events:
             cancel.set()
-        return removed, cancel is not None
+        return removed, bool(events)
 
     def preset_draft(self, user_id: int) -> set[str]:
         return self._preset_drafts.setdefault(user_id, set())
@@ -394,7 +423,8 @@ class BotService:
         # Explicitly reply to the original document. Telegram includes it in
         # callback messages, so a language selection survives Koyeb sleeping.
         markup, page, pages = language_keyboard(
-            self.catalog, presets=await self._preset_codes(update.effective_user.id)
+            self.catalog, presets=await self._preset_codes(update.effective_user.id),
+            allow_all=await self.is_premium(update.effective_user.id),
         )
         await message.reply_text(
             f"{PICK}\n\nPage {page}/{pages}",
@@ -415,13 +445,17 @@ class BotService:
             try:
                 page_number = int(data.removeprefix("page:"))
                 markup, current, total = language_keyboard(
-                    self.catalog, page_number, presets=await self._preset_codes(user.id)
+                    self.catalog, page_number, presets=await self._preset_codes(user.id),
+                    allow_all=await self.is_premium(user.id),
                 )
             except ValueError:
                 await query.answer("Please choose a language again.", show_alert=True)
                 return
             await query.answer()
             await self._edit_picker(query, f"{PICK}\n\nPage {current}/{total}", markup)
+            return
+        if (data == "all:locked" or data.startswith("all:confirm:")) and not await self.is_premium(user.id):
+            await query.answer(PREMIUM_ALERT, show_alert=True)
             return
         if data.startswith("all:confirm:"):
             try:
@@ -440,6 +474,9 @@ class BotService:
             return
         languages = ()
         if data == "all:start":
+            if not await self.is_premium(user.id):
+                await query.answer(PREMIUM_ALERT, show_alert=True)
+                return
             languages = tuple(self.catalog.items())
             code, name = "*", "all languages"
         elif data == "preset:start":
@@ -452,6 +489,14 @@ class BotService:
                     show_alert=True,
                 )
                 return
+            if len(languages) > FREE_PRESET_LIMIT and not await self.is_premium(user.id):
+                # Premium may have expired after a larger list was saved.
+                languages = languages[:FREE_PRESET_LIMIT]
+                await query.answer(
+                    f"Free accounts translate up to {FREE_PRESET_LIMIT} saved languages; "
+                    "only the first batch was queued.",
+                    show_alert=True,
+                )
             code, name = "*", "preset languages"
         elif data.startswith("lang:"):
             code = data.removeprefix("lang:")
@@ -749,16 +794,16 @@ class BotService:
             await self._process_all(job)
             return
         cancel = asyncio.Event()
-        self._single_cancellations[job.chat_id] = cancel
+        self._track_cancel(self._single_cancellations, job.chat_id, cancel)
         # /cancel_id 12 sets this exact event.
         self.tasks.mark_running(job.task_id, cancel, now=asyncio.get_running_loop().time())
         try:
             progress = await ProgressMessage.start(self.bot, job.chat_id, job.language_name)
         except BaseException:
-            self._single_cancellations.pop(job.chat_id, None)
+            self._untrack_cancel(self._single_cancellations, job.chat_id, cancel)
             raise
         if progress is None:
-            self._single_cancellations.pop(job.chat_id, None)
+            self._untrack_cancel(self._single_cancellations, job.chat_id, cancel)
             return
         self.tasks.attach_progress(job.task_id, progress)
         heartbeat = asyncio.create_task(self._keep_active_job_awake(), name="job-heartbeat")
@@ -797,7 +842,7 @@ class BotService:
             heartbeat.cancel()
             await asyncio.gather(heartbeat, return_exceptions=True)
             await progress.close()
-            self._single_cancellations.pop(job.chat_id, None)
+            self._untrack_cancel(self._single_cancellations, job.chat_id, cancel)
 
     async def _keep_active_job_awake(self) -> None:
         # A job is real work, but Koyeb only sees incoming HTTP traffic. Ping
@@ -824,7 +869,7 @@ class BotService:
     async def _process_all_with_resources(self, job: TranslationJob, directory: Path,
                                           transport: LargeTelegramTransfer) -> None:
         cancel = asyncio.Event()
-        self._batch_cancellations[job.chat_id] = cancel
+        self._track_cancel(self._batch_cancellations, job.chat_id, cancel)
         self.tasks.mark_running(job.task_id, cancel, now=asyncio.get_running_loop().time())
         heartbeat = None
         progress = None
@@ -937,7 +982,7 @@ class BotService:
                 await asyncio.gather(heartbeat, return_exceptions=True)
             if progress is not None:
                 await progress.close()
-            self._batch_cancellations.pop(job.chat_id, None)
+            self._untrack_cancel(self._batch_cancellations, job.chat_id, cancel)
 
     async def on_error(self, update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.error("Telegram update handling failed (%s)", type(context.error).__name__)

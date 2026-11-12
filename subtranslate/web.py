@@ -12,6 +12,11 @@ from telegram.error import InvalidToken, TelegramError
 from telegram.ext import Application
 from telegram.request import BaseRequest
 
+try:  # Optional dependency: flood control is skipped if it is not installed.
+    from telegram.ext import AIORateLimiter
+except ImportError:  # pragma: no cover - older installs keep working
+    AIORateLimiter = None
+
 from .bot import BotService
 from .config import Settings
 from .languages import LanguageCatalog
@@ -204,6 +209,15 @@ def _build_telegram_application(settings: Settings, update_queue: asyncio.Queue,
     else:
         # Inject a fake Telegram transport in integration tests.
         builder = builder.request(request).get_updates_request(request)
+    if request is None and AIORateLimiter is not None:
+        # Stay below Telegram's ~30 messages/second and pause every request
+        # when the API answers with RetryAfter (flood wait) instead of failing.
+        try:
+            builder = builder.rate_limiter(
+                AIORateLimiter(overall_max_rate=20, overall_time_period=1, max_retries=2)
+            )
+        except RuntimeError:  # aiolimiter is not installed; keep running
+            logger.warning("Flood control unavailable; install aiolimiter to enable it")
     return builder.token(settings.bot_token).update_queue(update_queue).concurrent_updates(8).build()
 
 

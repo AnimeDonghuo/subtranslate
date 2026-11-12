@@ -9,6 +9,11 @@ from urllib.parse import urlsplit
 
 from .proxies import BrowserProxy, VlessProxy, parse_proxy_pool
 
+# Free accounts may save this many preset languages and never "select all";
+# premium users and owners lift both limits.
+FREE_PRESET_LIMIT = 10
+PREMIUM_DEFAULT_DAYS = 30
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -28,6 +33,11 @@ class Settings:
     mongodb_storage_limit_mb: int = 512
     # Optional channel that receives a copy of every delivered subtitle.
     log_channel_id: int | None = None
+    # Two jobs may run at once. When free RAM drops below min_free_mb the
+    # second slot waits, so a small Koyeb/Railway instance queues instead of
+    # running two browsers at once and being killed.
+    max_concurrent_jobs: int = 2
+    min_free_mb: int = 250
     # Optional MTProto credentials are used only for transfers beyond the
     # public Bot API's file limits. Never include either value in repr/logs.
     api_id: int | None = field(default=None, repr=False)
@@ -145,6 +155,15 @@ class Settings:
                 raise ValueError
         except ValueError:
             raise ValueError("API_ID (or TELEGRAM_API_ID) must be a positive integer") from None
+        try:
+            concurrent = int(os.getenv("MAX_CONCURRENT_JOBS", "2"))
+            min_free = int(os.getenv("MIN_FREE_MB", "250"))
+        except ValueError:
+            raise ValueError("MAX_CONCURRENT_JOBS and MIN_FREE_MB must be integers") from None
+        if not 1 <= concurrent <= 4:
+            raise ValueError("MAX_CONCURRENT_JOBS must be between 1 and 4")
+        if not 0 <= min_free <= 100_000:
+            raise ValueError("MIN_FREE_MB must be between 0 and 100000")
         return cls(
             bot_token=token,
             webhook_base_url=base,
@@ -157,6 +176,8 @@ class Settings:
             mongodb_database=database_name,
             mongodb_storage_limit_mb=storage_limit,
             log_channel_id=log_channel_id,
+            max_concurrent_jobs=concurrent,
+            min_free_mb=min_free,
             api_id=api_id,
             api_hash=api_hash or None,
             website_proxies=parse_proxy_pool(os.getenv("WEBSITE_PROXIES", "")),

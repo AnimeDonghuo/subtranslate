@@ -5,9 +5,10 @@ import html
 import logging
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import BadRequest, TelegramError
+from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
+from .config import FREE_PRESET_LIMIT, PREMIUM_DEFAULT_DAYS
 from .store import PERIODS
 
 logger = logging.getLogger(__name__)
@@ -350,6 +351,22 @@ async def private_command(service, update: Update, context: ContextTypes.DEFAULT
     )
 
 
+def _retry_after_seconds(exc: RetryAfter) -> float:
+    value = getattr(exc, "retry_after", 1)
+    return float(value.total_seconds()) if hasattr(value, "total_seconds") else float(value)
+
+
+async def _send_with_flood_wait(bot, *, chat_id: int, text: str) -> None:
+    """Send one message; a Telegram flood wait is slept through, not dropped."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+    except RetryAfter as exc:
+        delay = min(60.0, _retry_after_seconds(exc) + 0.5)
+        logger.info("Telegram flood wait: pausing the broadcast for %.0f seconds", delay)
+        await asyncio.sleep(delay)
+        await bot.send_message(chat_id=chat_id, text=text, disable_web_page_preview=True)
+
+
 async def broadcast_command(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Message every known user once, skipping bans and reporting the outcome."""
     if not await _require_owner(service, update):
@@ -381,7 +398,7 @@ async def broadcast_command(service, update: Update, context: ContextTypes.DEFAU
             skipped += 1
             continue
         try:
-            await context.bot.send_message(chat_id=user_id, text=text, disable_web_page_preview=True)
+            await _send_with_flood_wait(context.bot, chat_id=user_id, text=text)
             sent += 1
         except TelegramError as exc:
             # Blocked bots and deleted accounts are expected; never log the text.
@@ -405,6 +422,76 @@ async def broadcast_command(service, update: Update, context: ContextTypes.DEFAU
         await message.reply_text(summary, parse_mode="HTML")
 
 
+async def _notify_premium(service, user_id: int, text: str) -> None:
+    """Tell the affected user; a blocked bot must not fail the command."""
+    try:
+        await service.bot.send_message(chat_id=user_id, text=text)
+    except TelegramError as exc:
+        logger.info("Premium notice failed (%s)", type(exc).__name__)
+
+
+async def addpremium_command(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/addpremium <id> <days>: unlimited presets and select-all for that user."""
+    if not await _require_owner(service, update):
+        return
+    args = context.args or []
+    try:
+        target = int(str(args[0]).strip()) if args else 0
+    except (TypeError, ValueError):
+        target = 0
+    if target <= 0:
+        await update.effective_message.reply_text(
+            "Usage: /addpremium <user id> <days>\nExample: /addpremium 123456789 30\n"
+            "Premium unlocks unlimited preset languages and 🌐 Select all languages. "
+            "Give a user's numeric ID, which /id shows."
+        )
+        return
+    days = PREMIUM_DEFAULT_DAYS
+    if len(args) > 1:
+        try:
+            days = int(args[1])
+        except (TypeError, ValueError):
+            days = 0
+        if not 1 <= days <= 3650:
+            await update.effective_message.reply_text("Days must be a whole number from 1 to 3650.")
+            return
+    until = await service.store.grant_premium(target, days)
+    info = await service.store.user_info(target) or {}
+    await update.effective_message.reply_text(
+        f"⭐ <b>Premium enabled</b>\n\n{_person(target, info.get('name', ''), info.get('username', ''))}\n"
+        f"Expires: <code>{until:%Y-%m-%d %H:%M} UTC</code> ({days} day(s))\n\n"
+        "Unlimited presets and 🌐 Select all languages are now unlocked.",
+        parse_mode="HTML",
+    )
+    await _notify_premium(
+        service, target,
+        f"⭐ Premium enabled by the bot owner: unlimited preset languages and 🌐 Select all "
+        f"languages, until {until:%Y-%m-%d %H:%M} UTC.",
+    )
+
+
+async def removepremium_command(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_owner(service, update):
+        return
+    target = _parse_id(context.args or [])
+    if target is None:
+        await update.effective_message.reply_text("Usage: /removepremium <user id>")
+        return
+    had_premium = await service.store.revoke_premium(target)
+    info = await service.store.user_info(target) or {}
+    person = _person(target, info.get('name', ''), info.get('username', ''))
+    await update.effective_message.reply_text(
+        f"⭐ Premium removed for {person}." if had_premium
+        else f"{person} did not have premium."
+    )
+    if had_premium:
+        await _notify_premium(
+            service, target,
+            "⭐ Your premium access has ended. You can still save up to "
+            f"{FREE_PRESET_LIMIT} preset languages; 🌐 Select all languages is locked again.",
+        )
+
+
 def install_admin_handlers(service, application) -> None:
     application.add_handler(CommandHandler("stats", lambda update, context: stats_command(
         service, update, context)))
@@ -425,6 +512,10 @@ def install_admin_handlers(service, application) -> None:
     application.add_handler(CommandHandler("private", lambda update, context: private_command(
         service, update, context)))
     application.add_handler(CommandHandler("broadcast", lambda update, context: broadcast_command(
+        service, update, context)))
+    application.add_handler(CommandHandler("addpremium", lambda update, context: addpremium_command(
+        service, update, context)))
+    application.add_handler(CommandHandler("removepremium", lambda update, context: removepremium_command(
         service, update, context)))
     application.add_handler(CallbackQueryHandler(
         lambda update, context: leaderboard_callback(service, update, context), pattern=r"^lb:"))

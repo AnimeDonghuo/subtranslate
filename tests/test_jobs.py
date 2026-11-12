@@ -24,7 +24,8 @@ async def test_queue_is_bounded_deduplicated_and_serial():
         done.append(item.original_message_id)
         active -= 1
 
-    queue = JobQueue(process, max_waiting=2)
+    # Serial semantics for this test; concurrency is covered in test_queue.py.
+    queue = JobQueue(process, max_waiting=2, max_concurrent=1, free_mb=lambda: 4000)
     queue.start()
     assert queue.submit(job(1)) is EnqueueResult.ACCEPTED
     await asyncio.wait_for(started.wait(), 1)

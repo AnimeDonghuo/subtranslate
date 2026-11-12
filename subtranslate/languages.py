@@ -65,8 +65,13 @@ class LanguageCatalog:
 
 
 def language_keyboard(catalog: LanguageCatalog, page: int = 0, *,
-                      presets: tuple[str, ...] = ()) -> tuple[InlineKeyboardMarkup, int, int]:
+                      presets: tuple[str, ...] = (),
+                      allow_all: bool = True) -> tuple[InlineKeyboardMarkup, int, int]:
     """Show five languages at a time, with navigation and an all-languages option.
+
+    ``allow_all=False`` keeps the select-all row visible but marks it as an
+    exclusive feature with a lock, so free users can see it and ask the owner
+    for premium instead.
 
     When the user has saved preset languages, one extra green button offers
     that whole set; it behaves like the normal language buttons, one language
@@ -98,8 +103,12 @@ def language_keyboard(catalog: LanguageCatalog, page: int = 0, *,
         navigation.append(InlineKeyboardButton("Next ›", callback_data=f"page:{page + 1}"))
     if navigation:
         rows.append(navigation)
-    rows.append([InlineKeyboardButton("🌐 Select all languages",
-                                      callback_data=f"all:confirm:{page}", style="danger")])
+    if allow_all:
+        rows.append([InlineKeyboardButton("🌐 Select all languages",
+                                          callback_data=f"all:confirm:{page}", style="danger")])
+    else:
+        rows.append([InlineKeyboardButton("🔒 Select all languages · premium",
+                                          callback_data="all:locked", style="danger")])
     return InlineKeyboardMarkup(rows), page + 1, page_count
 
 

@@ -102,7 +102,7 @@ async def test_ban_stops_queued_and_active_work_immediately():
 
     service = make_service(owner=OWNER)
     active = asyncio.Event()
-    service._single_cancellations[STRANGER] = active
+    service._single_cancellations[STRANGER] = {active}
     service.queue.submit(TranslationJob(
         chat_id=STRANGER, original_message_id=1, file_id="f", file_name="a.srt",
         file_size=10, language_code="hi", language_name="Hindi",

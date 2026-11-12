@@ -184,7 +184,9 @@ async def test_language_picker_page_edits_keep_saved_presets_visible():
     await service.callback(update, None)
     keyboard = query.edits[-1]["reply_markup"]
     assert "⭐ Saved languages to use (1)" in button_labels(keyboard)
-    assert any(button.callback_data == "all:confirm:1" for row in keyboard.inline_keyboard for button in row)
+    # Free users see the exclusive select-all button locked.
+    assert any(button.callback_data == "all:locked" for row in keyboard.inline_keyboard for button in row)
+    assert not any(button.callback_data == "all:confirm:1" for row in keyboard.inline_keyboard for button in row)
 
 
 def styles(keyboard) -> dict[str, str]:

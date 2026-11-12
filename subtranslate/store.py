@@ -121,6 +121,21 @@ class _MemoryBackend:
     async def user_ids(self) -> tuple[int, ...]:
         return tuple(self._users)
 
+    async def premium_until(self, user_id: int) -> datetime | None:
+        value = self._users.get(user_id, {}).get("premium_until")
+        return value if isinstance(value, datetime) else None
+
+    async def set_premium(self, user_id: int, until: datetime, now: datetime) -> None:
+        self._users.setdefault(user_id, {"first_seen": now}).update(premium_until=until, last_seen=now)
+
+    async def clear_premium(self, user_id: int, now: datetime) -> bool:
+        user = self._users.get(user_id)
+        if not user or "premium_until" not in user:
+            return False
+        user.pop("premium_until", None)
+        user["last_seen"] = now
+        return True
+
     async def touch_user(self, user_id: int, name: str, username: str, now: datetime) -> None:
         user = self._users.setdefault(user_id, {"first_seen": now})
         user.update(name=name, username=username, last_seen=now)
@@ -506,6 +521,28 @@ class Database:
     async def all_user_ids(self) -> tuple[int, ...]:
         """Everyone the bot has seen; /broadcast filters bans and adds owners."""
         return await self._run("user_ids", default=())
+
+    # -- premium --------------------------------------------------------
+    async def premium_until(self, user_id: int | None) -> datetime | None:
+        if not user_id:
+            return None
+        return await self._run("premium_until", user_id, default=None)
+
+    async def is_premium(self, user_id: int | None, now: datetime | None = None) -> bool:
+        until = await self.premium_until(user_id)
+        return bool(until and until > (now or utcnow()))
+
+    async def grant_premium(self, user_id: int, days: int) -> datetime:
+        """Extend premium from now (or the current expiry) and return the new end."""
+        now = utcnow()
+        current = await self.premium_until(user_id)
+        until = max(now, current) if current else now
+        until += timedelta(days=max(1, min(3650, days)))
+        await self._run("set_premium", user_id, until, now)
+        return until
+
+    async def revoke_premium(self, user_id: int) -> bool:
+        return bool(await self._run("clear_premium", user_id, utcnow(), default=False))
 
     async def presets(self, user_id: int | None) -> tuple[str, ...]:
         if not user_id:
