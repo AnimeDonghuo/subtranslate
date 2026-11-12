@@ -1,5 +1,6 @@
 """Owner commands: access mode, authorization, bans, statistics and ranking."""
 
+import asyncio
 import html
 import logging
 
@@ -349,6 +350,61 @@ async def private_command(service, update: Update, context: ContextTypes.DEFAULT
     )
 
 
+async def broadcast_command(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Message every known user once, skipping bans and reporting the outcome."""
+    if not await _require_owner(service, update):
+        return
+    message = update.effective_message
+    text = " ".join(context.args or []).strip()
+    reply = getattr(message, "reply_to_message", None)
+    if not text and reply is not None:
+        text = (getattr(reply, "text", "") or getattr(reply, "caption", "") or "").strip()
+    if not text:
+        await message.reply_text(
+            "Usage: /broadcast <text> — or reply to a message with /broadcast.\n"
+            "Everyone the bot has seen gets it, except banned users."
+        )
+        return
+    if len(text) > 4000:
+        await message.reply_text("Keep a broadcast under 4000 characters.")
+        return
+    targets = sorted(set(await service.store.all_user_ids()) | set(service.settings.owner_ids)
+                     | set(service.store.authorized))
+    if not targets:
+        await message.reply_text("There are no known users yet, so there is nobody to message.")
+        return
+    notice = await message.reply_text(f"📣 Broadcasting to {len(targets)} user(s)…")
+    chat_id = getattr(notice, "chat_id", None) or message.chat.id
+    sent = failed = skipped = 0
+    for number, user_id in enumerate(targets, start=1):
+        if service.store.is_banned(user_id):
+            skipped += 1
+            continue
+        try:
+            await context.bot.send_message(chat_id=user_id, text=text, disable_web_page_preview=True)
+            sent += 1
+        except TelegramError as exc:
+            # Blocked bots and deleted accounts are expected; never log the text.
+            logger.info("Broadcast delivery failed (%s)", type(exc).__name__)
+            failed += 1
+        # Stay well below Telegram's roughly 30 messages per second.
+        await asyncio.sleep(0.05)
+        if number % 25 == 0:
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=notice.message_id,
+                                                    text=f"📣 Broadcasting… {number}/{len(targets)}")
+            except TelegramError:
+                pass
+    summary = f"📣 <b>Broadcast finished</b>\n\n✅ Sent: {sent}\n⚠️ Failed: {failed}"
+    if skipped:
+        summary += f"\n🚫 Skipped (banned): {skipped}"
+    try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=notice.message_id,
+                                            text=summary, parse_mode="HTML")
+    except TelegramError:
+        await message.reply_text(summary, parse_mode="HTML")
+
+
 def install_admin_handlers(service, application) -> None:
     application.add_handler(CommandHandler("stats", lambda update, context: stats_command(
         service, update, context)))
@@ -367,6 +423,8 @@ def install_admin_handlers(service, application) -> None:
     application.add_handler(CommandHandler("public", lambda update, context: public_command(
         service, update, context)))
     application.add_handler(CommandHandler("private", lambda update, context: private_command(
+        service, update, context)))
+    application.add_handler(CommandHandler("broadcast", lambda update, context: broadcast_command(
         service, update, context)))
     application.add_handler(CallbackQueryHandler(
         lambda update, context: leaderboard_callback(service, update, context), pattern=r"^lb:"))

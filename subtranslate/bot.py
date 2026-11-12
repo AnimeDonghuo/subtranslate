@@ -5,6 +5,7 @@ import html
 import logging
 import tempfile
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 
@@ -42,6 +43,7 @@ from .subtitles import (
     subtitle_extension,
     translated_filename,
 )
+from .tasks import TaskRegistry
 from .website import LanguageUnavailable, WebsiteError, WebsiteTranslator
 
 logger = logging.getLogger(__name__)
@@ -65,6 +67,8 @@ class BotService:
         # still starts and translates when the database is not configured.
         self.store = store or Database(default_mode=settings.default_access_mode)
         self._preset_drafts: dict[int, set[str]] = {}
+        # Live task numbers for /status and /cancel_id (never persisted).
+        self.tasks = TaskRegistry()
         self.queue = JobQueue(self.process_job, max_waiting=2)
         self._batch_cancellations: dict[int, asyncio.Event] = {}
         self._single_cancellations: dict[int, asyncio.Event] = {}
@@ -210,7 +214,8 @@ class BotService:
         removed, active = self.cancel_user_work(chat_id)
         if active or removed:
             await update.effective_message.reply_text(
-                "Canceled queued jobs. Active work is stopping; no unfinished subtitle will be sent."
+                "Canceled queued jobs. Active work is stopping; no unfinished subtitle will be sent.\n"
+                "Use /status to see task numbers and /cancel_id to stop one task."
             )
         else:
             await update.effective_message.reply_text("You have no active or queued translation job.")
@@ -486,7 +491,18 @@ class BotService:
             user_name=getattr(user, "full_name", "") or "",
             username=getattr(user, "username", "") or "",
         )
+        # Number the job for /status and /cancel_id before it reaches the queue.
+        task = self.tasks.register(
+            job_key=job.key, chat_id=job.chat_id, user_id=job.user_id,
+            user_name=job.user_name, username=job.username,
+            file_name=job.file_name or "", language=name,
+            is_batch=bool(languages), batch_total=len(languages),
+            now=asyncio.get_running_loop().time(),
+        )
+        job = replace(job, task_id=task.id)
         status = self.queue.submit(job)
+        if status is not EnqueueResult.ACCEPTED:
+            self.tasks.remove(task.id)
         if status is EnqueueResult.DUPLICATE:
             await query.answer("That translation is already queued or running.")
         elif status is EnqueueResult.FULL:
@@ -497,13 +513,14 @@ class BotService:
                 label = (f"your {len(languages)} saved languages" if data == "preset:start"
                          else f"{len(languages)} languages")
                 await message.reply_text(
-                    f"Queued {label}. A stage bar will appear when the batch starts. "
-                    "I’ll send each file one by one. This may take hours; use /cancel to stop."
+                    f"Queued {label} as task #{task.id}. A stage bar will appear when the batch starts. "
+                    "I’ll send each file one by one. This may take hours; use /cancel or "
+                    f"/cancel_id {task.id} to stop."
                 )
             else:
                 await message.reply_text(
-                    f"Queued for {name}. A stage bar will appear when the job starts. "
-                    "This may take several minutes on the free instance."
+                    f"Queued for {name} as task #{task.id}. A stage bar will appear when the job starts. "
+                    f"This may take several minutes on the free instance; /cancel_id {task.id} stops it."
                 )
 
     async def _edit_picker(self, query, text, markup) -> None:
@@ -721,11 +738,20 @@ class BotService:
             return await translator.translate(source, code, on_progress=update)
 
     async def process_job(self, job: TranslationJob) -> None:
+        try:
+            await self._process_one(job)
+        finally:
+            # Single jobs and batches both pass through here.
+            self.tasks.remove(job.task_id)
+
+    async def _process_one(self, job: TranslationJob) -> None:
         if job.languages:
             await self._process_all(job)
             return
         cancel = asyncio.Event()
         self._single_cancellations[job.chat_id] = cancel
+        # /cancel_id 12 sets this exact event.
+        self.tasks.mark_running(job.task_id, cancel, now=asyncio.get_running_loop().time())
         try:
             progress = await ProgressMessage.start(self.bot, job.chat_id, job.language_name)
         except BaseException:
@@ -734,6 +760,7 @@ class BotService:
         if progress is None:
             self._single_cancellations.pop(job.chat_id, None)
             return
+        self.tasks.attach_progress(job.task_id, progress)
         heartbeat = asyncio.create_task(self._keep_active_job_awake(), name="job-heartbeat")
         try:
             try:
@@ -798,6 +825,7 @@ class BotService:
                                           transport: LargeTelegramTransfer) -> None:
         cancel = asyncio.Event()
         self._batch_cancellations[job.chat_id] = cancel
+        self.tasks.mark_running(job.task_id, cancel, now=asyncio.get_running_loop().time())
         heartbeat = None
         progress = None
         delivered = skipped = failed = consecutive_failures = 0
@@ -812,6 +840,7 @@ class BotService:
             )
             if progress is None:
                 return
+            self.tasks.attach_progress(job.task_id, progress)
             heartbeat = asyncio.create_task(self._keep_active_job_awake(), name="batch-heartbeat")
             try:
                 source = await self._cancelable(self._download_source(job, directory, transport), cancel)

@@ -25,6 +25,12 @@ _STAGE_INFO = {name: (index, label) for index, (name, label) in enumerate(STAGES
 _STAGE_INFO["checking website proxies"] = (_STAGE_INFO["starting the browser"][0], "Checking website proxies")
 
 
+def step_details(stage: str) -> tuple[int, int, str]:
+    """The exported stage numbering used by /status; stages, not percentages."""
+    index, label = _STAGE_INFO.get(stage, (1, "Preparing the translation"))
+    return index, len(STAGES), label
+
+
 def _bar(completed: int, total: int, width: int = 10) -> str:
     filled = min(width, max(0, completed * width // max(1, total)))
     return "■" * filled + "□" * (width - filled)

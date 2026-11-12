@@ -23,6 +23,8 @@ class TranslationJob:
     user_id: int | None = None
     user_name: str = ""
     username: str = ""
+    # Per-process number shown by /status and /cancel_id; 0 means unnumbered.
+    task_id: int = 0
 
     @property
     def key(self) -> tuple[int, int, str]:
@@ -58,6 +60,23 @@ class JobQueue:
             return EnqueueResult.FULL
         self._pending.add(job.key)
         return EnqueueResult.ACCEPTED
+
+    def cancel_job(self, key: tuple[int, int, str]) -> bool:
+        """Remove one queued job by key, for /cancel_id; returns whether it was queued."""
+        removed = False
+        retained = []
+        while not self._queue.empty():
+            job = self._queue.get_nowait()
+            if not removed and job.key == key:
+                self._pending.discard(job.key)
+                self._queue.task_done()
+                removed = True
+            else:
+                retained.append(job)
+        for job in retained:
+            self._queue.put_nowait(job)
+            self._queue.task_done()
+        return removed
 
     def cancel_waiting_batches(self, chat_id: int) -> int:
         """Remove this user's queued all-language jobs without stopping others."""

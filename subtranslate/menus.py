@@ -4,6 +4,7 @@ No message in this module names the third-party translation service. Users of
 the bot only ever see "the translation service" or "the website".
 """
 
+import asyncio
 import html
 import logging
 import math
@@ -11,6 +12,8 @@ import math
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
+
+from .tasks import render_task
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,7 @@ TOPICS: dict[str, tuple[str, str]] = {
         "service still apply.\n"
         "• Other formats are limited to 1 MB and 3,000 cues.\n"
         "• One translation runs at a time, with up to two queued.\n"
+        "• Use /status to see each running or queued task, and /cancel_id &lt;n&gt; to stop one.\n"
         "• Use /cancel to stop your queued jobs and active work.\n"
         "• If a job fails or is interrupted, tap the language button again."
         ),
@@ -90,6 +94,8 @@ TOPICS: dict[str, tuple[str, str]] = {
         "picker then offers a ⭐ Saved languages to use button. Settings are remembered "
         "across restarts.\n\n"
         "/stats — your personal usage.\n"
+        "/status — your running and queued translations, with stage bars.\n"
+        "/cancel_id &lt;n&gt; — stop one task without affecting the others.\n"
         "/leaderboard — the top users by translated subtitles."
         ),
     ),
@@ -120,6 +126,8 @@ TOPICS: dict[str, tuple[str, str]] = {
         "📊 <b>Statistics</b>\n"
         "/stats — full bot statistics\n"
         "/leaderboard — top 10 users, with today/week/month/year buttons\n\n"
+        "📣 <b>Messaging</b>\n"
+        "/broadcast &lt;text&gt; — send a message to every known user (or reply to a message)\n\n"
         "Every delivered subtitle is copied to LOG_CHANNEL_ID with the sender's ID, name "
         "and username."
         ),
@@ -371,12 +379,81 @@ async def settings_callback(service, update: Update, context: ContextTypes.DEFAU
     await query.answer("That setting is unavailable.", show_alert=True)
 
 
+STATUS_EMPTY = (
+    "😴 <b>No active translation</b>\n\n"
+    "Send a subtitle file to start one. /status lists your running and queued tasks, "
+    "and /cancel_id stops one of them."
+)
+
+
+def _clip(text: str, limit: int = 3900) -> str:
+    return text if len(text) <= limit else text[:limit].rstrip() + "\n\n…"
+
+
+async def send_status(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Stages of every running or queued task, never the website's percentage."""
+    if not await service._is_private_and_allowed(update):
+        return
+    user = update.effective_user
+    owner = service._is_owner(user.id)
+    tasks = service.tasks.all() if owner else service.tasks.for_chat(update.effective_chat.id)
+    if not tasks:
+        await update.effective_message.reply_text(STATUS_EMPTY, parse_mode="HTML")
+        return
+    now = asyncio.get_running_loop().time()
+    blocks = [render_task(task, number=number, now=now) for number, task in enumerate(tasks, start=1)]
+    title = "📊 <b>All active translations</b>" if owner else "📊 <b>Your active translations</b>"
+    count = f"{len(tasks)} task" + ("s" if len(tasks) != 1 else "")
+    await update.effective_message.reply_text(_clip(f"{title} · {count}\n\n" + "\n\n".join(blocks)),
+                                              parse_mode="HTML")
+
+
+async def cancel_task(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cancel_id <n>: stop one task for its owner, or for the owner of the bot."""
+    if not await service._is_private_and_allowed(update):
+        return
+    message = update.effective_message
+    user = update.effective_user
+    raw = ((context.args or [""])[0]).strip().lstrip("#")
+    if not raw.isdigit():
+        await message.reply_text("Usage: /cancel_id 12 — use the task number shown by /status.")
+        return
+    task_id = int(raw)
+    outcome, task = service.tasks.request_cancel(task_id, user_id=user.id,
+                                                 owner=service._is_owner(user.id))
+    if outcome == "missing":
+        await message.reply_text(f"No task #{task_id} is running. Use /status to see current task numbers.")
+        return
+    if outcome == "forbidden":
+        await message.reply_text(f"Task #{task_id} belongs to another user. Only the bot owner can stop it.")
+        return
+    if outcome == "queued":
+        removed = service.queue.cancel_job(task.job_key)
+        service.tasks.remove(task_id)
+        if task.chat_id != update.effective_chat.id:
+            await service._notice(task.chat_id, f"Your queued task #{task_id} was stopped by the bot owner.")
+        await message.reply_text(
+            f"🗑 Task #{task_id} removed from the queue." if removed
+            else f"Task #{task_id} had already left the queue."
+        )
+        return
+    if task.chat_id != update.effective_chat.id:
+        await service._notice(task.chat_id, f"Your task #{task_id} was stopped by the bot owner.")
+    await message.reply_text(
+        f"🛑 Stopping task #{task_id}. The current stage will stop and no unfinished file will be sent."
+    )
+
+
 def install_menu_handlers(service, application) -> None:
     application.add_handler(CommandHandler(["start"], lambda update, context: send_start(
         service, update, context)))
     application.add_handler(CommandHandler(["help"], lambda update, context: send_help(
         service, update, context)))
     application.add_handler(CommandHandler("ussetting", lambda update, context: user_settings(
+        service, update, context)))
+    application.add_handler(CommandHandler("status", lambda update, context: send_status(
+        service, update, context)))
+    application.add_handler(CommandHandler("cancel_id", lambda update, context: cancel_task(
         service, update, context)))
     application.add_handler(CallbackQueryHandler(
         lambda update, context: help_callback(service, update, context), pattern=r"^help:"))

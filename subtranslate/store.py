@@ -118,6 +118,9 @@ class _MemoryBackend:
     async def users_info(self, user_ids: list[int]) -> dict[int, dict]:
         return {user_id: dict(self._users[user_id]) for user_id in user_ids if user_id in self._users}
 
+    async def user_ids(self) -> tuple[int, ...]:
+        return tuple(self._users)
+
     async def touch_user(self, user_id: int, name: str, username: str, now: datetime) -> None:
         user = self._users.setdefault(user_id, {"first_seen": now})
         user.update(name=name, username=username, last_seen=now)
@@ -499,6 +502,10 @@ class Database:
 
     async def user_info(self, user_id: int) -> dict | None:
         return await self._run("user_info", user_id, default=None)
+
+    async def all_user_ids(self) -> tuple[int, ...]:
+        """Everyone the bot has seen; /broadcast filters bans and adds owners."""
+        return await self._run("user_ids", default=())
 
     async def presets(self, user_id: int | None) -> tuple[str, ...]:
         if not user_id:
