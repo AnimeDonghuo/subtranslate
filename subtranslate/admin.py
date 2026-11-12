@@ -303,6 +303,52 @@ async def auth_command(service, update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
+def _named(info: dict[int, dict], user_id: int) -> tuple[str, str]:
+    entry = info.get(user_id) or {}
+    return entry.get("name", "") or "", entry.get("username", "") or ""
+
+
+AUTHLIST_PAGE = 40
+
+
+async def authlist_command(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everyone who can use the bot: owners, env allowlist and /auth entries."""
+    if not await _require_owner(service, update):
+        return
+    owners = sorted(service.settings.owner_ids)
+    env_ids = sorted(service.settings.allowed_user_ids or ())
+    authorized = sorted(service.store.authorized)
+    info = await service.store.users_info(sorted(set(owners) | set(env_ids) | set(authorized)))
+
+    lines = ["🔐 <b>Access list</b>", ""]
+    if owners:
+        lines.append(f"👑 <b>Owners</b> · {len(owners)} (always allowed)")
+        lines.extend(f"• {_person(uid, *_named(info, uid))}" for uid in owners)
+        lines.append("")
+    if env_ids:
+        lines.append(f"🌍 <b>ALLOWED_USER_IDS</b> · {len(env_ids)}")
+        lines.extend(f"• {_person(uid, *_named(info, uid))}" for uid in env_ids)
+        lines.append("")
+    lines.append(f"✅ <b>Added with /auth</b> · {len(authorized)}")
+    if authorized:
+        lines.extend(f"• {_person(uid, *_named(info, uid))}" for uid in authorized[:AUTHLIST_PAGE])
+        if len(authorized) > AUTHLIST_PAGE:
+            lines.append(f"… and {len(authorized) - AUTHLIST_PAGE} more")
+    else:
+        lines.append("• none yet — add one with <code>/auth &lt;id&gt;</code>")
+    mode = service.store.mode
+    lines.append("")
+    lines.append(f"🚪 <b>Mode</b>: {mode} — " + (
+        "anyone in a private chat may use the bot, except banned users."
+        if mode == "public"
+        else "only owners, ALLOWED_USER_IDS and /auth entries may use the bot."
+    ))
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900].rstrip() + "\n\n… list truncated"
+    await update.effective_message.reply_text(text, parse_mode="HTML")
+
+
 async def unauth_command(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await _require_owner(service, update):
         return
@@ -506,6 +552,8 @@ def install_admin_handlers(service, application) -> None:
     application.add_handler(CommandHandler("auth", lambda update, context: auth_command(
         service, update, context)))
     application.add_handler(CommandHandler("unauth", lambda update, context: unauth_command(
+        service, update, context)))
+    application.add_handler(CommandHandler("authlist", lambda update, context: authlist_command(
         service, update, context)))
     application.add_handler(CommandHandler("public", lambda update, context: public_command(
         service, update, context)))

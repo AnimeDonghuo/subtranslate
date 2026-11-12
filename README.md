@@ -71,6 +71,23 @@ For VLESS links the Docker image includes a pinned Xray binary. The bot starts a
 
 A proxy operator can observe your traffic and may be able to inspect subtitle data, especially if they control TLS or the destination. Use only providers you trust. Proxies do not guarantee anonymity or prevent site tracking, rate limits, outages, or failed translations; respect the website's terms.
 
+### Free-tier capacity and acceptable use
+
+The bot is built to run on **Koyeb's free 512 MB instance** and Railway's free trial:
+
+- **One web service, one port.** It listens on `PORT` and uses Telegram's webhook, so there is no long-lived polling connection; `/healthz` is the health route Koyeb probes.
+- **No volumes.** Each job gets its own temporary directory under the default temp area; the source, the downloaded result and the browser's temporary files are removed when the job ends or is cancelled.
+- **Memory-aware queue.** `MAX_CONCURRENT_JOBS=2`, but before a second job starts the bot reads the container's **own cgroup limit** (`/sys/fs/cgroup/memory.max` + `memory.current`, with the cgroup v1 files as fallback) and the host's `MemAvailable`, and uses the smaller figure. Below `MIN_FREE_MB` (default 250) the extra job stays in the queue, so a free instance falls back to one job instead of being OOM-killed. The Playwright session is serialised anyway, so two browsers never run at once.
+- **Sleep and cold starts.** The webhook is registered on boot, HTTP timeouts are raised to 30 s, and a long job pings `/healthz` so Koyeb/Railway see traffic while it runs.
+- **MongoDB is optional.** Without it, settings live in memory; Atlas's free M0 tier is enough for presets, bans, access and counters.
+
+**Acceptable use.** The bot only translates subtitle files that users send it. It does not mine cryptocurrency, torrent, relay third-party traffic, host or stream media, or resell platform capacity. Two optional features deserve your own judgement:
+
+- `WEBSITE_PROXIES` (including the bundled VLESS/Xray bridge) routes only the bot's own browser requests to the translation website. Railway's terms restrict running a proxy or VPN service from their network; if that applies to you, leave `WEBSITE_PROXIES` unset — translation works without it.
+- Translating subtitles you have no permission to translate can infringe copyright; users are warned, and `/ban` is available.
+
+You remain responsible for the files your users send.
+
 ## Users, settings and moderation
 
 The bot supports many users at once. Settings and moderation state live in **MongoDB** when `MONGODB_URI` is set, and in memory otherwise. Either way the bot starts and translates: if the database is unreachable it logs a warning, keeps working, and `/stats` shows `in-memory (MongoDB not connected)`. Nothing about the translation flow depends on the database.
@@ -90,6 +107,7 @@ The bot supports many users at once. Settings and moderation state live in **Mon
 | `/public` | owner | Anyone in a private chat may use the bot (banned users still cannot) |
 | `/private` | owner | Only owners, `ALLOWED_USER_IDS` and `/auth`-ed users may use the bot |
 | `/auth <id>` · `/unauth <id>` | owner | Add or remove an authorized user |
+| `/authlist` | owner | Everyone who can use the bot in one place: owners, `ALLOWED_USER_IDS` and `/auth` entries, each with name, `@username` and ID, plus the current access mode |
 | `/addpremium <id> <days>` | owner | Gives that user premium for N days (default 30, max 3650): unlimited preset languages and the 🌐 Select all languages button. The user is notified |
 | `/removepremium <id>` | owner | Ends premium immediately; the user drops back to 10 presets and the 🔒 locked select-all button |
 | `/ban <id>` · `/release <id>` | owner | Block a user everywhere until released. A ban always applies, in public and private mode |

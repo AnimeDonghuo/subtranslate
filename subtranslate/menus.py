@@ -130,6 +130,7 @@ TOPICS: dict[str, tuple[str, str]] = {
         "/public — anyone may use the bot\n"
         "/private — only authorized users may use the bot\n"
         "/auth &lt;id&gt; — allow that user\n"
+        "/authlist — everyone with access (owners, ALLOWED_USER_IDS, /auth)\n"
         "/unauth &lt;id&gt; — remove that user\n\n"
         "🚫 <b>Bans</b>\n"
         "/ban &lt;id&gt; — block a user everywhere until released\n"

@@ -114,3 +114,38 @@ async def test_cancel_id_can_remove_a_queued_job_by_key():
     assert queue.cancel_job(job.key) is True
     assert queue._queue.empty()
     assert queue.cancel_job(job.key) is False
+
+
+def test_cgroup_and_host_memory_helpers(monkeypatch, tmp_path):
+    mib = 1024 * 1024
+    healthy = tmp_path / "healthy"
+    healthy.write_text(f"{600 * mib}\n")
+    used = tmp_path / "used"
+    used.write_text(f"{100 * mib}\n")
+    unlimited = tmp_path / "unlimited"
+    unlimited.write_text("max\n")
+    missing = tmp_path / "missing"
+
+    monkeypatch.setattr(jobs_module, "CGROUP_PAIRS", ((str(healthy), str(used)),))
+    assert jobs_module.cgroup_available_mb() == 500
+
+    monkeypatch.setattr(jobs_module, "CGROUP_PAIRS", ((str(unlimited), str(used)),))
+    assert jobs_module.cgroup_available_mb() is None       # v2 "max" = no limit
+
+    monkeypatch.setattr(jobs_module, "CGROUP_PAIRS", ((str(missing), str(used)),))
+    assert jobs_module.cgroup_available_mb() is None       # not a container
+
+    assert jobs_module._available_mb(1 << 62, 1) is None   # cgroup v1 "unlimited"
+    assert jobs_module._available_mb(0, 0) is None
+    assert jobs_module._available_mb(None, 5) is None
+    assert jobs_module._available_mb(100 * 1024 * 1024, 20 * 1024 * 1024) == 80
+
+
+def test_available_memory_uses_the_tighter_container_limit(monkeypatch):
+    monkeypatch.setattr(jobs_module, "cgroup_available_mb", lambda: 300)
+    monkeypatch.setattr(jobs_module, "host_available_mb", lambda: 8000)
+    assert jobs_module.available_memory_mb() == 300
+    monkeypatch.setattr(jobs_module, "cgroup_available_mb", lambda: None)
+    assert jobs_module.available_memory_mb() == 8000
+    monkeypatch.setattr(jobs_module, "host_available_mb", lambda: None)
+    assert jobs_module.available_memory_mb() is None

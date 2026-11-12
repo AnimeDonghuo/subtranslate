@@ -11,8 +11,38 @@ logger = logging.getLogger(__name__)
 ADMISSION_RETRY_SECONDS = 5.0
 
 
-def available_memory_mb() -> int | None:
-    """Free RAM from /proc/meminfo; None when the platform does not expose it."""
+# Container memory limits: cgroup v2 first, then the older v1 files. Reading
+# only /proc/meminfo would report the host's RAM on Railway and Koyeb.
+CGROUP_PAIRS = (
+    ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+    ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+)
+_MIB = 1024 * 1024
+
+
+def _read_number(path: str) -> int | None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            text = handle.read().strip()
+    except (OSError, ValueError):
+        return None
+    if not text or text == "max":
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _available_mb(limit: int | None, used: int | None) -> int | None:
+    """Free bytes inside a cgroup; None for missing or 'unlimited' limits."""
+    if not limit or used is None or limit <= 0 or limit >= 1 << 60:
+        return None
+    return max(0, (limit - used) // _MIB)
+
+
+def host_available_mb() -> int | None:
+    """Free host RAM from /proc/meminfo; None where it is not exposed."""
     try:
         with open("/proc/meminfo", encoding="ascii") as handle:
             for line in handle:
@@ -21,6 +51,23 @@ def available_memory_mb() -> int | None:
     except (OSError, ValueError, IndexError):
         return None
     return None
+
+
+def cgroup_available_mb() -> int | None:
+    """Free memory inside the container's own limit, when it has one."""
+    values = []
+    for limit_path, used_path in CGROUP_PAIRS:
+        value = _available_mb(_read_number(limit_path), _read_number(used_path))
+        if value is not None:
+            values.append(value)
+    return min(values) if values else None
+
+
+def available_memory_mb() -> int | None:
+    """The tighter of the container limit and host free memory."""
+    values = [value for value in (cgroup_available_mb(), host_available_mb())
+              if value is not None]
+    return min(values) if values else None
 
 
 @dataclass(frozen=True)

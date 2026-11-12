@@ -182,3 +182,37 @@ async def test_public_and_private_commands_persist_the_mode():
     assert service.store.mode == "public"
     await admin.private_command(service, make_update(user_id=OWNER), context())
     assert service.store.mode == "private"
+
+
+async def test_authlist_lists_owners_env_allowlist_and_auth_entries():
+    service = make_service(owner=OWNER, allowed={111})
+    await service.store.touch_user(42, "Asha Kumari", "asha")
+    await service.store.touch_user(111, "Env User", "envuser")
+    await service.store.authorize(42)
+    await service.store.authorize(43)
+    await service.store.set_mode("private")
+
+    update = make_update(user_id=OWNER)
+    await admin.authlist_command(service, update, context())
+    text = message_text(update)
+    assert "🔐 <b>Access list</b>" in text
+    assert "Asha Kumari" in text and "@asha" in text and "<code>42</code>" in text
+    # Both sources are listed separately, so it is clear where access comes from.
+    assert "ALLOWED_USER_IDS" in text and "<code>111</code>" in text
+    assert "Added with /auth</b> · 2" in text
+    assert "<code>43</code>" in text                      # no profile yet, still listed
+    assert "Mode</b>: private" in text
+    assert "/auth &lt;id&gt;" not in text.split("Added with /auth")[0]
+
+
+async def test_authlist_is_owner_only_and_handles_an_empty_list():
+    service = make_service(owner=OWNER)
+    stranger = make_update(user_id=42)
+    await admin.authlist_command(service, stranger, context())
+    assert "only for the bot owner" in message_text(stranger)
+
+    owner = make_update(user_id=OWNER)
+    await admin.authlist_command(service, owner, context())
+    text = message_text(owner)
+    assert "Added with /auth</b> · 0" in text and "none yet" in text
+    assert "Mode</b>: public" in text

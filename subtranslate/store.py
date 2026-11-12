@@ -518,6 +518,10 @@ class Database:
     async def user_info(self, user_id: int) -> dict | None:
         return await self._run("user_info", user_id, default=None)
 
+    async def users_info(self, user_ids: list[int]) -> dict[int, dict]:
+        """Names and usernames for a list of IDs, for /authlist and /banlist."""
+        return await self._run("users_info", list(user_ids), default={}) or {}
+
     async def all_user_ids(self) -> tuple[int, ...]:
         """Everyone the bot has seen; /broadcast filters bans and adds owners."""
         return await self._run("user_ids", default=())
