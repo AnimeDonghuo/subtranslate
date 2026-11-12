@@ -9,6 +9,7 @@ from support import (
     FakeMessage,
     FakeQuery,
     context,
+    make_query_update,
     make_service,
     make_update,
     user,
@@ -93,17 +94,22 @@ async def test_status_lists_only_own_tasks_but_an_owner_sees_everything():
 
     update = make_update(user_id=42)
     await menus.send_status(service, update, None)
-    own = update.effective_message.reply_text.await_args.args[0]
+    board = service.bot.messages[-1]
+    own = board["text"]
     assert "Your active translations" in own and "Task #1" in own
     assert "Task #2" not in own and "Other" not in own
+    # The live message carries a Refresh button and a Cancel button per task.
+    callbacks = [button.callback_data for row in board["reply_markup"].inline_keyboard for button in row]
+    assert "status:refresh" in callbacks and "status:cancel:1" in callbacks
 
     owner = make_update(user_id=1)
     await menus.send_status(service, owner, None)
-    everything = owner.effective_message.reply_text.await_args.args[0]
+    everything = service.bot.messages[-1]["text"]
     assert "All active translations" in everything
     assert "Task #1" in everything and "Task #2" in everything
     assert "waiting in queue" in everything and "/cancel_id 2" in everything
     assert second.state == "queued"
+    await service.status_boards.close_all()
 
 
 async def test_status_without_tasks_explains_the_commands():
@@ -257,3 +263,114 @@ async def test_a_finished_job_marks_running_then_releases_its_number(monkeypatch
     assert seen == {"state": "running", "stage": "downloading the original"}
     assert service.tasks.get(task.id) is None
     assert any("Could not translate: bad file" in message["text"] for message in service.bot.messages)
+
+
+async def test_status_opens_as_a_live_message_and_replaces_only_your_own():
+    service = make_service(owner=1)
+    service.bot = FakeBot()
+    task = service.tasks.register(job_key=(42, 1, "hi"), chat_id=42, user_id=42, user_name="Asha",
+                                  username="asha", file_name="a.srt", language="Hindi")
+    service.tasks.mark_running(task.id, asyncio.Event(), now=0.0)
+    other = service.tasks.register(job_key=(43, 2, "es"), chat_id=43, user_id=43, user_name="Other",
+                                   username="other", file_name="b.srt", language="Spanish")
+    service.tasks.mark_running(other.id, asyncio.Event(), now=0.0)
+
+    await menus.send_status(service, make_update(user_id=42), None)
+    first_id = service.status_boards.get(42).message_id
+    first = next(m for m in service.bot.messages if m.get("chat_id") == 42 and "text" in m)
+    await menus.send_status(service, make_update(user_id=43), None)
+    second_id = service.status_boards.get(43).message_id
+    second = next(m for m in service.bot.messages if m.get("chat_id") == 43 and "text" in m)
+    # Each user has an independent live message.
+    assert "Task #2" not in first["text"] and "Task #1" not in second["text"]
+
+    # Asking again replaces the caller's old message, not the other user's.
+    await menus.send_status(service, make_update(user_id=42), None)
+    assert service.status_boards.get(42).message_id != first_id
+    assert any(message.get("deleted") and message.get("message_id") == first_id
+               for message in service.bot.messages)
+    assert not any(message.get("deleted") and message.get("message_id") == second_id
+                   for message in service.bot.messages)
+    await service.status_boards.close_all()
+
+
+async def test_refresh_button_edits_the_live_message():
+    service = make_service(owner=1)
+    service.bot = FakeBot()
+    task = service.tasks.register(job_key=(42, 1, "hi"), chat_id=42, user_id=42, user_name="Asha",
+                                  username="asha", file_name="a.srt", language="Hindi")
+    service.tasks.mark_running(task.id, asyncio.Event(), now=0.0)
+    await menus.send_status(service, make_update(user_id=42), None)
+    board_id = service.status_boards.get(42).message_id
+
+    update, query = make_query_update("status:refresh", user_id=42)
+    await menus.status_callback(service, update, None)
+    assert query.answers == [("Refreshed ✅", False)]
+    edit = [message for message in service.bot.messages if message.get("message_id") == board_id][-1]
+    assert "Task #1" in edit["text"] and "Refresh" in str(edit["reply_markup"])
+    await service.status_boards.close_all()
+
+
+async def test_cancel_button_on_the_status_message_stops_that_task():
+    service = make_service(owner=1)
+    service.bot = FakeBot()
+    event = asyncio.Event()
+    task = service.tasks.register(job_key=(42, 1, "hi"), chat_id=42, user_id=42, user_name="Asha",
+                                  username="asha", language="Hindi")
+    service.tasks.mark_running(task.id, event, now=0.0)
+    keep = service.tasks.register(job_key=(42, 2, "es"), chat_id=42, user_id=42, language="Spanish")
+    service.tasks.mark_running(keep.id, asyncio.Event(), now=0.0)
+    await menus.send_status(service, make_update(user_id=42), None)
+
+    update, query = make_query_update("status:cancel:1", user_id=42)
+    await menus.status_callback(service, update, None)
+    assert event.is_set() and not keep.cancel.is_set()
+    assert "Stopping task #1" in query.answers[-1][0]
+    # Another user cannot use a Cancel button against that task.
+    update, query = make_query_update("status:cancel:2", user_id=43)
+    await menus.status_callback(service, update, None)
+    assert "another user" in query.answers[-1][0]
+    await service.status_boards.close_all()
+
+
+async def test_live_message_updates_itself_on_the_interval():
+    from subtranslate.status_board import StatusBoard
+
+    service = make_service(owner=1)
+    service.bot = FakeBot()
+    task = service.tasks.register(job_key=(42, 1, "hi"), chat_id=42, user_id=42, user_name="Asha",
+                                  username="asha", language="Hindi")
+    event = asyncio.Event()
+    service.tasks.mark_running(task.id, event, now=asyncio.get_running_loop().time())
+    board = StatusBoard(service, 42, viewer_id=42, interval=0.05)
+    service.status_boards._boards[42] = board
+    assert await board.show() is True
+    service.tasks.get(task.id).progress = SimpleNamespace(stage="translating", language="Hindi",
+                                                          batch_completed=0, batch_total=0)
+    await asyncio.sleep(0.2)
+    edits = [message for message in service.bot.messages
+             if message.get("message_id") == board.message_id]
+    assert edits and "Stage: Translating on the website" in edits[-1]["text"]
+    await board.close()
+
+
+async def test_queueing_a_task_shows_the_live_status_automatically():
+    service = make_service(owner=1)
+    service.bot = FakeBot()
+    document = SimpleNamespace(file_id="file1", file_name="movie.srt", file_size=120)
+    message = FakeMessage(chat_id=42, message_id=100)
+    message.reply_to_message = SimpleNamespace(
+        message_id=77, from_user=SimpleNamespace(id=42), document=document,
+    )
+    query = FakeQuery("lang:hi", 42, message)
+    update = SimpleNamespace(callback_query=query, effective_message=message,
+                             effective_chat=SimpleNamespace(id=42, type="private"),
+                             effective_user=user(42))
+    await service.callback(update, None)
+    live = [m for m in service.bot.messages if m.get("reply_markup") is not None
+            and "Your active translations" in m.get("text", "")]
+    assert live and "Task #1" in live[-1]["text"]
+    job = service.queue._queue.get_nowait()
+    service.queue._queue.task_done()
+    assert job.task_id == 1
+    await service.status_boards.close_all()

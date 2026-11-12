@@ -46,6 +46,10 @@ class FakeBot:
         self.documents.append({"chat_id": chat_id, "document": document, "caption": caption, **kwargs})
         return SimpleNamespace(message_id=self.next_id)
 
+    async def delete_message(self, chat_id=None, message_id=None, **kwargs):
+        self.messages.append({"chat_id": chat_id, "message_id": message_id, "deleted": True})
+        return True
+
     async def edit_message_text(self, chat_id=None, message_id=None, text="", **kwargs):
         self.next_id += 1
         self.messages.append({"chat_id": chat_id, "message_id": message_id, "text": text, **kwargs})

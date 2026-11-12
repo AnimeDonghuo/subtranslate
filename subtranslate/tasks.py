@@ -8,6 +8,8 @@ import asyncio
 import html
 from dataclasses import dataclass, field
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 from .progress import step_details
 
 BAR_CELLS = 10
@@ -166,3 +168,32 @@ def render_task(task: Task, *, number: int | None = None, now: float | None = No
                   "",
                   "The bar shows stages, not the website's translation percentage."))
     return "\n".join(lines)
+
+
+def render_board(tasks: list[Task], *, owner: bool, interval: int = 6) -> str:
+    """The whole live-status message: header, every task block and a hint."""
+    if not tasks:
+        return ("✅ <b>No active translations</b>\n\n"
+                "Nothing is running or queued. Send a subtitle to start one; this "
+                "message stops updating until you use /status again.")
+    title = "📊 <b>All active translations</b>" if owner else "📊 <b>Your active translations</b>"
+    count = f"{len(tasks)} task" + ("s" if len(tasks) != 1 else "")
+    now = asyncio.get_running_loop().time()
+    blocks = [render_task(task, number=number, now=now)
+              for number, task in enumerate(tasks, start=1)]
+    return (f"{title} · {count}\n"
+            f"<i>Live · refreshes every {interval}s · tap 🔄 Refresh</i>\n\n"
+            + "\n\n".join(blocks))
+
+
+def status_keyboard(tasks: list[Task]) -> InlineKeyboardMarkup:
+    """Cancel buttons for each task plus a manual Refresh, per live message."""
+    rows = []
+    for task in tasks:
+        label = (f"batch of {task.batch_total}" if task.is_batch else task.language) or "task"
+        rows.append([InlineKeyboardButton(
+            f"🛑 Cancel #{task.id} · {label}"[:64],
+            callback_data=f"status:cancel:{task.id}", style="danger",
+        )])
+    rows.append([InlineKeyboardButton("🔄 Refresh", callback_data="status:refresh", style="primary")])
+    return InlineKeyboardMarkup(rows)

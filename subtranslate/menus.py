@@ -4,7 +4,6 @@ No message in this module names the third-party translation service. Users of
 the bot only ever see "the translation service" or "the website".
 """
 
-import asyncio
 import html
 import logging
 import math
@@ -14,7 +13,7 @@ from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
 from .config import FREE_PRESET_LIMIT
-from .tasks import render_task
+from .tasks import render_board
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +105,8 @@ TOPICS: dict[str, tuple[str, str]] = {
         "picker then offers a ⭐ Saved languages to use button. Settings are remembered "
         "across restarts.\n\n"
         "/stats — your personal usage.\n"
-        "/status — your running and queued translations, with stage bars.\n"
+        "/status — a live message with stage bars, a 🔄 Refresh button and a 🛑 Cancel "
+        "button for each task; it updates itself every few seconds.\n"
         "/cancel_id &lt;n&gt; — stop one task without affecting the others.\n"
         "/leaderboard — the top users by translated subtitles."
         ),
@@ -433,21 +433,45 @@ def _clip(text: str, limit: int = 3900) -> str:
 
 
 async def send_status(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stages of every running or queued task, never the website's percentage."""
+    """One live, self-refreshing status message per chat.
+
+    Asking again replaces this user's previous status message. Other users keep
+    their own message and their own Refresh/Cancel buttons.
+    """
     if not await service._is_private_and_allowed(update):
         return
     user = update.effective_user
+    chat_id = update.effective_chat.id
     owner = service._is_owner(user.id)
-    tasks = service.tasks.all() if owner else service.tasks.for_chat(update.effective_chat.id)
+    tasks = service.tasks.all() if owner else service.tasks.for_chat(chat_id)
     if not tasks:
         await update.effective_message.reply_text(STATUS_EMPTY, parse_mode="HTML")
         return
-    now = asyncio.get_running_loop().time()
-    blocks = [render_task(task, number=number, now=now) for number, task in enumerate(tasks, start=1)]
-    title = "📊 <b>All active translations</b>" if owner else "📊 <b>Your active translations</b>"
-    count = f"{len(tasks)} task" + ("s" if len(tasks) != 1 else "")
-    await update.effective_message.reply_text(_clip(f"{title} · {count}\n\n" + "\n\n".join(blocks)),
-                                              parse_mode="HTML")
+    if service.bot is not None:
+        await service.status_boards.show(service, chat_id=chat_id, viewer_id=user.id)
+    else:
+        await update.effective_message.reply_text(
+            _clip(render_board(tasks, owner=owner)), parse_mode="HTML")
+
+
+async def cancel_task_work(service, *, task_id: int, user_id: int | None, owner: bool,
+                           chat_id: int) -> str:
+    """Shared by /cancel_id and the status message's Cancel buttons."""
+    outcome, task = service.tasks.request_cancel(task_id, user_id=user_id, owner=owner)
+    if outcome == "missing":
+        return f"No task #{task_id} is running. Use /status to see current task numbers."
+    if outcome == "forbidden":
+        return f"Task #{task_id} belongs to another user. Only the bot owner can stop it."
+    if task.chat_id != chat_id:
+        await service._notice(task.chat_id, f"Your task #{task_id} was stopped by the bot owner.")
+    if outcome == "queued":
+        removed = service.queue.cancel_job(task.job_key)
+        service.tasks.remove(task_id)
+        return (f"🗑 Task #{task_id} removed from the queue." if removed
+                else f"Task #{task_id} had already left the queue.")
+    # The task's own cancellation event also aborts an in-flight download or
+    # upload, not just the website stage.
+    return f"🛑 Stopping task #{task_id}. The current stage will stop and no unfinished file will be sent."
 
 
 async def cancel_task(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -460,30 +484,46 @@ async def cancel_task(service, update: Update, context: ContextTypes.DEFAULT_TYP
     if not raw.isdigit():
         await message.reply_text("Usage: /cancel_id 12 — use the task number shown by /status.")
         return
-    task_id = int(raw)
-    outcome, task = service.tasks.request_cancel(task_id, user_id=user.id,
-                                                 owner=service._is_owner(user.id))
-    if outcome == "missing":
-        await message.reply_text(f"No task #{task_id} is running. Use /status to see current task numbers.")
+    text = await cancel_task_work(service, task_id=int(raw), user_id=user.id,
+                                  owner=service._is_owner(user.id),
+                                  chat_id=update.effective_chat.id)
+    await message.reply_text(text)
+    board = service.status_boards.get(update.effective_chat.id)
+    if board is not None:
+        # Show the cancellation on the live status immediately.
+        await board.refresh()
+
+
+async def status_callback(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Refresh and per-task Cancel buttons on the live status message."""
+    query = update.callback_query
+    user = query.from_user
+    if not await service.ensure_callback_allowed(query):
         return
-    if outcome == "forbidden":
-        await message.reply_text(f"Task #{task_id} belongs to another user. Only the bot owner can stop it.")
+    data = query.data or ""
+    chat_id = update.effective_chat.id
+    if data == "status:refresh":
+        board = service.status_boards.get(chat_id)
+        if board is None or service.bot is None:
+            await query.answer("Use /status to open the live status.")
+            return
+        await board.refresh()
+        await query.answer("Refreshed ✅")
         return
-    if outcome == "queued":
-        removed = service.queue.cancel_job(task.job_key)
-        service.tasks.remove(task_id)
-        if task.chat_id != update.effective_chat.id:
-            await service._notice(task.chat_id, f"Your queued task #{task_id} was stopped by the bot owner.")
-        await message.reply_text(
-            f"🗑 Task #{task_id} removed from the queue." if removed
-            else f"Task #{task_id} had already left the queue."
-        )
+    if data.startswith("status:cancel:"):
+        try:
+            task_id = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            await query.answer("That task button is no longer valid.", show_alert=True)
+            return
+        text = await cancel_task_work(service, task_id=task_id, user_id=user.id,
+                                      owner=service._is_owner(user.id), chat_id=chat_id)
+        await query.answer(text[:200], show_alert=True)
+        board = service.status_boards.get(chat_id)
+        if board is not None:
+            await board.refresh()
         return
-    if task.chat_id != update.effective_chat.id:
-        await service._notice(task.chat_id, f"Your task #{task_id} was stopped by the bot owner.")
-    await message.reply_text(
-        f"🛑 Stopping task #{task_id}. The current stage will stop and no unfinished file will be sent."
-    )
+    await query.answer("That status action is unavailable.", show_alert=True)
 
 
 def install_menu_handlers(service, application) -> None:
@@ -497,6 +537,8 @@ def install_menu_handlers(service, application) -> None:
         service, update, context)))
     application.add_handler(CommandHandler("cancel_id", lambda update, context: cancel_task(
         service, update, context)))
+    application.add_handler(CallbackQueryHandler(
+        lambda update, context: status_callback(service, update, context), pattern=r"^status:"))
     application.add_handler(CallbackQueryHandler(
         lambda update, context: help_callback(service, update, context), pattern=r"^help:"))
     application.add_handler(CallbackQueryHandler(

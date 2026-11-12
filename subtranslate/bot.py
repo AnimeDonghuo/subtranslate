@@ -35,6 +35,7 @@ from .large_telegram import (
 from .menus import install_menu_handlers
 from .progress import ProgressMessage
 from .proxies import parse_proxy_candidates
+from .status_board import StatusBoards
 from .store import Database
 from .subtitles import (
     MAX_INPUT_BYTES,
@@ -73,6 +74,8 @@ class BotService:
         self._preset_drafts: dict[int, set[str]] = {}
         # Live task numbers for /status and /cancel_id (never persisted).
         self.tasks = TaskRegistry()
+        # One self-refreshing /status message per chat.
+        self.status_boards = StatusBoards()
         self.queue = JobQueue(
             self.process_job, max_waiting=2,
             max_concurrent=settings.max_concurrent_jobs, min_free_mb=settings.min_free_mb,
@@ -101,6 +104,7 @@ class BotService:
 
     async def shutdown(self) -> None:
         """Best-effort notices for jobs interrupted by a graceful shutdown."""
+        await self.status_boards.close_all()
         await self._cancel_proxy_scan()
         interrupted = await self.queue.close()
         if not interrupted or self.bot is None:
@@ -567,6 +571,10 @@ class BotService:
                     f"Queued for {name} as task #{task.id}. A stage bar will appear when the job starts. "
                     f"This may take several minutes on the free instance; /cancel_id {task.id} stops it."
                 )
+            if self.bot is not None:
+                # Show this user's live status straight away; it replaces their
+                # previous status message and refreshes itself.
+                await self.status_boards.show(self, chat_id=message.chat.id, viewer_id=user.id)
 
     async def _edit_picker(self, query, text, markup) -> None:
         try:
