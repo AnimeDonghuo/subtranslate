@@ -26,6 +26,15 @@ class FakeBot:
         self.documents = []
         self.next_id = 500
         self.fail_chat_ids = set()
+        self.files = {}
+
+    async def get_file(self, file_id=None, **kwargs):
+        payload = self.files.get(file_id, b"")
+
+        async def download_as_bytearray(*args, **kwargs):
+            return bytearray(payload)
+
+        return SimpleNamespace(file_id=file_id, download_as_bytearray=download_as_bytearray)
 
     async def send_message(self, chat_id=None, text="", **kwargs):
         if chat_id in self.fail_chat_ids:
@@ -64,6 +73,7 @@ class FakeMessage:
         self.reply_to_message = None
         self.document = None
         self.reply_text = AsyncMock(return_value=SimpleNamespace(message_id=message_id + 1))
+        self.reply_document = AsyncMock(return_value=SimpleNamespace(message_id=message_id + 2))
 
 
 class FakeQuery:

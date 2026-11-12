@@ -99,6 +99,7 @@ The bot supports many users at once. Settings and moderation state live in **Mon
 | `/start` | everyone | Welcome screen with the rules, the permission/18+ warning and shortcut buttons |
 | `/help` | everyone | Interactive help: every topic opens from a button in the same message |
 | `/ussetting` | everyone | Personal settings. **Preset languages**: select any number of languages (selected ones show ✅), then **💾 Save**. Once a user has saved presets, the language picker shows **one extra green button — ⭐ Saved languages to use (N)** — which translates that whole set one file at a time, exactly like the normal language buttons |
+| `/ass` | everyone | Converts an SRT into the bot's ASS style — bold white Arial, thick black outline and soft shadow, centred near the bottom but raised so subtitles already burned into the video stay readable. Reply to an SRT with `/ass`, or run `/ass` and send the SRT next. `/ass box` swaps the outline for a translucent plate behind each line. Output is hardsub-ready: `ffmpeg -i input.mp4 -vf "ass=movie.ass" -c:a copy output.mp4` |
 | `/status` | everyone | Opens one **live** message per chat that refreshes itself every 6 seconds while work is running, with a 🔄 Refresh button and a 🛑 Cancel #N button per task (cancelling stops a download, upload or website stage). Asking `/status` again deletes your old message and shows a new one; other users' messages are never touched. It appears automatically when a task is queued. Each task is a numbered block: `■□` **stage** bar (not the website's translation percentage), `Step n/10`, the current stage, elapsed time and the sender's name, ID and @username. A batch also shows how many languages are done. Owners see every task; everyone else sees only their own |
 | `/cancel_id <n>` | everyone | Stops exactly one task by its `/status` number — a single translation, a whole multi-language batch, or an in-flight download/upload — without touching other tasks. The same action is on each live-status 🛑 button. Owners may stop anyone's task; a user may only stop their own |
 | `/broadcast <text>` | owner | Sends one plain-text message to every known user (or use it as a reply to a message), skipping banned users and reporting sent/failed/skipped counts |
@@ -124,6 +125,16 @@ Defaults stay compatible with earlier releases: with no `ALLOWED_USER_IDS` the b
 **Log channel.** Set `LOG_CHANNEL_ID` and promote the bot to administrator in that channel. After each successful delivery the bot posts the translated file with a caption containing the sender's name, `@username` (or "not set"), numeric ID, target language, original and delivered filename, and cue count. If the channel refuses the copy (missing rights, oversized file), the delivery to the user still succeeds and the failure is logged.
 
 **Practical limits.** Usage counters are one small document per delivered subtitle. `/leaderboard` and `/stats` use indexed queries, so they stay fast on a free Atlas cluster; the 512 MB quota is usually reached by years of heavy use, not weeks. Without MongoDB, counters are kept in memory only and reset on restart.
+
+### ASS style and hardsubbing
+
+`/ass` writes a self-contained ASS file so a single `ffmpeg` command reproduces the look:
+
+- **Text and structure:** bold white Arial, size 54 at a 1920×1080 canvas, thick black outline, soft shadow, centred at `MarginV=120` with 80 px side margins. The raised bottom margin leaves room for subtitles already burned into the video (for example Chinese lines), so both remain visible.
+- **Same output everywhere:** `PlayResX/PlayResY` and `ScaledBorderAndShadow: yes` make libass scale the style with the video, and `Arial` exists on Windows/macOS; Linux falls back to Liberation/Noto Sans.
+- **Line breaks and tags:** `<i>`/`<b>`/`<font>` markup from the SRT is removed, blank lines dropped, multi-line cues become `\N`, and literal `{`/`}` are escaped instead of starting an override tag.
+- **Background blur:** ASS cannot blur the video behind text — no renderer implements that. The nearest equivalent is an opaque plate with transparency, which `/ass box` produces (`BorderStyle=3`, `BackColour=&H78000000`). A true blur has to be applied to the video itself while burning the subtitles, not in the ASS file.
+- **Limits:** up to 25 MB / 100,000 cues per conversion; conversion runs off the event loop and uses the same temporary directory and MTProto path as translation for large SRTs.
 
 ## Development and testing
 

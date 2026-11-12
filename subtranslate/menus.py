@@ -12,7 +12,9 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import BadRequest
 from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes
 
+from .ass_export import MAX_ASS_SOURCE_BYTES
 from .config import FREE_PRESET_LIMIT
+from .subtitles import SubtitleError, subtitle_extension
 from .tasks import render_board
 
 logger = logging.getLogger(__name__)
@@ -78,6 +80,10 @@ TOPICS: dict[str, tuple[str, str]] = {
         "✅ SubViewer (.sbv)\n"
         "✅ WebVTT (.vtt)\n"
         "✅ Spruce STL (.stl) — text-based only\n\n"
+        "🎬 /ass — convert an SRT into the bot's ASS style: bold white text, thick "
+        "black outline, raised above subtitles already burned into the video, and "
+        "ready for ffmpeg hardsubbing. /ass box uses a translucent plate instead of "
+        "the outline (ASS cannot blur the video behind text).\n\n"
         "❌ Binary VobSub and EBU STL are not supported.\n"
         "❌ Archives, images and PDFs are not subtitles."
         ),
@@ -191,8 +197,8 @@ def help_menu_text() -> str:
     return ("ℹ️ <b>Help</b>\n\n"
             "Choose a topic below. Every topic opens in this message; use /start for the "
             "quick tour.\n\n"
-            "Commands: /start · /help · /ussetting · /status · /cancel_id · /stats · "
-            "/leaderboard · /cancel")
+            "Commands: /start · /help · /ussetting · /ass · /status · /cancel_id · "
+            "/stats · /leaderboard · /cancel")
 
 
 def _settings_summary(names: list[str]) -> str:
@@ -422,6 +428,17 @@ async def settings_callback(service, update: Update, context: ContextTypes.DEFAU
     await query.answer("That setting is unavailable.", show_alert=True)
 
 
+ASS_PROMPT = (
+    "🎬 <b>SRT → ASS</b>\n\n"
+    "Send the SRT you want converted, or reply to an SRT document with /ass.\n\n"
+    "• Bold white Arial with a thick black outline and soft shadow\n"
+    "• Centred near the bottom but raised, so subtitles already burned into the "
+    "video stay readable underneath\n"
+    "• Hardsub with <code>ffmpeg -i input.mp4 -vf \"ass=file.ass\" -c:a copy output.mp4</code>\n\n"
+    "ASS cannot blur the video behind text. Use <code>/ass box</code> for a "
+    "translucent plate behind each line instead."
+)
+
 STATUS_EMPTY = (
     "😴 <b>No active translation</b>\n\n"
     "Send a subtitle file to start one. /status lists your running and queued tasks, "
@@ -431,6 +448,30 @@ STATUS_EMPTY = (
 
 def _clip(text: str, limit: int = 3900) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "\n\n…"
+
+
+async def ass_command(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Convert an SRT to the styled ASS format, by reply or by the next file."""
+    if not await service.ensure_allowed(update):
+        return
+    message = update.effective_message
+    plate = bool(context.args) and str(context.args[0]).lower() in {"box", "plate", "blur"}
+    reply = message.reply_to_message
+    if reply is not None and reply.document is not None:
+        try:
+            extension = subtitle_extension(reply.document.file_name or "")
+        except SubtitleError:
+            extension = ""
+        if extension != ".srt":
+            await message.reply_text("Reply to an SRT file with /ass; other formats cannot be converted.")
+            return
+        if reply.document.file_size is not None and reply.document.file_size > MAX_ASS_SOURCE_BYTES:
+            await message.reply_text("That SRT is too large to convert; keep it under 25 MB.")
+            return
+        await service.convert_to_ass(reply, plate=plate)
+        return
+    service.wait_for_ass(update.effective_chat.id)
+    await message.reply_text(ASS_PROMPT, parse_mode="HTML")
 
 
 async def send_status(service, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -533,6 +574,8 @@ def install_menu_handlers(service, application) -> None:
     application.add_handler(CommandHandler(["help"], lambda update, context: send_help(
         service, update, context)))
     application.add_handler(CommandHandler("ussetting", lambda update, context: user_settings(
+        service, update, context)))
+    application.add_handler(CommandHandler("ass", lambda update, context: ass_command(
         service, update, context)))
     application.add_handler(CommandHandler("status", lambda update, context: send_status(
         service, update, context)))

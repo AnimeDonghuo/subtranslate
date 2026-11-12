@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 from .admin import install_admin_handlers
+from .ass_export import MAX_ASS_SOURCE_BYTES, ass_filename, srt_to_ass
 from .config import FREE_PRESET_LIMIT, Settings
 from .fileio import run_file_io, run_scan, wait_for_cleanup
 from .jobs import EnqueueResult, JobQueue, TranslationJob
@@ -84,6 +85,8 @@ class BotService:
         self._batch_cancellations: dict[int, set[asyncio.Event]] = {}
         self._single_cancellations: dict[int, set[asyncio.Event]] = {}
         self._proxy_input_chats: set[int] = set()
+        # Chats that ran /ass and are expected to send an SRT next.
+        self._ass_waiting: set[int] = set()
         self._proxy_scan_task: asyncio.Task | None = None
         self._proxy_scan_status: dict[str, int] = {}
         self.bot = None
@@ -389,6 +392,56 @@ class BotService:
         else:
             await update.effective_message.reply_text("Send a subtitle file as a document, then choose a language. /help")
 
+    def wait_for_ass(self, chat_id: int) -> None:
+        self._ass_waiting.add(chat_id)
+
+    async def convert_to_ass(self, message: Message, *, plate: bool = False) -> None:
+        """Convert the SRT attached to this message and send back a styled ASS."""
+        doc = message.document
+        if doc is None or self.bot is None:
+            return
+        if doc.file_size is not None and doc.file_size > MAX_ASS_SOURCE_BYTES:
+            await message.reply_text("That SRT is too large to convert; keep it under 25 MB.")
+            return
+        job = TranslationJob(
+            chat_id=message.chat.id,
+            original_message_id=message.message_id,
+            file_id=doc.file_id,
+            file_name=doc.file_name or "subtitle.srt",
+            file_size=doc.file_size,
+            language_code="ass",
+            language_name="ASS",
+        )
+        try:
+            async with self._job_resources() as (directory, transport):
+                if doc.file_size is not None and doc.file_size > BOT_API_DOWNLOAD_BYTES:
+                    path = directory / "source.srt"
+                    await transport.download(job, path)
+                    data = await run_file_io(path.read_bytes)
+                else:
+                    telegram_file = await self.bot.get_file(doc.file_id)
+                    data = bytes(await telegram_file.download_as_bytearray(read_timeout=120))
+            content, cue_count = await run_file_io(srt_to_ass, data, plate)
+        except (SubtitleError, LargeTransferError) as exc:
+            await message.reply_text(f"Could not convert: {exc}")
+            return
+        except TelegramError as exc:
+            logger.warning("ASS conversion download failed (%s)", type(exc).__name__)
+            await message.reply_text("Telegram could not download the SRT. Please resend it and try again.")
+            return
+        except OSError as exc:
+            logger.warning("Temporary storage failed during ASS conversion (%s)", type(exc).__name__)
+            await message.reply_text("Could not use temporary storage. Check disk space and try again.")
+            return
+        filename = ass_filename(job.file_name)
+        escaped = html.escape(filename, quote=False)
+        await message.reply_document(
+            document=InputFile(BytesIO(content), filename=filename),
+            caption=(f"🎬 <b>ASS ready</b> · {cue_count:,} cues\n"
+                     f"Hardsub: <code>ffmpeg -i input.mp4 -vf \"ass={escaped}\" -c:a copy output.mp4</code>"),
+            parse_mode="HTML",
+        )
+
     async def document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_private_and_allowed(update):
             return
@@ -423,6 +476,13 @@ class BotService:
             return
         if extension != ".srt" and doc.file_size is not None and doc.file_size > MAX_INPUT_BYTES:
             await message.reply_text("Non-SRT formats are limited to 1 MB. Try SRT for larger files.")
+            return
+        if chat_id in self._ass_waiting:
+            self._ass_waiting.discard(chat_id)
+            if extension != ".srt":
+                await message.reply_text("Send an SRT file for /ass; other formats cannot be converted.")
+                return
+            await self.convert_to_ass(message)
             return
         # Explicitly reply to the original document. Telegram includes it in
         # callback messages, so a language selection survives Koyeb sleeping.
