@@ -65,6 +65,66 @@ async def test_mtproto_uses_bot_identity_fresh_message_and_private_peer(tmp_path
     client.disconnect.assert_awaited_once()
 
 
+def chunked_client(payload: bytes):
+    """A client that serves MTProto parts for offset/stride requests."""
+    message = SimpleNamespace(chat_id=42, document=SimpleNamespace(size=len(payload)),
+                              get_input_chat=AsyncMock(return_value=object()))
+    requests = []
+
+    async def iter_download(received, *, offset=0, stride=None, request_size=524288, file_size=None):
+        assert received is message
+        assert file_size == len(payload)
+        requests.append((offset, stride))
+        position = offset
+        while position < len(payload):
+            yield payload[position:position + request_size]
+            position += stride or request_size
+
+    async def download_media(received, *, file):
+        assert received is message
+        Path(file).write_bytes(payload)
+        return file
+
+    client = SimpleNamespace(
+        connect=AsyncMock(), sign_in=AsyncMock(),
+        get_me=AsyncMock(return_value=SimpleNamespace(id=12345, bot=True)),
+        get_messages=AsyncMock(return_value=message),
+        iter_download=iter_download, download_media=AsyncMock(side_effect=download_media),
+        upload_file=AsyncMock(return_value=object()), send_file=AsyncMock(), disconnect=AsyncMock(),
+    )
+    return client, message, requests
+
+
+async def test_large_download_fetches_parts_over_several_connections(tmp_path):
+    payload = bytes(range(256)) * 12_000            # ~3 MB, several parts each
+    client, _message, requests = chunked_client(payload)
+    transfer = LargeTelegramTransfer(SETTINGS, client=client)
+    path = tmp_path / "source.sub"
+
+    await transfer.download(replace(JOB, file_name="movie.sub", file_size=len(payload)), path)
+
+    assert path.read_bytes() == payload
+    # One stream per worker, each starting at its own part and striding.
+    assert len(requests) == 4
+    assert {offset for offset, _stride in requests} == {0, 524288, 1_048_576, 1_572_864}
+    assert {stride for _offset, stride in requests} == {4 * 524288}
+    client.download_media.assert_not_awaited()
+    await transfer.close()
+
+
+async def test_small_download_still_uses_one_request(tmp_path):
+    client, _message, requests = chunked_client(SOURCE)
+    transfer = LargeTelegramTransfer(SETTINGS, client=client)
+    path = tmp_path / "source.srt"
+
+    await transfer.download(JOB, path)
+
+    assert requests == []
+    client.download_media.assert_awaited_once()
+    assert path.read_bytes() == SOURCE
+    await transfer.close()
+
+
 async def test_missing_credentials_only_block_large_transfer():
     transfer = LargeTelegramTransfer(Settings("12345:TEST-TOKEN", "https://example.com"))
     with pytest.raises(LargeTransferError, match="API_ID and API_HASH"):

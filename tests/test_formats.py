@@ -67,6 +67,17 @@ def test_ssa_is_translated_as_srt_and_restored_with_its_own_styles():
     assert restored.unchanged is False and restored.cue_count == 2
 
 
+def test_utf16_sub_viewer_sub_is_still_read_as_text():
+    text = ("[INFORMATION]\r\n[TITLE]Example\r\n[END INFORMATION]\r\n[SUBTITLE]\r\n"
+            "00:00:01.00,00:00:03.00\r\nHello[br]world\r\n\r\n")
+    source = prepare_subtitle(text.encode("utf-16"), "movie.sub")
+    assert source.extension == ".sub"
+    assert len(source.cues) == 1
+    assert source.utf8.decode("utf-8").startswith("[INFORMATION]")
+    bridged = subtitle_for_website(source)
+    assert bridged.extension == ".srt" and b"Hello\nworld" in bridged.utf8
+
+
 def test_binary_sub_is_explained_instead_of_silently_failing():
     import pytest
 

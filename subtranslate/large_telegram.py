@@ -31,6 +31,14 @@ BOT_API_DOWNLOAD_BYTES = 20_000_000
 BOT_API_UPLOAD_BYTES = 50_000_000
 # Telegram's own bot limit over MTProto, which API_ID/API_HASH unlock.
 TELEGRAM_MAX_BYTES = 2_000_000_000
+# MTProto parts are fetched over several connections at once. A single
+# sequential stream is the slowest part of a large download; every subtitle
+# format (not only SRT) uses these settings.
+DOWNLOAD_CHUNK_BYTES = 512 * 1024
+DOWNLOAD_WORKERS = 4
+# Below this size one request is already fast enough to be worth no extra
+# connections (and Telegram charges per-request overhead).
+PARALLEL_DOWNLOAD_MIN_BYTES = 2 * 1024 * 1024
 
 
 class LargeTransferError(Exception):
@@ -115,13 +123,50 @@ class LargeTelegramTransfer:
         self._message_key = key
         return message
 
+    def _worker_count(self, size: int | None) -> int:
+        """How many parallel MTProto streams this download deserves."""
+        if not size or size < PARALLEL_DOWNLOAD_MIN_BYTES:
+            return 1
+        return max(1, min(DOWNLOAD_WORKERS, size // DOWNLOAD_CHUNK_BYTES))
+
+    async def _parallel_download(self, message, path: Path, size: int, workers: int) -> None:
+        """Fetch interleaved MTProto parts over ``workers`` connections at once."""
+        # Preallocate so each worker can write at its own offset.
+        with path.open("wb") as handle:
+            handle.truncate(size)
+        stride = workers * DOWNLOAD_CHUNK_BYTES
+
+        async def worker(index: int) -> None:
+            position = index * DOWNLOAD_CHUNK_BYTES
+            with path.open("r+b") as handle:
+                async for piece in self.client.iter_download(
+                        message, offset=position, stride=stride,
+                        request_size=DOWNLOAD_CHUNK_BYTES, file_size=size):
+                    if not piece:
+                        break
+                    handle.seek(position)
+                    handle.write(piece)
+                    position += stride
+
+        await asyncio.gather(*(worker(index) for index in range(workers)))
+
+    async def _download_to(self, message, path: Path, size: int | None) -> None:
+        workers = self._worker_count(size)
+        if size is None or workers < 2 or getattr(self.client, "iter_download", None) is None:
+            saved = await self.client.download_media(message, file=str(path))
+            if not saved or not path.is_file():
+                raise OSError("download did not create the destination")
+            return
+        await self._parallel_download(message, path, size, workers)
+
     async def download(self, job: TranslationJob, path: Path) -> None:
         message = await self._original(job)
         ensure_telegram_size(message.document.size if message.document else None)
         ensure_telegram_size(job.file_size)
         try:
-            saved = await self.client.download_media(message, file=str(path))
-            if not saved or not path.is_file():
+            size = message.document.size if message.document else job.file_size
+            await self._download_to(message, path, size)
+            if not path.is_file():
                 raise OSError("download did not create the destination")
             actual = path.stat().st_size
             document_size = message.document.size

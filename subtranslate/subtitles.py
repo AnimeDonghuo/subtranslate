@@ -104,6 +104,8 @@ def subtitle_extension(filename: str) -> str:
     return extension
 
 
+# MPEG program-stream pack header, the first bytes of a binary VobSub .sub.
+_VOBSUB_SIGNATURE = (b"\x00\x00\x01\xba", b"\x00\x00\x01\xb9")
 _TIME = r"\d+:\d{2}:\d{2}\.\d{1,3}"
 _SBV_LINE = re.compile(rf"^[ \t]*({_TIME})[ \t]*,[ \t]*({_TIME})[ \t]*\r?$", re.MULTILINE)
 _MICRODVD_LINE = re.compile(r"^[ \t]*\{(\d+)\}\{(\d+)\}([^\r\n]*)", re.MULTILINE)
@@ -173,8 +175,9 @@ def _parse_other(text: str, extension: str) -> list[OtherCue]:
         if extension == ".stl":
             raise SubtitleError("Use a text-based Spruce STL file; binary EBU STL is not supported.")
         if extension == ".sub":
-            raise SubtitleError("This .sub has no text cues. A binary VobSub .sub stores images, "
-                                "so it cannot be translated without OCR; extract a text SRT first.")
+            raise SubtitleError("This .sub has no readable text cues. MicroDVD (frames) and "
+                                "SubViewer (timestamps) are supported; a binary VobSub .sub stores "
+                                "images and needs OCR, so extract a text SRT first.")
         raise SubtitleError("The subtitle has no readable cues in this format.")
     if any(cue.end < cue.start or (isinstance(cue.start, int) and cue.start < 0) or not cue.content.strip()
            for cue in cues):
@@ -191,9 +194,11 @@ def prepare_subtitle(data: bytes, filename: str = "subtitle.srt") -> PreparedSub
     extension = subtitle_extension(filename)
     # SRT is streamed from disk for big files by the bot; other text formats are
     # parsed in memory, and the caller checks the host's free memory first.
-    if extension == ".sub" and b"\x00" in data[:8192]:
-        raise SubtitleError("This .sub is not a text file: a binary VobSub .sub stores images, "
-                            "so it cannot be translated without OCR. Extract a text SRT first.")
+    # Only a real MPEG-PS pack signature means VobSub pictures. A UTF-16 text
+    # .sub is full of NUL bytes and must still be read normally.
+    if extension == ".sub" and data.startswith(_VOBSUB_SIGNATURE):
+        raise SubtitleError("This is a binary VobSub .sub made of images, so it cannot be "
+                            "translated without OCR. Extract a text SRT first.")
     text = decode_subtitle(data)
     encoded = text.encode("utf-8")
     cues = _parse(text) if extension == ".srt" else _parse_other(text, extension)
