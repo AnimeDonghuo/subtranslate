@@ -13,8 +13,6 @@ from .fileio import run_scan
 from .languages import LanguageCatalog
 from .large_srt import prepare_file_srt
 from .subtitles import (
-    MAX_INPUT_BYTES,
-    SubtitleError,
     prepare_subtitle,
     subtitle_extension,
     translated_filename,
@@ -30,8 +28,6 @@ async def _run(args) -> None:
         raise ValueError("Unknown target language code; check subtranslate/languages.tsv")
     path = Path(args.file)
     extension = subtitle_extension(path.name)
-    if extension != ".srt" and path.stat().st_size > MAX_INPUT_BYTES:
-        raise SubtitleError("Non-SRT formats are limited to 1 MB. Try SRT for larger files.")
     output = Path(args.output_dir) / translated_filename(path.name, name)
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite {output}")

@@ -10,10 +10,13 @@ import pysubs2
 import srt
 from charset_normalizer import from_bytes
 
-MAX_INPUT_BYTES = 1_000_000
-MAX_OUTPUT_BYTES = 5_000_000
-MAX_CUES = 3000
-SUPPORTED_EXTENSIONS = frozenset({".srt", ".ass", ".sub", ".sbv", ".vtt", ".stl"})
+# No bot-wide size or cue cap: SRT is streamed from disk, other text formats are
+# bounded by the host's free memory and by Telegram's own ~2 GB file limit.
+MAX_OUTPUT_BYTES = 2_000_000_000
+SUPPORTED_EXTENSIONS = frozenset({".srt", ".ass", ".ssa", ".sub", ".sbv", ".vtt", ".stl"})
+# Formats the translation site does not handle reliably are bridged through
+# SRT. ASS, SBV, VTT and STL are uploaded in their own format, as before.
+SITE_BRIDGED = frozenset({".ssa", ".sub"})
 
 
 class SubtitleError(ValueError):
@@ -94,7 +97,10 @@ def subtitle_extension(filename: str) -> str:
     basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
     extension = "." + basename.rsplit(".", 1)[-1].lower() if "." in basename else ""
     if extension not in SUPPORTED_EXTENSIONS:
-        raise SubtitleError("Please send an SRT, ASS, SUB, SBV, VTT, or text-based STL subtitle file.")
+        hint = (" Image-based subtitles (.sup or binary VobSub .sub/.idx) cannot be "
+                "translated without OCR; extract a text SRT first.")
+        raise SubtitleError("Please send an SRT, ASS, SSA, SUB, SBV, VTT, or text-based "
+                            "STL subtitle file." + hint)
     return extension
 
 
@@ -132,10 +138,12 @@ def _parse_sbv(text: str) -> list[OtherCue]:
 
 def _parse_other(text: str, extension: str) -> list[OtherCue]:
     try:
-        if extension in {".ass", ".vtt"}:
+        if extension in {".ass", ".ssa", ".vtt"}:
             if extension == ".vtt" and not text.lstrip().startswith("WEBVTT"):
                 raise SubtitleError("The VTT subtitle must start with WEBVTT.")
             parsed = pysubs2.SSAFile.from_string(text, format_=extension[1:])
+            if not parsed.events:
+                raise SubtitleError("The subtitle has no readable cues in this format.")
             cues = [OtherCue(event.start, event.end, event.plaintext)
                     for event in parsed.events if not event.is_comment]
         elif extension == ".sbv":
@@ -164,9 +172,10 @@ def _parse_other(text: str, extension: str) -> list[OtherCue]:
     if not cues:
         if extension == ".stl":
             raise SubtitleError("Use a text-based Spruce STL file; binary EBU STL is not supported.")
+        if extension == ".sub":
+            raise SubtitleError("This .sub has no text cues. A binary VobSub .sub stores images, "
+                                "so it cannot be translated without OCR; extract a text SRT first.")
         raise SubtitleError("The subtitle has no readable cues in this format.")
-    if len(cues) > MAX_CUES:
-        raise SubtitleError(f"The file has more than {MAX_CUES:,} cues. Split it and try again.")
     if any(cue.end < cue.start or (isinstance(cue.start, int) and cue.start < 0) or not cue.content.strip()
            for cue in cues):
         raise SubtitleError("The subtitle contains an empty cue or an invalid timestamp.")
@@ -180,37 +189,57 @@ def _parse_other(text: str, extension: str) -> list[OtherCue]:
 
 def prepare_subtitle(data: bytes, filename: str = "subtitle.srt") -> PreparedSubtitle:
     extension = subtitle_extension(filename)
-    # Non-SRT formats still use their existing in-memory restoration path.
-    # Large SRTs are routed through the disk-backed parser by the bot/CLI.
-    if extension != ".srt" and len(data) > MAX_INPUT_BYTES:
-        raise SubtitleError("This non-SRT subtitle format is limited to 1 MB. Try SRT for larger files.")
+    # SRT is streamed from disk for big files by the bot; other text formats are
+    # parsed in memory, and the caller checks the host's free memory first.
+    if extension == ".sub" and b"\x00" in data[:8192]:
+        raise SubtitleError("This .sub is not a text file: a binary VobSub .sub stores images, "
+                            "so it cannot be translated without OCR. Extract a text SRT first.")
     text = decode_subtitle(data)
     encoded = text.encode("utf-8")
-    if extension != ".srt" and len(encoded) > MAX_INPUT_BYTES:
-        raise SubtitleError("This non-SRT subtitle exceeds 1 MB after UTF-8 conversion. Try SRT instead.")
     cues = _parse(text) if extension == ".srt" else _parse_other(text, extension)
     return PreparedSubtitle(utf8=encoded, cues=cues, extension=extension)
 
 
-def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
-    """Bridge text .sub variants through SRT when the site's SUB parser drops cues.
+def _cue_milliseconds(value: int | tuple[int, ...]) -> int:
+    """Turn a millisecond count, or an STL (h, m, s, centiseconds) tuple, into ms."""
+    if isinstance(value, int):
+        return value
+    hours, minutes, seconds, centiseconds = (list(value) + [0, 0, 0, 0])[:4]
+    return ((hours * 60 + minutes) * 60 + seconds) * 1000 + centiseconds * 10
 
-    Synthetic times only identify cues during translation: the original .sub
-    frame numbers or timestamps remain untouched in the final output.
+
+def _bridge_text(content: str, extension: str) -> str:
+    """Make cue text safe to send as plain SRT lines."""
+    if extension == ".sub":
+        # MicroDVD uses |, SubViewer uses [br]; both become real SRT lines.
+        return re.sub(r"\[br\]|\|", "\n", content, flags=re.IGNORECASE)
+    if extension in {".sbv", ".stl"}:
+        return re.sub(r"\[br\]|\|", "\n", content, flags=re.IGNORECASE)
+    return content
+
+
+def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
+    """Send formats the site parses unreliably as an equivalent SRT.
+
+    Cue text and real timings are preserved so the translated SRT can be
+    spliced back into the untouched original file. Only MicroDVD .sub needs
+    synthetic times, because its frame numbers are not real timestamps.
     """
-    if source.extension != ".sub":
+    if source.extension not in SITE_BRIDGED:
         return source
-    text = source.utf8.decode("utf-8")
-    microdvd = bool(_MICRODVD_LINE.search(text))
+    synthetic = source.extension == ".sub" and bool(_MICRODVD_LINE.search(source.utf8.decode("utf-8")))
     site_cues = []
     for index, cue in enumerate(source.cues, start=1):
-        content = cue.content.replace("|", "\n") if microdvd else re.sub(r"\[br\]", "\n", cue.content, flags=re.IGNORECASE)
-        start = timedelta(seconds=(index - 1) * 2)
-        site_cues.append(srt.Subtitle(index=index, start=start, end=start + timedelta(seconds=1), content=content))
-    encoded = srt.compose(site_cues, reindex=False).encode("utf-8")
-    if len(encoded) > MAX_INPUT_BYTES:
-        raise SubtitleError("The SUB file exceeds 1 MB when prepared for translation. Split it and try again.")
-    return PreparedSubtitle(utf8=encoded, cues=site_cues, extension=".srt")
+        if synthetic:
+            start = timedelta(seconds=(index - 1) * 2)
+            end = start + timedelta(seconds=1)
+        else:
+            start = timedelta(milliseconds=_cue_milliseconds(cue.start))
+            end = timedelta(milliseconds=_cue_milliseconds(cue.end))
+        site_cues.append(srt.Subtitle(index=index, start=start, end=end,
+                                      content=_bridge_text(cue.content, source.extension)))
+    return PreparedSubtitle(utf8=srt.compose(site_cues, reindex=False).encode("utf-8"),
+                            cues=site_cues, extension=".srt")
 
 
 _CJK_TARGETS = frozenset({"zh-CN", "zh-TW", "yue", "ja", "ko"})
@@ -292,34 +321,59 @@ def obviously_untranslated_run(source: PreparedSubtitle, result: TranslatedSubti
     return 0
 
 
+def _block_spans(original: str, pattern: re.Pattern) -> list[tuple[int, int, str]]:
+    """Text spans after each timing line, plus the separator used for line breaks."""
+    matches = list(pattern.finditer(original))
+    spans = []
+    for index, match in enumerate(matches):
+        start = match.end()
+        limit = matches[index + 1].start() if index + 1 < len(matches) else len(original)
+        segment = original[start:limit]
+        leading = len(segment) - len(segment.lstrip())
+        trailing = len(segment) - len(segment.rstrip())
+        separator = "[br]" if re.search(r"\[br\]", segment, flags=re.IGNORECASE) else (
+            "\r\n" if "\r\n" in segment else "\n")
+        spans.append((start + leading, start + len(segment) - trailing, separator))
+    return spans
+
+
+def _text_spans(original: str, extension: str) -> list[tuple[int, int, str]]:
+    """Character spans of every cue's text in the original .sub file."""
+    if extension != ".sub":
+        raise SubtitleError("Unsupported subtitle format.")
+    if _MICRODVD_LINE.search(original):
+        matches = list(_MICRODVD_LINE.finditer(original))
+        return [(match.start(3), match.end(3), "|") for index, match in enumerate(matches)
+                if not _is_frame_rate_declaration(index, match)]
+    # Text-based SubViewer files use SBV-like timings.
+    return _block_spans(original, _SBV_LINE)
+
+
 def restore_subtitle_from_website(source: PreparedSubtitle, site_result: TranslatedSubtitle) -> TranslatedSubtitle:
-    """Put translated SRT cue text back into a text .sub without changing its timing."""
-    if source.extension != ".sub":
+    """Put translated cue text back into the original file, leaving everything else untouched."""
+    if source.extension not in SITE_BRIDGED:
+        # The site returns these formats itself: SRT as downloaded, ASS merged
+        # onto its own styling, and SBV/VTT/STL uploaded and returned as-is.
         return site_result
     translated_cues = _parse(decode_subtitle(site_result.content), is_output=True)
+    if source.extension == ".ssa":
+        original_ssa = pysubs2.SSAFile.from_string(source.utf8.decode("utf-8"), format_="ssa")
+        events = [event for event in original_ssa.events if not event.is_comment]
+        if len(events) != len(translated_cues):
+            raise SubtitleError("The translated SSA cues could not be matched to the original. Please try again.")
+        for event, cue in zip(events, translated_cues):
+            event.text = cue.content.replace("\r\n", "\n").replace("\n", "\\N")
+        restored = original_ssa.to_string(format_="ssa").encode("utf-8")
+        return verify_and_merge(source, restored)
     original = source.utf8.decode("utf-8")
-    microdvd = list(_MICRODVD_LINE.finditer(original))
-    spans: list[tuple[int, int, str]] = []
-    if microdvd:
-        for index, match in enumerate(microdvd):
-            if not _is_frame_rate_declaration(index, match):
-                spans.append((match.start(3), match.end(3), "|"))
-    else:
-        matches = list(_SBV_LINE.finditer(original))
-        for index, match in enumerate(matches):
-            start = match.end()
-            end = matches[index + 1].start() if index + 1 < len(matches) else len(original)
-            segment = original[start:end]
-            leading = len(segment) - len(segment.lstrip())
-            trailing = len(segment) - len(segment.rstrip())
-            separator = "[br]" if re.search(r"\[br\]", segment, flags=re.IGNORECASE) else ("\r\n" if "\r\n" in segment else "\n")
-            spans.append((start + leading, end - trailing, separator))
+    spans = _text_spans(original, source.extension)
     if len(spans) != len(translated_cues):
-        raise SubtitleError("The translated SUB cues could not be matched to the original. Please try again.")
+        raise SubtitleError(f"The translated {source.extension[1:].upper()} cues could not be matched "
+                            "to the original. Please try again.")
     for (start, end, separator), cue in reversed(list(zip(spans, translated_cues))):
         replacement = cue.content.replace("\r\n", "\n").replace("\r", "\n").replace("\n", separator)
         original = original[:start] + replacement + original[end:]
-    # Independently re-check the restored frame numbers or timestamps.
+    # Independently re-check the restored timings and cue text.
     return verify_and_merge(source, original.encode("utf-8"))
 
 

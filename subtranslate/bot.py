@@ -22,9 +22,10 @@ from telegram.ext import (
 
 from .admin import install_admin_handlers
 from .ass_export import MAX_ASS_SOURCE_BYTES, ass_filename, srt_to_ass
+from .commands import install_sync_handlers
 from .config import FREE_PRESET_LIMIT, Settings
 from .fileio import run_file_io, run_scan, wait_for_cleanup
-from .jobs import EnqueueResult, JobQueue, TranslationJob
+from .jobs import EnqueueResult, JobQueue, TranslationJob, available_memory_mb
 from .languages import LanguageCatalog, confirm_all_keyboard, language_keyboard
 from .large_srt import prepare_file_srt
 from .large_telegram import (
@@ -33,13 +34,13 @@ from .large_telegram import (
     LargeTelegramTransfer,
     LargeTransferError,
 )
+from .longform import translate_in_parts
 from .menus import install_menu_handlers
 from .progress import ProgressMessage
 from .proxies import parse_proxy_candidates
 from .status_board import StatusBoards
 from .store import Database
 from .subtitles import (
-    MAX_INPUT_BYTES,
     SubtitleError,
     prepare_subtitle,
     subtitle_extension,
@@ -57,6 +58,27 @@ PREMIUM_ALERT = (
 )
 MAX_PROXY_INPUT_BYTES = 19 * 1024 * 1024
 MAX_PROXY_ENTRIES = 80_000
+
+
+def _in_memory_limit() -> int | None:
+    """Bytes of non-SRT subtitle text this server can safely convert in memory."""
+    free_mb = available_memory_mb()
+    if free_mb is None:
+        return None
+    return max(24, free_mb // 3) * 1_000_000
+
+
+def _check_in_memory_size(file_size: int | None, extension: str) -> None:
+    """Non-SRT formats are parsed in memory, so scale the ceiling to free RAM."""
+    if extension == ".srt" or file_size is None:
+        return
+    limit = _in_memory_limit()
+    if limit is not None and file_size > limit:
+        raise SubtitleError(
+            f"{extension[1:].upper()} files are converted in memory, and this one is "
+            f"{file_size / 1_000_000:.0f} MB while this server can spare about "
+            f"{limit // 1_000_000:,.0f} MB. Send the SRT version of this file instead."
+        )
 
 
 class JobCancelled(Exception):
@@ -100,6 +122,7 @@ class BotService:
         # registered before the catch-all job callback so it cannot swallow them.
         install_menu_handlers(self, application)
         install_admin_handlers(self, application)
+        install_sync_handlers(self, application)
         application.add_handler(MessageHandler(filters.Document.ALL, self.document))
         application.add_handler(CallbackQueryHandler(self.callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.other_text))
@@ -474,9 +497,6 @@ class BotService:
         if doc.file_size is not None and doc.file_size <= 0:
             await message.reply_text("Please send a non-empty subtitle file.")
             return
-        if extension != ".srt" and doc.file_size is not None and doc.file_size > MAX_INPUT_BYTES:
-            await message.reply_text("Non-SRT formats are limited to 1 MB. Try SRT for larger files.")
-            return
         if chat_id in self._ass_waiting:
             self._ass_waiting.discard(chat_id)
             if extension != ".srt":
@@ -577,15 +597,12 @@ class BotService:
             return
         doc = original.document
         try:
-            extension = subtitle_extension(doc.file_name or "")
+            subtitle_extension(doc.file_name or "")
         except SubtitleError:
             await query.answer("Please send a supported subtitle file again.", show_alert=True)
             return
         if doc.file_size is not None and doc.file_size <= 0:
             await query.answer("The file must not be empty.", show_alert=True)
-            return
-        if extension != ".srt" and doc.file_size is not None and doc.file_size > MAX_INPUT_BYTES:
-            await query.answer("Non-SRT formats are limited to 1 MB. Try SRT for larger files.", show_alert=True)
             return
         job = TranslationJob(
             chat_id=message.chat.id,
@@ -667,30 +684,39 @@ class BotService:
             finally:
                 await transport.close()
 
+    async def _prepare_downloaded(self, path: Path, job: TranslationJob, extension: str):
+        """Turn a downloaded file into subtitles, SRT from disk and the rest in memory."""
+        if extension == ".srt":
+            return await run_scan(prepare_file_srt, path)
+        data = await run_file_io(path.read_bytes)
+        return await asyncio.to_thread(prepare_subtitle, bytes(data), job.file_name)
+
     async def _download_source(self, job: TranslationJob, directory: Path, transport: LargeTelegramTransfer):
         extension = subtitle_extension(job.file_name)
         path = directory / "source.srt"
-        if extension == ".srt" and job.file_size is not None and job.file_size > BOT_API_DOWNLOAD_BYTES:
+        _check_in_memory_size(job.file_size, extension)
+        if job.file_size is not None and job.file_size > BOT_API_DOWNLOAD_BYTES:
+            # The Bot API cannot serve files this large; use MTProto for every
+            # supported format, not only SRT.
             await transport.download(job, path)
-            return await run_scan(prepare_file_srt, path)
+            return await self._prepare_downloaded(path, job, extension)
         try:
             telegram_file = await self.bot.get_file(job.file_id)
         except BadRequest:
             # Some updates do not include size; the public endpoint can reject
             # an oversized file before returning metadata. Try the original
             # message over MTProto if credentials are configured.
-            if extension != ".srt" or not self.settings.api_id or not self.settings.api_hash:
+            if not self.settings.api_id or not self.settings.api_hash:
                 raise
             await transport.download(job, path)
-            return await run_scan(prepare_file_srt, path)
+            return await self._prepare_downloaded(path, job, extension)
         file_size = telegram_file.file_size if telegram_file.file_size is not None else job.file_size
         if file_size is not None and file_size <= 0:
             raise SubtitleError("The subtitle file is empty.")
-        if extension != ".srt" and file_size is not None and file_size > MAX_INPUT_BYTES:
-            raise SubtitleError("Non-SRT formats are limited to 1 MB. Try SRT for larger files.")
-        if extension == ".srt" and file_size is not None and file_size > BOT_API_DOWNLOAD_BYTES:
+        _check_in_memory_size(file_size, extension)
+        if file_size is not None and file_size > BOT_API_DOWNLOAD_BYTES:
             await transport.download(job, path)
-            return await run_scan(prepare_file_srt, path)
+            return await self._prepare_downloaded(path, job, extension)
         data = await telegram_file.download_as_bytearray(read_timeout=60)
         if not data or (file_size is not None and len(data) != file_size):
             raise SubtitleError("The Telegram download was empty or incomplete. Please send the file again.")
@@ -848,7 +874,15 @@ class BotService:
                     deadline.reschedule(loop.time() + seconds)
                 progress.set_stage(stage)
 
-            return await translator.translate(source, code, on_progress=update)
+            async def translate(part_source):
+                return await translator.translate(part_source, code, on_progress=update)
+
+            async def on_part(index: int, total: int) -> None:
+                progress.set_stage(f"translating part {index}/{total} of a long subtitle")
+
+            # Only SRTs longer than four hours are split; shorter files and
+            # every other format take the single-session path unchanged.
+            return await translate_in_parts(translate, source, code, on_part=on_part)
 
     async def process_job(self, job: TranslationJob) -> None:
         try:

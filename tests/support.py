@@ -27,6 +27,10 @@ class FakeBot:
         self.next_id = 500
         self.fail_chat_ids = set()
         self.files = {}
+        self.commands = []
+
+    async def set_my_commands(self, commands, scope=None, **kwargs):
+        self.commands.append((list(commands), scope))
 
     async def get_file(self, file_id=None, **kwargs):
         payload = self.files.get(file_id, b"")

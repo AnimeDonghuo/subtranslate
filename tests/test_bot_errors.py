@@ -11,7 +11,7 @@ from subtranslate.bot import BotService
 from subtranslate.config import Settings
 from subtranslate.jobs import TranslationJob
 from subtranslate.languages import LanguageCatalog
-from subtranslate.subtitles import MAX_INPUT_BYTES, TranslatedSubtitle
+from subtranslate.subtitles import TranslatedSubtitle
 from subtranslate.website import WebsiteError
 
 VALID_SRT = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
@@ -50,7 +50,7 @@ async def test_invalid_srt_is_rejected_before_upload_to_site(service):
 
 
 async def test_checks_downloaded_size_even_if_metadata_claims_it_is_small(service):
-    service.bot.get_file.return_value = telegram_file(b"x" * (MAX_INPUT_BYTES + 1), size=10)
+    service.bot.get_file.return_value = telegram_file(b"x" * 2048, size=10)
     await service.process_job(JOB)
     assert "incomplete" in last_notice(service)
     service.translator.translate.assert_not_awaited()

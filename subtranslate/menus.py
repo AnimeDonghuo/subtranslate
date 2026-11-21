@@ -74,12 +74,16 @@ TOPICS: dict[str, tuple[str, str]] = {
     "formats": (
         "🗂 Supported formats",
         ("🗂 <b>Supported formats</b>\n\n"
-        "✅ SRT (.srt) — full support, largest files, no cue cap\n"
-        "✅ ASS / SSA (.ass) — source styles are kept\n"
-        "✅ SubViewer / MicroDVD (.sub) — original timings are kept\n"
-        "✅ SubViewer (.sbv)\n"
-        "✅ WebVTT (.vtt)\n"
-        "✅ Spruce STL (.stl) — text-based only\n\n"
+        "✅ SRT (.srt) — no cue cap; files beyond the bot API limit are fetched "
+        "through MTProto, up to Telegram's 2 GB\n"
+        "✅ ASS (.ass) — source styles are kept\n"
+        "✅ SSA (.ssa) — converted to the website's format and restored afterwards\n"
+        "✅ SubViewer / MicroDVD (.sub) — original timings and frame numbers are kept\n"
+        "✅ SubViewer (.sbv), WebVTT (.vtt), Spruce STL (.stl) — text-based only\n\n"
+        "Files the website cannot read are translated as SRT and converted back to "
+        "your original format and styling; only the translated words change. Non-SRT "
+        "files are converted in memory, so their size is limited by this server's "
+        "free RAM, not by a fixed cap.\n\n"
         "🎬 /ass — convert an SRT into the bot's ASS style: bold white text, thick "
         "black outline, raised above subtitles already burned into the video, and "
         "ready for ffmpeg hardsubbing. /ass box uses a translucent plate instead of "
@@ -198,7 +202,9 @@ def help_menu_text() -> str:
             "Choose a topic below. Every topic opens in this message; use /start for the "
             "quick tour.\n\n"
             "Commands: /start · /help · /ussetting · /ass · /status · /cancel_id · "
-            "/stats · /leaderboard · /cancel")
+            "/stats · /leaderboard · /cancel\n\n"
+            "Owner: /sync (or /resync) re-registers this command menu with Telegram, "
+            "so newly added commands appear in the ☰ menu.")
 
 
 def _settings_summary(names: list[str]) -> str:

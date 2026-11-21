@@ -2,8 +2,6 @@ import pytest
 import srt
 
 from subtranslate.subtitles import (
-    MAX_CUES,
-    MAX_INPUT_BYTES,
     SubtitleError,
     prepare_subtitle,
     restore_subtitle_from_website,
@@ -84,17 +82,21 @@ def test_rejects_changed_timing_or_dropped_cues():
         verify_and_merge(prepared, TRANSLATED.split("\n\n2\n")[0].encode())
 
 
-def test_reject_invalid_and_oversized_files():
+def test_reject_invalid_files():
     for data in [b"", b"Not a subtitle file", b"\x00\x01\x00\x01"]:
         with pytest.raises(SubtitleError):
             prepare_subtitle(data)
-    with pytest.raises(SubtitleError, match="1 MB"):
-        prepare_subtitle(b"x" * (MAX_INPUT_BYTES + 1), "movie.vtt")
+    with pytest.raises(SubtitleError, match="Image-based subtitles"):
+        prepare_subtitle(b"[VobSub data]", "movie.sup")
 
 
-def test_srt_has_no_3000_cue_limit():
-    many = "".join(f"{i}\n00:00:01,000 --> 00:00:02,000\nHi\n\n" for i in range(1, MAX_CUES + 2))
-    assert len(prepare_subtitle(many.encode()).cues) == MAX_CUES + 1
+def test_no_fixed_cue_or_size_limit_for_text_formats():
+    many = "".join(f"{i}\n00:00:01,000 --> 00:00:02,000\nHi\n\n" for i in range(1, 5001))
+    assert len(prepare_subtitle(many.encode()).cues) == 5000
+    big_vtt = "WEBVTT\n\n" + "".join(
+        f"{i}\n00:00:01.000 --> 00:00:02.000\nHello world number {i}\n\n" for i in range(1, 30_000))
+    assert len(big_vtt.encode()) > 1_000_000
+    assert len(prepare_subtitle(big_vtt.encode(), "movie.vtt").cues) == 29_999
 
 
 def test_safe_and_informative_output_names():

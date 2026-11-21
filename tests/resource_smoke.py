@@ -21,8 +21,11 @@ from aiohttp.test_utils import TestClient, TestServer
 import subtranslate.web as bot_web
 from subtranslate.config import Settings
 from subtranslate.languages import LanguageCatalog
-from subtranslate.subtitles import MAX_CUES, MAX_INPUT_BYTES, prepare_subtitle
+from subtranslate.subtitles import prepare_subtitle
 from subtranslate.website import WebsiteTranslator
+
+# A previously problematic size, without storing a large fixture.
+CUE_COUNT = 3000
 
 
 async def wait_for_result(stub: fake_telegram.TelegramStub) -> None:
@@ -45,16 +48,14 @@ async def main() -> None:
     if not chromium:
         raise RuntimeError("Set TEST_CHROMIUM_PATH or CHROMIUM_PATH to a Chromium executable")
 
-    # A previously problematic size, without storing a large fixture.
     cue_text = "x" * 240
     fake_telegram.SOURCE = "".join(
         f"{index}\n00:00:01,000 --> 00:00:02,000\nOriginal subtitle cue {index}: {cue_text}"
         "\nSecond line for readability.\n\n"
-        for index in range(1, MAX_CUES + 1)
+        for index in range(1, CUE_COUNT + 1)
     ).encode()
-    assert 0.99 * MAX_INPUT_BYTES < len(fake_telegram.SOURCE) <= MAX_INPUT_BYTES
     fake_telegram.DOCUMENT_MESSAGE["document"]["file_size"] = len(fake_telegram.SOURCE)
-    print(f"Mocked bot flow: {MAX_CUES:,} cues, {len(fake_telegram.SOURCE):,} input bytes", flush=True)
+    print(f"Mocked bot flow: {CUE_COUNT:,} cues, {len(fake_telegram.SOURCE):,} input bytes", flush=True)
 
     html = (Path(__file__).parent / "fixtures" / "mock_website.html").read_text(encoding="utf-8")
     mock = web.Application()
@@ -93,8 +94,8 @@ async def main() -> None:
                 upload = next(iter(stub.uploads[0].values()))
                 assert upload[0] == "movie.Hindi.srt"
                 cues = list(srt.parse(upload[1].decode("utf-8")))
-                assert len(cues) == MAX_CUES
-                assert cues[0].index == 1 and cues[-1].index == MAX_CUES
+                assert len(cues) == CUE_COUNT
+                assert cues[0].index == 1 and cues[-1].index == CUE_COUNT
                 assert all(cue.content == "Hola mundo" for cue in cues)
                 print(f"Success: {len(upload[1]):,} output bytes in {time.monotonic() - start:.1f}s", flush=True)
 
