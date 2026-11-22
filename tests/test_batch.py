@@ -69,7 +69,7 @@ async def test_all_languages_are_sent_one_by_one(batch_service):
     batch_service.bot.get_file.assert_awaited_once()
     sends = batch_service.bot.send_document.await_args_list
     assert [item.kwargs["document"].filename for item in sends] == [
-        "movie.Hindi.srt", "movie.Spanish.srt", "movie.French.srt",
+        "Hindi.srt", "Spanish.srt", "French.srt",
     ]
     assert [item.kwargs["caption"].split(" · ")[0] for item in sends] == ["1/3", "2/3", "3/3"]
     assert "3 file(s) sent" in batch_service.bot.edit_message_text.await_args.kwargs["text"]

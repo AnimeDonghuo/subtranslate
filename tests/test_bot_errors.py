@@ -147,7 +147,7 @@ async def test_unchanged_file_has_a_warning_in_the_caption(service):
     await service.process_job(JOB)
     send = service.bot.send_document.await_args.kwargs
     assert "unchanged text" in send["caption"]
-    assert send["document"].filename == "movie.Hindi.srt"
+    assert send["document"].filename == "Hindi.srt"
 
 
 async def test_partly_unchanged_file_is_sent_with_the_cue_range_that_did_not_change(service):
@@ -159,7 +159,7 @@ async def test_partly_unchanged_file_is_sent_with_the_cue_range_that_did_not_cha
     await service.process_job(JOB)
 
     send = service.bot.send_document.await_args.kwargs
-    assert send["document"].filename == "movie.Hindi.srt"
+    assert send["document"].filename == "Hindi.srt"
     assert "40 cues in a row" in send["caption"]
     assert "cue 61–100" in send["caption"] and "40 of 100 cues (40%)" in send["caption"]
     assert "Please check it" in send["caption"]
@@ -182,6 +182,8 @@ async def test_caption_reports_changed_text_as_a_comparison_not_a_translation_gu
     await service.process_job(JOB)
     caption = service.bot.send_document.await_args.kwargs["caption"]
     assert "2 cues checked" in caption and "1/2 cue texts differ" in caption
+    # The delivered file is named after the language, and the caption says so.
+    assert "📄 Hindi.srt" in caption
     assert "may stay the same" in caption and "Please review" in caption
 
 

@@ -214,7 +214,7 @@ async def test_large_result_uses_mtproto_and_keeps_single_download_on_disk(tmp_p
         result.truncate(BOT_API_UPLOAD_BYTES + 1)  # sparse: no large fixture on disk
     await service._send_result(JOB, "Hindi", TranslatedSubtitle(path, 1, False, changed_cues=1), transport)
     transport.send.assert_awaited_once()
-    assert transport.send.await_args.args[:3] == (JOB, path, "private.Hindi.srt")
+    assert transport.send.await_args.args[:3] == (JOB, path, "Hindi.srt")
     service.bot.send_document.assert_not_awaited()
 
 

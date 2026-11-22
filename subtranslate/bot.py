@@ -24,6 +24,18 @@ from .admin import install_admin_handlers
 from .ass_export import MAX_ASS_SOURCE_BYTES, ass_filename, srt_to_ass
 from .commands import install_sync_handlers
 from .config import FREE_PRESET_LIMIT, Settings
+from .convert import (
+    MAX_CONVERT_BYTES,
+    TARGET_CODES,
+    ConvertError,
+    FormatDraft,
+    check_target,
+    convert_subtitle,
+    converted_filename,
+    format_keyboard,
+    format_prompt,
+    target_label,
+)
 from .fileio import run_file_io, run_scan, wait_for_cleanup
 from .jobs import EnqueueResult, JobQueue, TranslationJob, available_memory_mb
 from .languages import LanguageCatalog, confirm_all_keyboard, language_keyboard
@@ -42,9 +54,9 @@ from .status_board import StatusBoards
 from .store import Database
 from .subtitles import (
     SubtitleError,
+    language_filename,
     prepare_subtitle,
     subtitle_extension,
-    translated_filename,
 )
 from .tasks import TaskRegistry
 from .website import LanguageUnavailable, WebsiteError, WebsiteTranslator
@@ -57,6 +69,13 @@ PREMIUM_ALERT = (
     "Ask the owner to enable premium with /addpremium."
 )
 MAX_PROXY_INPUT_BYTES = 19 * 1024 * 1024
+FORMAT_PROMPT = (
+    "🔄 <b>Change subtitle format</b>\n\n"
+    "Send the subtitle file you want to convert, or reply to a file with /changeformat.\n\n"
+    "Formats: <b>SRT · SUB · SBV · VTT · STL</b>\n"
+    "ASS/SSA is not offered here — /ass already builds a styled ASS file.\n\n"
+    "Pick one or more formats, then tap ✅ Done."
+)
 MAX_PROXY_ENTRIES = 80_000
 
 
@@ -112,6 +131,9 @@ class BotService:
         self._proxy_input_chats: set[int] = set()
         # Chats that ran /ass and are expected to send an SRT next.
         self._ass_waiting: set[int] = set()
+        # /changeformat: chats waiting for a file, and their format choices.
+        self._format_waiting: set[int] = set()
+        self._format_drafts: dict[int, FormatDraft] = {}
         self._proxy_scan_task: asyncio.Task | None = None
         self._proxy_scan_status: dict[str, int] = {}
         self.bot = None
@@ -121,12 +143,17 @@ class BotService:
         application.add_handler(CommandHandler("id", self.user_id))
         application.add_handler(CommandHandler("cancel", self.cancel_batch))
         application.add_handler(CommandHandler("proxychk", self.proxy_command))
+        # "changeformate" is accepted too: it is the spelling users try first.
+        application.add_handler(CommandHandler(["changeformat", "changeformate"],
+                                               self.change_format))
         # Menus and owner commands use specific callback patterns. They are
         # registered before the catch-all job callback so it cannot swallow them.
         install_menu_handlers(self, application)
         install_admin_handlers(self, application)
         install_sync_handlers(self, application)
         application.add_handler(MessageHandler(filters.Document.ALL, self.document))
+        # Format buttons must reach their own handler, not the job catch-all.
+        application.add_handler(CallbackQueryHandler(self.format_callback, pattern=r"^fmt:"))
         application.add_handler(CallbackQueryHandler(self.callback))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.other_text))
         application.add_error_handler(self.on_error)
@@ -468,6 +495,146 @@ class BotService:
             parse_mode="HTML",
         )
 
+    def wait_for_format_file(self, chat_id: int) -> None:
+        self._format_waiting.add(chat_id)
+
+    async def change_format(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Convert a subtitle to another format, by reply or with the next file."""
+        if not await self._is_private_and_allowed(update):
+            return
+        message = update.effective_message
+        reply = message.reply_to_message
+        document = reply.document if reply is not None and reply.document is not None else None
+        if document is not None:
+            await self.offer_formats(message, document)
+            return
+        self.wait_for_format_file(update.effective_chat.id)
+        await message.reply_text(FORMAT_PROMPT, parse_mode="HTML")
+
+    async def offer_formats(self, message: Message, document) -> None:
+        """Show the format buttons for one subtitle document."""
+        try:
+            subtitle_extension(document.file_name or "")
+        except SubtitleError as exc:
+            await message.reply_text(str(exc))
+            return
+        if document.file_size is not None and not 0 < document.file_size <= MAX_CONVERT_BYTES:
+            await message.reply_text("That subtitle is too large to convert; keep it under 25 MB.")
+            return
+        draft = FormatDraft(file_id=document.file_id, file_name=document.file_name or "subtitle",
+                            file_size=document.file_size, message_id=message.message_id)
+        self._format_drafts[message.chat.id] = draft
+        await message.reply_text(format_prompt(draft.file_name, draft.selected),
+                                 reply_markup=format_keyboard(draft.selected), parse_mode="HTML")
+
+    async def format_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Toggle a format button, or convert everything once Done is tapped."""
+        query = update.callback_query
+        if not query:
+            return
+        if not await self.ensure_callback_allowed(query):
+            return
+        chat_id = query.message.chat.id if query.message is not None else None
+        draft = self._format_drafts.get(chat_id) if chat_id is not None else None
+        if draft is None:
+            await query.answer("That request expired. Send /changeformat again.", show_alert=True)
+            return
+        choice = (query.data or "").removeprefix("fmt:")
+        if choice == "done":
+            await self._finish_format_change(query, draft)
+            return
+        try:
+            code = check_target(choice)
+        except ConvertError as exc:
+            await query.answer(str(exc), show_alert=True)
+            return
+        if code in draft.selected:
+            draft.selected.discard(code)
+        else:
+            draft.selected.add(code)
+        await query.answer()
+        try:
+            await query.edit_message_text(format_prompt(draft.file_name, draft.selected),
+                                          reply_markup=format_keyboard(draft.selected),
+                                          parse_mode="HTML")
+        except TelegramError as exc:
+            logger.info("Format picker could not be updated (%s)", type(exc).__name__)
+
+    async def _finish_format_change(self, query, draft: FormatDraft) -> None:
+        if not draft.selected:
+            await query.answer("Choose at least one format, then tap ✅ Done.", show_alert=True)
+            return
+        await query.answer()
+        chat_id = query.message.chat.id
+        targets = [code for code in TARGET_CODES if code in draft.selected]
+        labels = ", ".join(target_label(code) for code in targets)
+        await query.edit_message_text(f"⏳ Converting to {labels} …")
+        try:
+            data = await self._read_document(chat_id, draft)
+        except (SubtitleError, LargeTransferError) as exc:
+            self._format_drafts.pop(chat_id, None)
+            await query.message.reply_text(f"Could not convert: {exc}")
+            return
+        except TelegramError as exc:
+            self._format_drafts.pop(chat_id, None)
+            logger.warning("Format conversion download failed (%s)", type(exc).__name__)
+            await query.message.reply_text("Telegram could not download the file. Please send it again.")
+            return
+        except OSError as exc:
+            self._format_drafts.pop(chat_id, None)
+            logger.warning("Temporary storage failed during conversion (%s)", type(exc).__name__)
+            await query.message.reply_text("Could not use temporary storage. Check disk space and try again.")
+            return
+        try:
+            source_extension = subtitle_extension(draft.file_name).lstrip(".").upper()
+        except SubtitleError:
+            source_extension = "SUBTITLE"
+        sent: list[str] = []
+        failed: list[str] = []
+        for code in targets:
+            label = target_label(code)
+            try:
+                content, cue_count = await run_file_io(convert_subtitle, data, draft.file_name, code)
+            except SubtitleError as exc:
+                failed.append(f"{label}: {exc}")
+                continue
+            filename = converted_filename(draft.file_name, code)
+            try:
+                await query.message.reply_document(
+                    document=InputFile(BytesIO(content), filename=filename),
+                    caption=(f"🔄 <b>{html.escape(source_extension)} → {label}</b> · {cue_count:,} cues\n"
+                             f"📄 {html.escape(filename)}"),
+                    parse_mode="HTML",
+                    read_timeout=120, write_timeout=120,
+                )
+            except TelegramError as exc:
+                logger.warning("Converted file upload failed (%s)", type(exc).__name__)
+                failed.append(f"{label}: Telegram could not send it")
+                continue
+            sent.append(label)
+        self._format_drafts.pop(chat_id, None)
+        lines = [f"✅ Done · sent {', '.join(sent)}" if sent else "❌ Nothing could be converted."]
+        if failed:
+            lines.append("Could not convert: " + "; ".join(failed))
+        await query.message.reply_text("\n".join(lines))
+
+    async def _read_document(self, chat_id: int, draft: FormatDraft) -> bytes:
+        """Read a subtitle document, using MTProto only when the Bot API cannot."""
+        if draft.file_size is not None and draft.file_size > BOT_API_DOWNLOAD_BYTES:
+            job = TranslationJob(chat_id=chat_id, original_message_id=draft.message_id,
+                                 file_id=draft.file_id, file_name=draft.file_name,
+                                 file_size=draft.file_size, language_code="convert",
+                                 language_name="Convert")
+            async with self._job_resources() as (directory, transport):
+                path = directory / "source-subtitle"
+                await transport.download(job, path)
+                return await run_file_io(path.read_bytes)
+        telegram_file = await self.bot.get_file(draft.file_id)
+        data = bytes(await telegram_file.download_as_bytearray(read_timeout=120))
+        if not data or (draft.file_size is not None and len(data) != draft.file_size):
+            raise SubtitleError("The Telegram download was empty or incomplete. Please send the file again.")
+        return data
+
     async def document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._is_private_and_allowed(update):
             return
@@ -499,6 +666,10 @@ class BotService:
             return
         if doc.file_size is not None and doc.file_size <= 0:
             await message.reply_text("Please send a non-empty subtitle file.")
+            return
+        if chat_id in self._format_waiting:
+            self._format_waiting.discard(chat_id)
+            await self.offer_formats(message, doc)
             return
         if chat_id in self._ass_waiting:
             self._ass_waiting.discard(chat_id)
@@ -735,9 +906,14 @@ class BotService:
                            progress: str = "") -> None:
         # An unchanged stretch is reported in the caption below rather than
         # blocking delivery: a refused job leaves the user with nothing.
-        filename = translated_filename(job.file_name, name)
+        try:
+            extension = subtitle_extension(job.file_name)
+        except SubtitleError:
+            extension = ".srt"
+        # The delivered file is named after its language, like English.srt.
+        filename = language_filename(name, extension)
         cue_word = "cue" if result.cue_count == 1 else "cues"
-        caption = f"{progress}{name} · {result.cue_count:,} {cue_word} checked"
+        caption = f"{progress}{name} · {result.cue_count:,} {cue_word} checked\n📄 {filename}"
         if result.changed_cues is not None:
             caption += (f"\n{result.changed_cues:,}/{result.cue_count:,} cue texts differ from the original. "
                         "Names or shared words may stay the same.")

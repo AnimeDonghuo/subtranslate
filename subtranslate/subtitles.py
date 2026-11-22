@@ -633,6 +633,24 @@ def verify_and_merge(source: PreparedSubtitle, downloaded: bytes) -> TranslatedS
                               longest_run_start=longest_run_start, unchanged_cues=unchanged_cues)
 
 
+def language_filename(language: str, extension: str = ".srt") -> str:
+    """Name a delivered file after its language, e.g. ``English.srt``.
+
+    Users asked for the language as the file name instead of the original name
+    with a language suffix, so a chat with several translations stays readable.
+    """
+    if extension not in SUPPORTED_EXTENSIONS:
+        extension = ".srt"
+    stem = "".join(
+        char for char in unicodedata.normalize("NFC", language or "")
+        if not unicodedata.category(char).startswith("C") and char not in '<>:"/\\|?*'
+    ).strip(" .")
+    stem = re.sub(r"\s+", " ", stem) or "subtitles"
+    while len(stem.encode("utf-8")) > 80:
+        stem = stem[:-1].rstrip(" .")
+    return f"{stem or 'subtitles'}{extension}"
+
+
 def translated_filename(original: str, language: str) -> str:
     # A Telegram filename is untrusted. Never use it as a path.
     basename = original.replace("\\", "/").rsplit("/", 1)[-1]

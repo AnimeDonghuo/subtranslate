@@ -140,7 +140,7 @@ async def test_document_to_button_to_download_and_return():
             assert send["chat_id"] == 42
             assert "Hindi" in send["caption"]
             upload = next(iter(request.uploads[0].values()))
-            assert upload[0] == "movie.Hindi.srt"
+            assert upload[0] == "Hindi.srt"
             assert "नमस्ते दुनिया".encode() in upload[1]
             assert b"00:00:01,000 --> 00:00:02,000" in upload[1]
     finally:
@@ -223,7 +223,7 @@ async def test_select_all_returns_each_file_in_sequence_through_telegram_handler
         await asyncio.wait_for(service.queue._queue.join(), 5)
         assert seen == ["fr", "hi", "es"]  # alphabetical names in the picker
         assert [next(iter(upload.values()))[0] for upload in request.uploads] == [
-            "movie.French.srt", "movie.Hindi.srt", "movie.Spanish.srt",
+            "French.srt", "Hindi.srt", "Spanish.srt",
         ]
         documents = [params for action, params in request.calls if action == "sendDocument"]
         assert [item["caption"].split(" · ")[0] for item in documents] == ["1/3", "2/3", "3/3"]
@@ -351,7 +351,7 @@ async def test_full_webhook_bot_and_real_browser_with_mock_site(mock_site, chrom
             await client.post("/telegram/webhook", headers=headers, json=callback_update(21))
             await asyncio.wait_for(request.document_sent.wait(), 15)
             upload = next(iter(request.uploads[0].values()))
-            assert upload[0] == "movie.Hindi.srt"
+            assert upload[0] == "Hindi.srt"
             # The preview says Hola mundo, but Download returns different text.
             # The Telegram attachment must be exactly the downloaded SRT bytes.
             assert upload[1] == b"10\n00:00:01,000 --> 00:00:02,000\nText from the downloaded file\n\n"
@@ -388,7 +388,7 @@ async def test_sequential_batch_through_webhook_and_fresh_browsers(mock_site, ch
 
             await asyncio.wait_for(wait_for_batch(), 20)
             assert [next(iter(upload.values()))[0] for upload in request.uploads] == [
-                "movie.Hindi.srt", "movie.Spanish.srt",
+                "Hindi.srt", "Spanish.srt",
             ]
             assert all(b"Hola mundo" in next(iter(upload.values()))[1] for upload in request.uploads)
             progress_edits = [params for action, params in request.calls if action == "editMessageText"]

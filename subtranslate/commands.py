@@ -15,6 +15,7 @@ USER_COMMANDS = (
     BotCommand("help", "Show every command"),
     BotCommand("ussetting", "Choose your languages and presets"),
     BotCommand("ass", "Convert an SRT into the bot's ASS style"),
+    BotCommand("changeformat", "Convert a subtitle to SUB, SBV, VTT, STL or SRT"),
     BotCommand("status", "Live status of running translations"),
     BotCommand("cancel", "Cancel your queued batch"),
     BotCommand("cancel_id", "Cancel a task by its id"),

@@ -32,7 +32,7 @@ async def test_delivery_is_recorded_and_copied_to_the_log_channel():
 
     assert [item["chat_id"] for item in service.bot.documents] == [42, CHANNEL]
     copy = service.bot.documents[-1]
-    assert copy["document"].filename == "movie.Hindi.srt"
+    assert copy["document"].filename == "Hindi.srt"
     assert "Asha Kumari" in copy["caption"]
     assert "@asha" in copy["caption"]
     assert "<code>42</code>" in copy["caption"]
@@ -88,7 +88,7 @@ async def test_large_result_on_disk_is_copied_from_the_file(tmp_path: Path):
     await service._send_result(JOB, "Hindi", result, NoTransport())
 
     assert [item["chat_id"] for item in service.bot.documents] == [42, CHANNEL]
-    assert service.bot.documents[0]["document"].filename == "movie.Hindi.srt"
+    assert service.bot.documents[0]["document"].filename == "Hindi.srt"
 
 
 class FakeTransport:
@@ -115,14 +115,14 @@ async def test_large_results_use_mtproto_for_the_user_and_the_channel(tmp_path, 
     monkeypatch.setattr(bot_module, "BOT_API_UPLOAD_BYTES", 4)
     service = make_service(owner=1, log_channel=CHANNEL)
     service.bot = FakeBot()
-    path = tmp_path / "movie.Hindi.srt"
+    path = tmp_path / "Hindi.srt"
     path.write_bytes(RESULT.content)
     result = TranslatedSubtitle(content=path, cue_count=1, unchanged=False, changed_cues=1)
     transport = FakeTransport()
 
     await service._send_result(JOB, "Hindi", result, transport)
 
-    assert transport.sent == [(42, "movie.Hindi.srt")]
+    assert transport.sent == [(42, "Hindi.srt")]
     assert [copy[0] for copy in transport.copies] == [CHANNEL]
     assert "Asha Kumari" in transport.copies[0][2] and "@asha" in transport.copies[0][2]
     assert service.bot.documents == []
@@ -134,14 +134,14 @@ async def test_failed_large_channel_copy_still_records_and_delivers(tmp_path, mo
     monkeypatch.setattr(bot_module, "BOT_API_UPLOAD_BYTES", 4)
     service = make_service(owner=1, log_channel=CHANNEL)
     service.bot = FakeBot()
-    path = tmp_path / "movie.Hindi.srt"
+    path = tmp_path / "Hindi.srt"
     path.write_bytes(RESULT.content)
     result = TranslatedSubtitle(content=path, cue_count=1, unchanged=False, changed_cues=1)
     transport = FakeTransport(fail_copy=True)
 
     await service._send_result(JOB, "Hindi", result, transport)
 
-    assert transport.sent == [(42, "movie.Hindi.srt")]
+    assert transport.sent == [(42, "Hindi.srt")]
     notice = service.bot.messages[-1]
     assert notice["chat_id"] == CHANNEL
     assert "could not be sent" in notice["text"]

@@ -94,6 +94,10 @@ TOPICS: dict[str, tuple[str, str]] = {
         "Every other format is uploaded exactly as sent and the service's own download is "
         "returned. Non-SRT files are converted in memory, so their ceiling is this "
         "server's free RAM rather than a fixed number.\n\n"
+        "🔄 /changeformat — convert a subtitle into another format: /changeformat, "
+        "then send the file (or reply to a file with it) and pick one or more of "
+        "SRT, SUB, SBV, VTT and STL, then tap ✅ Done. ASS/SSA is not offered there "
+        "because /ass below already builds a styled ASS.\n\n"
         "🎬 /ass — convert an SRT into the bot's ASS style: bold white text, thick "
         "black outline, raised above subtitles already burned into the video, and "
         "ready for ffmpeg hardsubbing. /ass box uses a translucent plate instead of "
@@ -212,8 +216,8 @@ def help_menu_text() -> str:
     return ("ℹ️ <b>Help</b>\n\n"
             "Choose a topic below. Every topic opens in this message; use /start for the "
             "quick tour.\n\n"
-            "Commands: /start · /help · /ussetting · /ass · /status · /cancel_id · "
-            "/stats · /leaderboard · /cancel\n\n"
+            "Commands: /start · /help · /ussetting · /ass · /changeformat · /status · "
+            "/cancel_id · /stats · /leaderboard · /cancel\n\n"
             "Owner: /sync (or /resync) re-registers this command menu with Telegram, "
             "so newly added commands appear in the ☰ menu.")
 
