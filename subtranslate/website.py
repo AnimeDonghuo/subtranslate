@@ -9,6 +9,7 @@ import secrets
 import tempfile
 from collections.abc import Callable
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -506,17 +507,14 @@ class WebsiteSession:
         if isinstance(source, PreparedSubtitle):
             suspicious = await asyncio.to_thread(obviously_untranslated_run, source, result, language_code)
             if suspicious:
-                raise WebsiteError(
-                    "The website download appears to contain untranslated subtitles, "
-                    "so no incomplete file was sent. Please try again later."
-                )
+                # The download is structurally valid but a stretch of it still
+                # looks like the source language. Report it and send the file:
+                # a refused job leaves the user with nothing to work with.
+                logger.info("Website download kept source-language text in %d cues", suspicious)
+                result = replace(result, untranslated_run=suspicious)
         if result.possibly_incomplete:
-            if isinstance(result.content, Path):
-                result.content.unlink(missing_ok=True)
-            raise WebsiteError(
-                "A long section of the website download remained unchanged and may be untranslated, "
-                "so no potentially incomplete file was sent. Please try again later."
-            )
+            logger.info("Website download kept the original text for %d cues in a row (from cue %d of %d)",
+                        result.longest_unchanged_run, result.longest_run_start + 1, result.cue_count)
         return result
 
 

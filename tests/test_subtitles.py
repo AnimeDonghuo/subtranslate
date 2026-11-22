@@ -229,6 +229,9 @@ def test_long_unchanged_sections_are_warnings_not_assumed_failures():
     assert result.changed_cues == 1
     assert result.longest_unchanged_run == 39
     assert result.possibly_incomplete
+    # The user is told exactly which stretch kept the original text.
+    assert result.longest_run_start == 1 and result.unchanged_cues == 39
+    assert result.suspect
     unchanged = verify_and_merge(source, source.utf8)
     assert unchanged.unchanged and not unchanged.possibly_incomplete
 

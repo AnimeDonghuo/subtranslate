@@ -2,7 +2,7 @@
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 
@@ -46,12 +46,24 @@ class TranslatedSubtitle:
     unchanged: bool
     changed_cues: int | None = None
     longest_unchanged_run: int = 0
+    # Where that stretch starts (0-based cue index) and how much of the file
+    # kept the original text. Reported to the user instead of guessing.
+    longest_run_start: int = 0
+    unchanged_cues: int = 0
+    # Cues in the longest stretch whose text still looks like the source
+    # script (see obviously_untranslated_run); used for the warning only.
+    untranslated_run: int = 0
 
     @property
     def possibly_incomplete(self) -> bool:
         # Same-language sections and names can legitimately be unchanged.
         # This is a warning, not proof of a failed translation.
         return not self.unchanged and self.longest_unchanged_run >= 20
+
+    @property
+    def suspect(self) -> bool:
+        """Ship the file, but tell the user which stretch to check."""
+        return self.unchanged or self.possibly_incomplete or self.untranslated_run >= 5
 
 
 def decode_subtitle(data: bytes) -> str:
@@ -537,9 +549,7 @@ def _restore_ass(source: PreparedSubtitle, site_result: TranslatedSubtitle,
     restored = _ass_replace_texts(source.utf8.decode("utf-8"), texts)
     # Only text fields change, so the timings that verify_and_merge already
     # checked against the upload cannot move; skip a second full parse.
-    return TranslatedSubtitle(content=restored.encode("utf-8"), cue_count=len(source.cues),
-                              unchanged=site_result.unchanged, changed_cues=site_result.changed_cues,
-                              longest_unchanged_run=site_result.longest_unchanged_run)
+    return replace(site_result, content=restored.encode("utf-8"), cue_count=len(source.cues))
 
 
 def restore_subtitle_from_website(source: PreparedSubtitle, site_result: TranslatedSubtitle) -> TranslatedSubtitle:
@@ -594,15 +604,18 @@ def verify_and_merge(source: PreparedSubtitle, downloaded: bytes) -> TranslatedS
     for original, result in zip(source.cues, translated):
         if original.start != result.start or original.end != result.end:
             raise SubtitleError("The website changed subtitle timestamps, so the result was not sent. Please try again.")
-    changed_cues = 0
-    unchanged_run = longest_unchanged_run = 0
-    for original, result in zip(source.cues, translated):
+    changed_cues = unchanged_cues = 0
+    unchanged_run = longest_unchanged_run = longest_run_start = 0
+    for index, (original, result) in enumerate(zip(source.cues, translated)):
         if original.content.strip() != result.content.strip():
             changed_cues += 1
         key = _comparison_key(original.content)
         if key and key == _comparison_key(result.content) and any(char.isalpha() for char in key):
+            unchanged_cues += 1
             unchanged_run += 1
-            longest_unchanged_run = max(longest_unchanged_run, unchanged_run)
+            if unchanged_run > longest_unchanged_run:
+                longest_unchanged_run = unchanged_run
+                longest_run_start = index - unchanged_run + 1
         else:
             unchanged_run = 0
     # Send the website's actual Download file, not its on-page preview. Keep
@@ -611,7 +624,8 @@ def verify_and_merge(source: PreparedSubtitle, downloaded: bytes) -> TranslatedS
     # default styles are never delivered.
     content = _download_as_utf8(downloaded, text)
     return TranslatedSubtitle(content=content, cue_count=len(translated), unchanged=changed_cues == 0,
-                              changed_cues=changed_cues, longest_unchanged_run=longest_unchanged_run)
+                              changed_cues=changed_cues, longest_unchanged_run=longest_unchanged_run,
+                              longest_run_start=longest_run_start, unchanged_cues=unchanged_cues)
 
 
 def translated_filename(original: str, language: str) -> str:

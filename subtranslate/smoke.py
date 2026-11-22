@@ -58,8 +58,13 @@ async def _run(args) -> None:
                 output.unlink(missing_ok=True)
             raise
     print(f"Saved {result.cue_count} cues to {output}")
-    if result.unchanged or result.possibly_incomplete:
-        print("Warning: a long section of text did not change; the result may be incomplete. Please review it.")
+    if result.suspect:
+        if result.possibly_incomplete:
+            print(f"Warning: {result.longest_unchanged_run} cues in a row from cue "
+                  f"{result.longest_run_start + 1} kept the original text; the result may be incomplete. "
+                  "Please review it.")
+        else:
+            print("Warning: a long section of text did not change; the result may be incomplete. Please review it.")
 
 
 def main() -> None:

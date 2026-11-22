@@ -460,13 +460,18 @@ async def test_a_later_job_can_retry_after_an_upload_error(mock_site, chromium_p
     assert "Hello world" not in caplog.text
 
 
-async def test_same_script_partial_result_is_refused(mock_site, chromium_path):
+async def test_same_script_partial_result_is_sent_with_a_warning(mock_site, chromium_path):
     source = prepare_subtitle("".join(
         f"{i}\n00:00:01,000 --> 00:00:02,000\nAn English subtitle sentence {i}\n\n"
         for i in range(1, 41)
     ).encode())
-    with pytest.raises(WebsiteError, match="remained unchanged"):
-        await translator(mock_site + "?mode=partial10", chromium_path).translate(source, "es")
+    result = await translator(mock_site + "?mode=partial10", chromium_path).translate(source, "es")
+
+    # Ten of forty cues were translated: the file is still delivered, but the
+    # unchanged stretch is named so the user can check that part.
+    assert result.changed_cues == 10
+    assert result.possibly_incomplete and result.longest_unchanged_run == 30
+    assert result.longest_run_start == 10 and result.suspect
 
 
 async def test_sub_bridge_restores_every_frame_from_one_download(mock_site, chromium_path):

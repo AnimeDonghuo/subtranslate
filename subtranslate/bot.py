@@ -733,8 +733,8 @@ class BotService:
 
     async def _send_result(self, job: TranslationJob, name: str, result, transport: LargeTelegramTransfer,
                            progress: str = "") -> None:
-        if result.possibly_incomplete:
-            raise SubtitleError("A long section of the website download remained unchanged; no potentially incomplete file was sent.")
+        # An unchanged stretch is reported in the caption below rather than
+        # blocking delivery: a refused job leaves the user with nothing.
         filename = translated_filename(job.file_name, name)
         cue_word = "cue" if result.cue_count == 1 else "cues"
         caption = f"{progress}{name} · {result.cue_count:,} {cue_word} checked"
@@ -746,6 +746,20 @@ class BotService:
             caption += (
                 "\n\n⚠️ The website returned unchanged text. It may already be in the target "
                 "language, or translation may have failed."
+            )
+        elif result.possibly_incomplete:
+            last = result.longest_run_start + result.longest_unchanged_run
+            caption += (
+                f"\n\n⚠️ {result.longest_unchanged_run:,} cues in a row (cue "
+                f"{result.longest_run_start + 1:,}–{last:,}) kept the original text; "
+                f"{result.unchanged_cues:,} of {result.cue_count:,} cues in total did. That stretch may be a "
+                "repeated chorus, sign or name, or the website may have stopped translating there. "
+                "Please check it before using the file."
+            )
+        elif result.untranslated_run >= 5:
+            caption += (
+                f"\n\n⚠️ About {result.untranslated_run:,} cues in a row still look like the original "
+                "language. Please check that part of the file."
             )
         if isinstance(result.content, Path):
             if result.content.stat().st_size > BOT_API_UPLOAD_BYTES:
@@ -922,7 +936,7 @@ class BotService:
                     progress.set_stage("sending result")
                     await self._cancelable(self._send_result(job, job.language_name, result, transport), cancel)
                 cue_word = "cue" if result.cue_count == 1 else "cues"
-                if result.unchanged or result.possibly_incomplete:
+                if result.suspect:
                     final = (f"⚠️ Sent {job.language_name} with {result.cue_count:,} checked {cue_word}, "
                              "but some text may be untranslated. Please review the file.")
                 else:

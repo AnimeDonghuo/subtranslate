@@ -150,6 +150,32 @@ async def test_unchanged_file_has_a_warning_in_the_caption(service):
     assert send["document"].filename == "movie.Hindi.srt"
 
 
+async def test_partly_unchanged_file_is_sent_with_the_cue_range_that_did_not_change(service):
+    service.bot.get_file.return_value = telegram_file(VALID_SRT)
+    service.translator.translate.return_value = TranslatedSubtitle(
+        VALID_SRT, 100, unchanged=False, changed_cues=60, longest_unchanged_run=40,
+        longest_run_start=60, unchanged_cues=40,
+    )
+    await service.process_job(JOB)
+
+    send = service.bot.send_document.await_args.kwargs
+    assert send["document"].filename == "movie.Hindi.srt"
+    assert "40 cues in a row" in send["caption"]
+    assert "cue 61–100" in send["caption"] and "40 of 100 cues in total" in send["caption"]
+    assert "Please check it" in send["caption"]
+
+
+async def test_source_script_stretch_is_flagged_even_when_cue_text_changed(service):
+    service.bot.get_file.return_value = telegram_file(VALID_SRT)
+    service.translator.translate.return_value = TranslatedSubtitle(
+        VALID_SRT, 100, unchanged=False, changed_cues=50, untranslated_run=12,
+    )
+    await service.process_job(JOB)
+
+    caption = service.bot.send_document.await_args.kwargs["caption"]
+    assert "12 cues in a row still look like the original language" in caption
+
+
 async def test_caption_reports_changed_text_as_a_comparison_not_a_translation_guarantee(service):
     service.bot.get_file.return_value = telegram_file(VALID_SRT)
     service.translator.translate.return_value = TranslatedSubtitle(VALID_SRT, 2, unchanged=False, changed_cues=1)
@@ -176,12 +202,15 @@ async def test_job_does_not_run_when_status_cannot_be_delivered(service):
     service.translator.translate.assert_not_awaited()
 
 
-async def test_possible_partial_result_is_not_sent_as_complete(service):
+async def test_possible_partial_result_is_delivered_but_never_as_complete(service):
+    # Refusing the job used to leave the user with nothing; the file is sent
+    # and the status says plainly that part of it may be untranslated.
     service.bot.get_file.return_value = telegram_file(VALID_SRT)
     service.translator.translate.return_value = TranslatedSubtitle(
         VALID_SRT, 50, unchanged=False, changed_cues=5, longest_unchanged_run=45,
     )
     await service.process_job(JOB)
-    service.bot.send_document.assert_not_awaited()
-    assert "long section" in last_notice(service).lower()
-    assert "no potentially incomplete file was sent" in last_notice(service)
+
+    service.bot.send_document.assert_awaited_once()
+    assert "some text may be untranslated" in last_notice(service)
+    assert "Please review the file" in last_notice(service)
