@@ -196,7 +196,9 @@ def test_ass_preserves_source_styles_dialogue_metadata_and_comments():
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
         "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Hola\n"
     )
-    result = verify_and_merge(prepare_subtitle(source.encode(), "movie.ass"), downloaded.encode())
+    original = prepare_subtitle(source.encode(), "movie.ass")
+    verified = verify_and_merge(original, downloaded.encode())
+    result = restore_subtitle_from_website(original, verified)
     merged = pysubs2.SSAFile.from_string(result.content.decode(), format_="ass")
     assert merged.info["Title"] == "Original"
     assert merged.styles["Custom"].fontname == "OriginalFont"

@@ -23,7 +23,7 @@ class SubtitleError(ValueError):
     """An input or downloaded subtitle cannot safely be used."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class OtherCue:
     start: int | tuple[int, ...]
     end: int | tuple[int, ...]
@@ -140,7 +140,11 @@ def _parse_sbv(text: str) -> list[OtherCue]:
 
 def _parse_other(text: str, extension: str) -> list[OtherCue]:
     try:
-        if extension in {".ass", ".ssa", ".vtt"}:
+        if extension in {".ass", ".ssa"} and _ass_standard_events(text):
+            # Line scanning keeps a 30 MB typesetting file within a small
+            # host's memory; pysubs2 would need many times the file size.
+            cues = _ass_cues(text)
+        elif extension in {".ass", ".ssa", ".vtt"}:
             if extension == ".vtt" and not text.lstrip().startswith("WEBVTT"):
                 raise SubtitleError("The VTT subtitle must start with WEBVTT.")
             parsed = pysubs2.SSAFile.from_string(text, format_=extension[1:])
@@ -179,8 +183,13 @@ def _parse_other(text: str, extension: str) -> list[OtherCue]:
                                 "SubViewer (timestamps) are supported; a binary VobSub .sub stores "
                                 "images and needs OCR, so extract a text SRT first.")
         raise SubtitleError("The subtitle has no readable cues in this format.")
-    if any(cue.end < cue.start or (isinstance(cue.start, int) and cue.start < 0) or not cue.content.strip()
-           for cue in cues):
+    # ASS/SSA typesetting files legitimately contain empty, zero-length and
+    # drawing-only events. They are skipped for translation instead of
+    # rejecting the whole file; every other format must be clean.
+    if extension not in {".ass", ".ssa"} and any(
+        cue.end < cue.start or (isinstance(cue.start, int) and cue.start < 0) or not cue.content.strip()
+        for cue in cues
+    ):
         raise SubtitleError("The subtitle contains an empty cue or an invalid timestamp.")
     if extension == ".stl" and any(
         value[1] >= 60 or value[2] >= 60 or value[3] >= 100
@@ -223,16 +232,137 @@ def _bridge_text(content: str, extension: str) -> str:
     return content
 
 
-def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
-    """Send formats the site parses unreliably as an equivalent SRT.
+def _plain_cue_text(text: str) -> str:
+    return re.sub(r"<[^>]*>|\{\\[^}]*\}", "", text)
 
-    Cue text and real timings are preserved so the translated SRT can be
-    spliced back into the untouched original file. Only MicroDVD .sub needs
-    synthetic times, because its frame numbers are not real timestamps.
+
+_ASS_DIALOGUE = re.compile(r"^[ \t]*Dialogue:(?P<fields>[^\r\n]*)$", re.MULTILINE)
+
+
+def _ass_is_plain_text(raw: str) -> str:
+    """Visible words of an ASS text field: tags and escapes removed."""
+    return (_plain_cue_text(raw).replace("\\N", "\n").replace("\\n", "\n")
+            .replace("\\h", " "))
+
+
+def _ass_time_ms(value: str) -> int:
+    hours, minutes, seconds = value.strip().split(":")
+    whole, _, fraction = seconds.partition(".")
+    if int(minutes) >= 60 or int(whole) >= 60:
+        raise ValueError("Invalid ASS timestamp")
+    scale = {0: 0, 1: 100, 2: 10, 3: 1}.get(len(fraction), 0)
+    return ((int(hours) * 60 + int(minutes)) * 60 + int(whole)) * 1000 + int(fraction or 0) * scale
+
+
+def _ass_dialogue_lines(text: str):
+    """Yield one Dialogue line at a time with absolute offsets.
+
+    (line_start, line_end, start_ms, end_ms, raw_text, text_start, text_end)
+
+    One regex pass instead of a pysubs2 object keeps a 30 MB typesetting file
+    inside a small host's memory: pysubs2 would need many times the file size.
     """
-    if source.extension not in SITE_BRIDGED:
+    for match in _ASS_DIALOGUE.finditer(text):
+        fields = match["fields"].split(",", 9)
+        if len(fields) != 10:
+            raise ValueError("Invalid ASS dialogue line")
+        start = _ass_time_ms(fields[1])
+        end = _ass_time_ms(fields[2])
+        text_start = match.start("fields") + sum(len(field) + 1 for field in fields[:9])
+        line_end = match.end()
+        if text.startswith("\r\n", line_end):
+            line_end += 2
+        elif text.startswith("\n", line_end):
+            line_end += 1
+        yield match.start(), line_end, start, end, fields[9], text_start, match.end("fields")
+
+
+def _ass_cues(text: str) -> list[OtherCue]:
+    """Read ASS/SSA Dialogue lines without building a full pysubs2 object."""
+    return [OtherCue(start, end, _ass_is_plain_text(raw))
+            for _line_start, _line_end, start, end, raw, _text_start, _text_end
+            in _ass_dialogue_lines(text)]
+
+
+def _ass_standard_events(text: str) -> bool:
+    """True when the [Events] Format line uses the usual field order."""
+    if "[Events]" not in text:
+        return False
+    for line in text.split("[Events]", 1)[1].splitlines()[:6]:
+        stripped = line.strip()
+        if stripped.lower().startswith("format:"):
+            fields = [field.strip().lower() for field in stripped.split(":", 1)[1].split(",")]
+            # Old SSA v4 calls the first field "Marked"; it fills the same slot.
+            return fields[0] in {"layer", "marked"} and fields[1:3] == ["start", "end"]
+    return True
+
+
+# Vector drawings (\p1 … \p9) are typesetting, not dialogue: never translate them.
+_ASS_DRAWING = re.compile(r"\\p[1-9]")
+
+
+def _ass_line_has_text(start: int, end: int, raw: str) -> bool:
+    """True when a Dialogue line carries words the website can translate."""
+    return (end > start and not _ASS_DRAWING.search(raw)
+            and bool(_ass_is_plain_text(raw).strip()))
+
+
+def _ass_for_site(source: PreparedSubtitle) -> PreparedSubtitle:
+    """Upload only the ASS/SSA Dialogue lines that carry translatable text.
+
+    Typesetting files contain empty, zero-length and drawing-only lines. The
+    delivered file is always rebuilt from the original, so leaving those out of
+    the upload keeps the website's cue count equal to what it can translate —
+    instead of rejecting a 30 MB file over one empty line. Everything else in
+    the upload stays byte-for-byte identical.
+    """
+    text = source.utf8.decode("utf-8")
+    cues: list[OtherCue] = []
+    kept: list[str] = []
+    cursor = 0
+    dropped = False
+    for line_start, line_end, start, end, raw, _text_start, _text_end in _ass_dialogue_lines(text):
+        if _ass_line_has_text(start, end, raw):
+            cues.append(OtherCue(start, end, _ass_is_plain_text(raw)))
+        else:
+            dropped = True
+            kept.append(text[cursor:line_start])
+            cursor = line_end
+    if not dropped:
         return source
-    synthetic = source.extension == ".sub" and bool(_MICRODVD_LINE.search(source.utf8.decode("utf-8")))
+    if not cues:
+        raise SubtitleError("The subtitle has no text cues to translate; every cue is empty.")
+    kept.append(text[cursor:])
+    return PreparedSubtitle(utf8="".join(kept).encode("utf-8"), cues=cues,
+                            extension=source.extension)
+
+
+def _ass_replace_texts(original: str, texts: list[str]) -> str:
+    """Insert translated lines into the Dialogue lines, byte-for-byte elsewhere."""
+    pieces: list[str] = []
+    used = 0
+    cursor = 0
+    for _line_start, _line_end, start, end, raw, text_start, text_end in _ass_dialogue_lines(original):
+        if not _ass_line_has_text(start, end, raw):
+            continue
+        if used >= len(texts):
+            raise SubtitleError("The translated ASS cues could not be matched to the "
+                                "original. Please try again.")
+        replacement = (texts[used].replace("\r\n", "\n").replace("\r", "\n")
+                       .replace("\n", "\\N"))
+        pieces.append(original[cursor:text_start])
+        pieces.append(replacement)
+        cursor = text_end
+        used += 1
+    if used != len(texts):
+        raise SubtitleError("The translated ASS cues could not be matched to the "
+                            "original. Please try again.")
+    pieces.append(original[cursor:])
+    return "".join(pieces)
+
+
+def _srt_bridge(source: PreparedSubtitle, *, synthetic: bool) -> PreparedSubtitle:
+    """Build the SRT the website receives; timings stay exact unless synthetic."""
     site_cues = []
     for index, cue in enumerate(source.cues, start=1):
         if synthetic:
@@ -247,6 +377,28 @@ def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
                             cues=site_cues, extension=".srt")
 
 
+def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
+    """Send formats the site parses unreliably as an equivalent SRT.
+
+    Cue text and real timings are preserved so the translated file can be
+    spliced back into the untouched original. Only MicroDVD .sub needs
+    synthetic times, because its frame numbers are not real timestamps. ASS
+    keeps its own format; only its untranslatable lines are left out.
+    """
+    if source.extension in {".ass", ".ssa"}:
+        if not _ass_standard_events(source.utf8.decode("utf-8")):
+            # An unusual [Events] field order: leave the file exactly as sent.
+            return _srt_bridge(source, synthetic=False) if source.extension == ".ssa" else source
+        sanitized = _ass_for_site(source)
+        if source.extension == ".ass":
+            return sanitized
+        return _srt_bridge(sanitized, synthetic=False)
+    if source.extension != ".sub":
+        return source
+    synthetic = bool(_MICRODVD_LINE.search(source.utf8.decode("utf-8")))
+    return _srt_bridge(source, synthetic=synthetic)
+
+
 _CJK_TARGETS = frozenset({"zh-CN", "zh-TW", "yue", "ja", "ko"})
 _NON_LATIN_TARGETS = frozenset({
     "zh-CN", "zh-TW", "yue", "ja", "ko", "ar", "fa", "fa-AF", "ur", "ps", "sd", "ug", "ckb",
@@ -254,10 +406,6 @@ _NON_LATIN_TARGETS = frozenset({
     "te", "kn", "ml", "si", "th", "lo", "km", "my", "el", "iw", "yi", "ru", "uk", "be", "bg",
     "mk", "sr", "kk", "ky", "mn", "tg", "ka", "hy", "am", "ti",
 })
-
-
-def _plain_cue_text(text: str) -> str:
-    return re.sub(r"<[^>]*>|\{\\[^}]*\}", "", text)
 
 
 def _comparison_key(text: str) -> str:
@@ -354,22 +502,47 @@ def _text_spans(original: str, extension: str) -> list[tuple[int, int, str]]:
     return _block_spans(original, _SBV_LINE)
 
 
+def _merge_ass_with_pysubs2(source: PreparedSubtitle, site_result: TranslatedSubtitle) -> TranslatedSubtitle:
+    """Legacy style-preserving merge for ASS files with an unusual field order."""
+    original = pysubs2.SSAFile.from_string(source.utf8.decode("utf-8"), format_=source.extension[1:])
+    result = pysubs2.SSAFile.from_string(decode_subtitle(site_result.content),
+                                         format_=source.extension[1:])
+    originals = (event for event in original.events if not event.is_comment)
+    results = (event for event in result.events if not event.is_comment)
+    for original_event, result_event in zip(originals, results):
+        original_event.text = result_event.text
+    return verify_and_merge(source, original.to_string(format_=source.extension[1:]).encode("utf-8"))
+
+
+def _restore_ass(source: PreparedSubtitle, site_result: TranslatedSubtitle,
+                 texts: list[str]) -> TranslatedSubtitle:
+    """Splice translated lines into the original ASS/SSA and keep its styling."""
+    restored = _ass_replace_texts(source.utf8.decode("utf-8"), texts)
+    # Only text fields change, so the timings that verify_and_merge already
+    # checked against the upload cannot move; skip a second full parse.
+    return TranslatedSubtitle(content=restored.encode("utf-8"), cue_count=len(source.cues),
+                              unchanged=site_result.unchanged, changed_cues=site_result.changed_cues,
+                              longest_unchanged_run=site_result.longest_unchanged_run)
+
+
 def restore_subtitle_from_website(source: PreparedSubtitle, site_result: TranslatedSubtitle) -> TranslatedSubtitle:
     """Put translated cue text back into the original file, leaving everything else untouched."""
+    if source.extension == ".ass":
+        # The website rebuilds ASS downloads with its own default style, so the
+        # translated lines are spliced into the original file instead.
+        if not _ass_standard_events(source.utf8.decode("utf-8")):
+            return _merge_ass_with_pysubs2(source, site_result)
+        translated = _ass_cues(decode_subtitle(site_result.content))
+        return _restore_ass(source, site_result, [cue.content for cue in translated])
     if source.extension not in SITE_BRIDGED:
-        # The site returns these formats itself: SRT as downloaded, ASS merged
-        # onto its own styling, and SBV/VTT/STL uploaded and returned as-is.
+        # The site returns these formats itself: SRT as downloaded, and
+        # SBV/VTT/STL uploaded and returned as-is.
         return site_result
     translated_cues = _parse(decode_subtitle(site_result.content), is_output=True)
     if source.extension == ".ssa":
-        original_ssa = pysubs2.SSAFile.from_string(source.utf8.decode("utf-8"), format_="ssa")
-        events = [event for event in original_ssa.events if not event.is_comment]
-        if len(events) != len(translated_cues):
-            raise SubtitleError("The translated SSA cues could not be matched to the original. Please try again.")
-        for event, cue in zip(events, translated_cues):
-            event.text = cue.content.replace("\r\n", "\n").replace("\n", "\\N")
-        restored = original_ssa.to_string(format_="ssa").encode("utf-8")
-        return verify_and_merge(source, restored)
+        if not _ass_standard_events(source.utf8.decode("utf-8")):
+            return _merge_ass_with_pysubs2(source, site_result)
+        return _restore_ass(source, site_result, [cue.content for cue in translated_cues])
     original = source.utf8.decode("utf-8")
     spans = _text_spans(original, source.extension)
     if len(spans) != len(translated_cues):
@@ -415,21 +588,11 @@ def verify_and_merge(source: PreparedSubtitle, downloaded: bytes) -> TranslatedS
             longest_unchanged_run = max(longest_unchanged_run, unchanged_run)
         else:
             unchanged_run = 0
-    if source.extension == ".ass":
-        # The site rebuilds ASS downloads with default styles. Retain the
-        # source styles, dialogue metadata and comments while replacing its
-        # dialogue text; inline override tags may still be changed by the site.
-        original_ass = pysubs2.SSAFile.from_string(source.utf8.decode("utf-8"), format_="ass")
-        result_ass = pysubs2.SSAFile.from_string(text, format_="ass")
-        original_events = (event for event in original_ass.events if not event.is_comment)
-        result_events = (event for event in result_ass.events if not event.is_comment)
-        for original_event, result_event in zip(original_events, result_events):
-            original_event.text = result_event.text
-        content = original_ass.to_string(format_="ass").encode("utf-8")
-    else:
-        # Send the website's actual Download file, not its on-page preview.
-        # Keep byte-for-byte output when it is UTF-8.
-        content = _download_as_utf8(downloaded, text)
+    # Send the website's actual Download file, not its on-page preview. Keep
+    # byte-for-byte output when it is UTF-8. ASS styling is restored afterwards
+    # by splicing the translated lines into the original file, so the website's
+    # default styles are never delivered.
+    content = _download_as_utf8(downloaded, text)
     return TranslatedSubtitle(content=content, cue_count=len(translated), unchanged=changed_cues == 0,
                               changed_cues=changed_cues, longest_unchanged_run=longest_unchanged_run)
 

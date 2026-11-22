@@ -60,19 +60,22 @@ MAX_PROXY_INPUT_BYTES = 19 * 1024 * 1024
 MAX_PROXY_ENTRIES = 80_000
 
 
-def _in_memory_limit() -> int | None:
+def _in_memory_limit(extension: str = ".vtt") -> int | None:
     """Bytes of non-SRT subtitle text this server can safely convert in memory."""
     free_mb = available_memory_mb()
     if free_mb is None:
         return None
-    return max(24, free_mb // 3) * 1_000_000
+    # ASS/SSA parse and restore cost roughly six times the file size because of
+    # per-event work; the other text formats need about three times.
+    divisor = 6 if extension in {".ass", ".ssa"} else 3
+    return max(16, free_mb // divisor) * 1_000_000
 
 
 def _check_in_memory_size(file_size: int | None, extension: str) -> None:
     """Non-SRT formats are parsed in memory, so scale the ceiling to free RAM."""
     if extension == ".srt" or file_size is None:
         return
-    limit = _in_memory_limit()
+    limit = _in_memory_limit(extension)
     if limit is not None and file_size > limit:
         raise SubtitleError(
             f"{extension[1:].upper()} files are converted in memory, and this one is "
