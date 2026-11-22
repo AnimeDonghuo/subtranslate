@@ -61,6 +61,11 @@ class TranslatedSubtitle:
         return not self.unchanged and self.longest_unchanged_run >= 20
 
     @property
+    def unchanged_count(self) -> int:
+        """Cues reported as unchanged; never less than the longest run."""
+        return max(self.unchanged_cues, self.longest_unchanged_run)
+
+    @property
     def suspect(self) -> bool:
         """Ship the file, but tell the user which stretch to check."""
         return self.unchanged or self.possibly_incomplete or self.untranslated_run >= 5

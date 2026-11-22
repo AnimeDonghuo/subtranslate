@@ -72,7 +72,7 @@ def test_rejects_missing_extra_and_changed_timing(tmp_path):
         verify_file_srt(source, output, "es")
 
 
-def test_rejects_likely_incomplete_download_without_splitting(tmp_path, caplog):
+def test_likely_incomplete_download_is_reported_not_refused(tmp_path, caplog):
     import logging
 
     caplog.set_level(logging.INFO, logger="subtranslate.large_srt")
@@ -83,8 +83,11 @@ def test_rejects_likely_incomplete_download_without_splitting(tmp_path, caplog):
     output = tmp_path / "downloaded.srt"
     first = raw.split("\n\n", 1)[0]
     output.write_text(raw.replace(first, first.replace("这是一个简单的字幕测试句子", "Translated first cue"), 1), encoding="utf-8")
-    with pytest.raises(SubtitleError, match="untranslated subtitles"):
-        verify_file_srt(source, output, "en")
+    result = verify_file_srt(source, output, "en")
+    # Delivered, but the stretch that kept the source script is named.
+    assert result.changed_cues == 1 and result.untranslated_run >= 5
+    assert result.suspect and result.possibly_incomplete
+    assert result.longest_run_start == 1 and result.unchanged_count == 39
     assert "changed 1 of 40 cue texts" in caplog.text and "longest unchanged run 39" in caplog.text
     assert "这是一个" not in caplog.text and "Translated first cue" not in caplog.text
 
@@ -99,6 +102,9 @@ def test_untranslated_run_warning_metadata_crosses_many_cues(tmp_path):
     result = verify_file_srt(source, output, "es")
     assert result.changed_cues == 1 and result.longest_unchanged_run == 39
     assert result.possibly_incomplete
+    # The streamed SRT path must report where the run is, or the caption would
+    # claim "0 cues in total" beside a non-zero run.
+    assert result.longest_run_start == 1 and result.unchanged_count == 39
 
 
 def test_numeric_dialogue_before_an_unnumbered_cue_is_not_silently_lost(tmp_path):

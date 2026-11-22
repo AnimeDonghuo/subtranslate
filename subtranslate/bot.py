@@ -749,12 +749,13 @@ class BotService:
             )
         elif result.possibly_incomplete:
             last = result.longest_run_start + result.longest_unchanged_run
+            share = 100 * result.unchanged_count / max(1, result.cue_count)
             caption += (
                 f"\n\n⚠️ {result.longest_unchanged_run:,} cues in a row (cue "
                 f"{result.longest_run_start + 1:,}–{last:,}) kept the original text; "
-                f"{result.unchanged_cues:,} of {result.cue_count:,} cues in total did. That stretch may be a "
-                "repeated chorus, sign or name, or the website may have stopped translating there. "
-                "Please check it before using the file."
+                f"{result.unchanged_count:,} of {result.cue_count:,} cues ({share:.0f}%) did. That stretch may be a "
+                "repeated chorus, sign, name or text already in the target language, or the website may have "
+                "stopped translating there. Please check it before using the file."
             )
         elif result.untranslated_run >= 5:
             caption += (

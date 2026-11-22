@@ -61,8 +61,9 @@ async def _run(args) -> None:
     if result.suspect:
         if result.possibly_incomplete:
             print(f"Warning: {result.longest_unchanged_run} cues in a row from cue "
-                  f"{result.longest_run_start + 1} kept the original text; the result may be incomplete. "
-                  "Please review it.")
+                  f"{result.longest_run_start + 1} kept the original text "
+                  f"({result.unchanged_count} of {result.cue_count} cues overall); the result may be "
+                  "incomplete. Please review it.")
         else:
             print("Warning: a long section of text did not change; the result may be incomplete. Please review it.")
 

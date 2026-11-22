@@ -161,7 +161,7 @@ async def test_partly_unchanged_file_is_sent_with_the_cue_range_that_did_not_cha
     send = service.bot.send_document.await_args.kwargs
     assert send["document"].filename == "movie.Hindi.srt"
     assert "40 cues in a row" in send["caption"]
-    assert "cue 61–100" in send["caption"] and "40 of 100 cues in total" in send["caption"]
+    assert "cue 61–100" in send["caption"] and "40 of 100 cues (40%)" in send["caption"]
     assert "Please check it" in send["caption"]
 
 

@@ -182,6 +182,7 @@ def verify_file_srt(source: FileSubtitle, downloaded: Path, language_code: str, 
     output_encoding = _encoding(downloaded)
     detector = UntranslatedRunDetector(language_code)
     count = changed = run = longest = 0
+    longest_start = unchanged_cues = 0
     suspicious = 0
     with closing(iter_file_cues(source.path, source.encoding)) as original, \
             closing(iter_file_cues(downloaded, output_encoding)) as output:
@@ -198,7 +199,10 @@ def verify_file_srt(source: FileSubtitle, downloaded: Path, language_code: str, 
             key = _comparison_key(before.content)
             if key and key == _comparison_key(after.content) and any(char.isalpha() for char in key):
                 run += 1
-                longest = max(longest, run)
+                unchanged_cues += 1
+                if run > longest:
+                    longest = run
+                    longest_start = count - run
             else:
                 run = 0
             if not suspicious:
@@ -209,9 +213,10 @@ def verify_file_srt(source: FileSubtitle, downloaded: Path, language_code: str, 
     # whether a direct website download is likely to be partial.
     logger.info("Website download changed %d of %d cue texts; longest unchanged run %d",
                 changed, count, longest)
-    if suspicious:
-        raise SubtitleError(
-            "The website download appears to contain untranslated subtitles, so no incomplete file was sent. "
-            "Please try again later."
-        )
-    return TranslatedSubtitle(downloaded, count, changed == 0, changed, longest)
+    # A stretch that still looks like the source language is reported in the
+    # caption instead of aborting the job: a refused file leaves nothing to
+    # work with, and the user can see exactly which cues look wrong.
+    return TranslatedSubtitle(content=downloaded, cue_count=count, unchanged=changed == 0,
+                              changed_cues=changed, longest_unchanged_run=longest,
+                              longest_run_start=longest_start, unchanged_cues=unchanged_cues,
+                              untranslated_run=suspicious)
