@@ -57,7 +57,7 @@ async def test_huge_non_srt_file_reports_free_memory_instead_of_a_fixed_cap(
         await service._download_source(job, tmp_path, FakeTransport(b""))
 
     message = str(error.value)
-    assert "400 MB" in message and "100 MB" in message
+    assert "400 MB" in message and "60 MB" in message
     assert "SRT" in message
 
 
@@ -71,3 +71,11 @@ def test_unknown_memory_or_size_does_not_block_the_file(monkeypatch):
     _check_in_memory_size(1_900_000_000, ".vtt")
     monkeypatch.setattr(bot_module, "available_memory_mb", lambda: 300)
     _check_in_memory_size(None, ".vtt")
+
+
+def test_ass_ceiling_matches_its_larger_memory_footprint(monkeypatch):
+    monkeypatch.setattr(bot_module, "available_memory_mb", lambda: 240)
+    _check_in_memory_size(30_000_000, ".ass")             # ~8x: needs 240 MB
+    with pytest.raises(SubtitleError, match="ASS files") as error:
+        _check_in_memory_size(60_000_000, ".ass")
+    assert "30 MB" in str(error.value)

@@ -65,9 +65,9 @@ def _in_memory_limit(extension: str = ".vtt") -> int | None:
     free_mb = available_memory_mb()
     if free_mb is None:
         return None
-    # ASS/SSA parse and restore cost roughly six times the file size because of
-    # per-event work; the other text formats need about three times.
-    divisor = 6 if extension in {".ass", ".ssa"} else 3
+    # Measured peaks: ASS/SSA need about eight times the file size, VTT about
+    # ten (pysubs2 objects), and the regex-parsed text formats about five.
+    divisor = {".ass": 8, ".ssa": 8, ".vtt": 10}.get(extension, 5)
     return max(16, free_mb // divisor) * 1_000_000
 
 

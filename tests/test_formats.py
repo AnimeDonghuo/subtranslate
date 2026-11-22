@@ -1,8 +1,10 @@
 """Formats the website cannot parse are bridged through SRT and restored."""
 
 import pysubs2
+import pytest
 
 from subtranslate.subtitles import (
+    SubtitleError,
     prepare_subtitle,
     restore_subtitle_from_website,
     subtitle_for_website,
@@ -79,10 +81,6 @@ def test_utf16_sub_viewer_sub_is_still_read_as_text():
 
 
 def test_binary_sub_is_explained_instead_of_silently_failing():
-    import pytest
-
-    from subtranslate.subtitles import SubtitleError
-
     with pytest.raises(SubtitleError, match="VobSub"):
         prepare_subtitle(b"\x00\x00\x01\xba\x00\x00\x01\xb9garbage", "movie.sub")
 
@@ -241,11 +239,8 @@ def test_old_ssa_marked_field_order_is_supported():
     assert "[V4 Styles]" in text and "OriginalFont" in text
 
 
+@pytest.mark.filterwarnings("ignore::RuntimeWarning")
 def test_an_unreadable_ass_field_order_is_reported_not_corrupted():
-    import pytest
-
-    from subtranslate.subtitles import SubtitleError
-
     odd = (
         "[Script Info]\nScriptType: v4.00+\n\n"
         "[Events]\n"
@@ -254,3 +249,46 @@ def test_an_unreadable_ass_field_order_is_reported_not_corrupted():
     )
     with pytest.raises(SubtitleError):
         prepare_subtitle(odd.encode(), "odd.ass")
+
+
+CRLF_ASS = ASS_WITH_EMPTY.replace("\n", "\r\n")
+
+
+def test_crlf_ass_file_is_read_and_restored_with_its_line_endings():
+    """Aegisub on Windows writes CRLF; the scanner must not depend on LF."""
+    source = prepare_subtitle(CRLF_ASS.encode(), "bcs.ass")
+    assert len(source.cues) == 4
+    assert [cue.start for cue in source.cues] == [1000, 3500, 4000, 7000]
+
+    site_source = subtitle_for_website(source)
+    assert len(site_source.cues) == 2
+    assert b"\r\n" in site_source.utf8
+
+    verified = verify_and_merge(site_source, site_ass([(1000, 3000, "Hola"), (7000, 9000, "Gracias")]))
+    restored = restore_subtitle_from_website(source, verified)
+
+    text = restored.content.decode()
+    assert "\r\n" in text and "\n\n" not in text.replace("\r\n", "")
+    dialogue = [line for line in text.split("\r\n") if line.startswith("Dialogue:")]
+    assert dialogue[0].endswith(",,Hola")
+    assert dialogue[1].endswith(",,Zero length line")      # untouched
+    assert dialogue[2].endswith(",,")                      # empty line kept
+    assert dialogue[3].endswith(",,Gracias")
+    assert "Style: Sign,OriginalFont" in text
+
+
+def test_cr_only_ass_file_is_read():
+    source = prepare_subtitle(ASS_WITH_EMPTY.replace("\n", "\r").encode(), "old.ass")
+    assert len(source.cues) == 4
+    assert len(subtitle_for_website(source).cues) == 2
+
+
+def test_ass_text_that_mentions_the_dialogue_keyword_is_not_a_cue():
+    tricky = ASS_WITH_EMPTY.replace(
+        "Dialogue: 0,0:00:01.00,0:00:03.00,Sign,,0,0,0,,Hello there",
+        "Dialogue: 0,0:00:01.00,0:00:03.00,Sign,,0,0,0,,Dialogue: this is spoken text")
+    source = prepare_subtitle(tricky.encode(), "tricky.ass")
+    assert len(source.cues) == 4
+    site_source = subtitle_for_website(source)
+    assert len(site_source.cues) == 2
+    assert b"Dialogue: this is spoken text" in site_source.utf8

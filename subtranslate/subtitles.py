@@ -140,18 +140,12 @@ def _parse_sbv(text: str) -> list[OtherCue]:
 
 def _parse_other(text: str, extension: str) -> list[OtherCue]:
     try:
-        if extension in {".ass", ".ssa"} and _ass_standard_events(text):
+        if extension in {".ass", ".ssa"} and _ass_scannable(text):
             # Line scanning keeps a 30 MB typesetting file within a small
             # host's memory; pysubs2 would need many times the file size.
-            cues = _ass_cues(text)
+            cues = _ass_cues(text) or _parse_with_pysubs2(text, extension)
         elif extension in {".ass", ".ssa", ".vtt"}:
-            if extension == ".vtt" and not text.lstrip().startswith("WEBVTT"):
-                raise SubtitleError("The VTT subtitle must start with WEBVTT.")
-            parsed = pysubs2.SSAFile.from_string(text, format_=extension[1:])
-            if not parsed.events:
-                raise SubtitleError("The subtitle has no readable cues in this format.")
-            cues = [OtherCue(event.start, event.end, event.plaintext)
-                    for event in parsed.events if not event.is_comment]
+            cues = _parse_with_pysubs2(text, extension)
         elif extension == ".sbv":
             cues = _parse_sbv(text)
         elif extension == ".sub":
@@ -236,7 +230,7 @@ def _plain_cue_text(text: str) -> str:
     return re.sub(r"<[^>]*>|\{\\[^}]*\}", "", text)
 
 
-_ASS_DIALOGUE = re.compile(r"^[ \t]*Dialogue:(?P<fields>[^\r\n]*)$", re.MULTILINE)
+_ASS_DIALOGUE = re.compile(r"(?P<sep>\A|[\r\n])[ \t]*Dialogue:(?P<fields>[^\r\n]*)")
 
 
 def _ass_is_plain_text(raw: str) -> str:
@@ -265,16 +259,23 @@ def _ass_dialogue_lines(text: str):
     for match in _ASS_DIALOGUE.finditer(text):
         fields = match["fields"].split(",", 9)
         if len(fields) != 10:
-            raise ValueError("Invalid ASS dialogue line")
-        start = _ass_time_ms(fields[1])
-        end = _ass_time_ms(fields[2])
+            # A malformed line is left alone: never translated, never restored.
+            continue
+        try:
+            start = _ass_time_ms(fields[1])
+            end = _ass_time_ms(fields[2])
+        except ValueError:
+            continue
+        line_start = match.start() + len(match["sep"])
         text_start = match.start("fields") + sum(len(field) + 1 for field in fields[:9])
-        line_end = match.end()
-        if text.startswith("\r\n", line_end):
-            line_end += 2
-        elif text.startswith("\n", line_end):
-            line_end += 1
-        yield match.start(), line_end, start, end, fields[9], text_start, match.end("fields")
+        text_end = match.end("fields")
+        if text.startswith("\r\n", text_end):
+            line_end = text_end + 2
+        elif text.startswith(("\n", "\r"), text_end):
+            line_end = text_end + 1
+        else:
+            line_end = text_end
+        yield line_start, line_end, start, end, fields[9], text_start, text_end
 
 
 def _ass_cues(text: str) -> list[OtherCue]:
@@ -282,6 +283,22 @@ def _ass_cues(text: str) -> list[OtherCue]:
     return [OtherCue(start, end, _ass_is_plain_text(raw))
             for _line_start, _line_end, start, end, raw, _text_start, _text_end
             in _ass_dialogue_lines(text)]
+
+
+def _ass_scannable(text: str) -> bool:
+    """True when the line scanner can read this ASS/SSA file."""
+    return _ass_standard_events(text) and _ASS_DIALOGUE.search(text) is not None
+
+
+def _parse_with_pysubs2(text: str, extension: str) -> list[OtherCue]:
+    """Fallback parser for files whose [Events] order or layout is unusual."""
+    if extension == ".vtt" and not text.lstrip().startswith("WEBVTT"):
+        raise SubtitleError("The VTT subtitle must start with WEBVTT.")
+    parsed = pysubs2.SSAFile.from_string(text, format_=extension[1:])
+    if not parsed.events:
+        raise SubtitleError("The subtitle has no readable cues in this format.")
+    return [OtherCue(event.start, event.end, event.plaintext)
+            for event in parsed.events if not event.is_comment]
 
 
 def _ass_standard_events(text: str) -> bool:
@@ -386,7 +403,7 @@ def subtitle_for_website(source: PreparedSubtitle) -> PreparedSubtitle:
     keeps its own format; only its untranslatable lines are left out.
     """
     if source.extension in {".ass", ".ssa"}:
-        if not _ass_standard_events(source.utf8.decode("utf-8")):
+        if not _ass_scannable(source.utf8.decode("utf-8")):
             # An unusual [Events] field order: leave the file exactly as sent.
             return _srt_bridge(source, synthetic=False) if source.extension == ".ssa" else source
         sanitized = _ass_for_site(source)
@@ -530,7 +547,7 @@ def restore_subtitle_from_website(source: PreparedSubtitle, site_result: Transla
     if source.extension == ".ass":
         # The website rebuilds ASS downloads with its own default style, so the
         # translated lines are spliced into the original file instead.
-        if not _ass_standard_events(source.utf8.decode("utf-8")):
+        if not _ass_scannable(source.utf8.decode("utf-8")):
             return _merge_ass_with_pysubs2(source, site_result)
         translated = _ass_cues(decode_subtitle(site_result.content))
         return _restore_ass(source, site_result, [cue.content for cue in translated])
@@ -540,7 +557,7 @@ def restore_subtitle_from_website(source: PreparedSubtitle, site_result: Transla
         return site_result
     translated_cues = _parse(decode_subtitle(site_result.content), is_output=True)
     if source.extension == ".ssa":
-        if not _ass_standard_events(source.utf8.decode("utf-8")):
+        if not _ass_scannable(source.utf8.decode("utf-8")):
             return _merge_ass_with_pysubs2(source, site_result)
         return _restore_ass(source, site_result, [cue.content for cue in translated_cues])
     original = source.utf8.decode("utf-8")
