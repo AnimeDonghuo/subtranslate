@@ -23,6 +23,11 @@ MODES = frozenset({"public", "private"})
 PERIODS = ("day", "week", "month", "year")
 # A deployment without MongoDB keeps recent usage in memory only.
 _MEMORY_TRANSLATIONS = 50_000
+# Writes made while MongoDB is unreachable are replayed after it returns.
+# Access rules and bans are handled from the cache instead.
+_PENDING_WRITES = frozenset({"set_premium", "clear_premium", "touch_user", "set_presets",
+                             "record_translation"})
+_PENDING_LIMIT = 500
 
 
 def utcnow() -> datetime:
@@ -194,6 +199,16 @@ class _MongoBackend:
         self._storage_limit_mb = storage_limit_mb
         self._client = None
         self._db = None
+
+    @property
+    def started(self) -> bool:
+        return self._db is not None
+
+    async def ping(self) -> None:
+        """Cheap liveness check used before returning to MongoDB."""
+        if self._db is None:
+            raise RuntimeError("MongoDB client is not started")
+        await asyncio.to_thread(self._client.admin.command, "ping")
 
     @property
     def users(self):
@@ -374,6 +389,18 @@ class Database:
         self._active: _MemoryBackend | _MongoBackend = self._memory
         self.db_configured = bool(uri)
         self.degraded = False
+        # Retrying in the background means a dead database never stalls a user
+        # operation, and a short Atlas outage heals without a redeploy.
+        self._retry_interval = 60.0
+        self._next_retry = 0.0
+        self._reconnect_task: asyncio.Task | None = None
+        self._closed = False
+        # Anything changed while MongoDB was away is pushed back on reconnect.
+        self._access_dirty = False
+        self._bans_dirty = False
+        self._released: set[int] = set()
+        self._pending: list[tuple[str, tuple]] = []
+        self._pending_full_warned = False
 
     # -- connection -----------------------------------------------------
     async def start(self) -> None:
@@ -405,6 +432,17 @@ class Database:
                     self._mode, len(self._authorized), len(self._bans))
 
     async def close(self) -> None:
+        self._closed = True
+        task = self._reconnect_task
+        self._reconnect_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - shutdown is best effort
+                logger.info("MongoDB reconnect task ended with %s", type(exc).__name__)
         for backend in (self._active, self._memory):
             try:
                 await backend.close()
@@ -413,12 +451,108 @@ class Database:
 
     def _degrade(self, exc: Exception) -> None:
         if self._active is not self._memory:
-            logger.warning("MongoDB operation failed (%s); using in-memory settings until restart",
-                           type(exc).__name__)
+            logger.warning(
+                "MongoDB operation failed (%s); using in-memory settings and retrying every %ds",
+                type(exc).__name__, int(self._retry_interval),
+            )
             self._active = self._memory
             self.degraded = True
+            try:
+                self._next_retry = asyncio.get_running_loop().time() + self._retry_interval
+            except RuntimeError:  # no loop (unit tests): retry on the next call
+                self._next_retry = 0.0
+
+    def _schedule_reconnect(self) -> None:
+        """Try MongoDB again soon, off the request path."""
+        if self._mongo is None or self._closed or self._active is not self._memory:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            return
+        if now < self._next_retry:
+            return
+        self._next_retry = now + self._retry_interval
+        self._reconnect_task = asyncio.create_task(self._try_reconnect(), name="mongo-reconnect")
+
+    def _merge_remote(self, mode: str | None, authorized: list[int], bans: list[BanEntry]) -> None:
+        """Adopt what MongoDB has, but never lose a change made during the outage."""
+        if not self._bans_dirty:
+            self._bans = {entry.user_id: entry for entry in bans}
+        else:
+            for entry in bans:
+                if entry.user_id not in self._released:
+                    self._bans.setdefault(entry.user_id, entry)
+        if not self._access_dirty:
+            if mode in MODES:
+                self._mode = mode
+            if authorized:
+                self._authorized = {value for value in authorized
+                                    if isinstance(value, int) and value > 0}
+
+    async def _try_reconnect(self) -> None:
+        if self._mongo is None:
+            return
+        try:
+            if not self._mongo.started:
+                await self._mongo.start()
+            await self._mongo.ping()
+            mode, authorized = await self._mongo.load_access()
+            bans = await self._mongo.load_bans()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - try again on a later operation
+            logger.info("MongoDB still unavailable (%s); keeping in-memory settings",
+                        type(exc).__name__)
+            return
+        self._active = self._mongo
+        self.degraded = False
+        self._merge_remote(mode, authorized, bans)
+        try:
+            # The cached state is authoritative: it includes everything that
+            # happened while MongoDB was unreachable.
+            await self._mongo.save_access(self._mode, sorted(self._authorized))
+            self._access_dirty = False
+            for entry in list(self._bans.values()):
+                await self._mongo.save_ban(entry)
+            for user_id in sorted(self._released):
+                await self._mongo.delete_ban(user_id)
+            self._bans_dirty = False
+            self._released.clear()
+            # Replay presets, premium, users and counters recorded meanwhile;
+            # anything that fails stays queued for the next attempt.
+            while self._pending:
+                method, args = self._pending[0]
+                try:
+                    await getattr(self._mongo, method)(*args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - keep it queued for next time
+                    logger.info("Could not replay a queued %s write (%s)",
+                                method, type(exc).__name__)
+                    break
+                self._pending.pop(0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - keep the cache, retry later
+            logger.warning("MongoDB reconnected but the first write failed (%s); retrying later",
+                           type(exc).__name__)
+            self._degrade(exc)
+            return
+        logger.info("MongoDB reconnected: mode=%s, authorized=%d, banned=%d",
+                    self._mode, len(self._authorized), len(self._bans))
 
     async def _run(self, method: str, *args, default=None):
+        if self._active is self._memory:
+            if self._mongo is not None and method in _PENDING_WRITES:
+                if len(self._pending) < _PENDING_LIMIT:
+                    self._pending.append((method, args))
+                elif not self._pending_full_warned:
+                    logger.warning("Too many database writes queued; later ones stay in memory")
+                    self._pending_full_warned = True
+            self._schedule_reconnect()
         try:
             return await getattr(self._active, method)(*args)
         except Exception as exc:  # noqa: BLE001 - the bot must survive database errors
@@ -433,10 +567,16 @@ class Database:
                 return default
 
     async def _persist_access(self) -> None:
+        if self._active is self._memory:
+            self._schedule_reconnect()
+        self._access_dirty = True
         try:
             await self._active.save_access(self._mode, sorted(self._authorized))
         except Exception as exc:  # noqa: BLE001 - cached access still applies
             self._degrade(exc)
+            return
+        if self._active is self._mongo:
+            self._access_dirty = False
 
     # -- access ---------------------------------------------------------
     @property
@@ -495,18 +635,33 @@ class Database:
             banned_by=admin_id,
         )
         self._bans[user_id] = entry
+        self._released.discard(user_id)
+        self._bans_dirty = True
+        if self._active is self._memory:
+            self._schedule_reconnect()
         try:
             await self._active.save_ban(entry)
         except Exception as exc:  # noqa: BLE001 - the cached ban still applies
             self._degrade(exc)
+        else:
+            if self._active is self._mongo:
+                self._bans_dirty = False
         return entry
 
     async def release(self, user_id: int) -> bool:
         existed = self._bans.pop(user_id, None) is not None
+        self._released.add(user_id)
+        self._bans_dirty = True
+        if self._active is self._memory:
+            self._schedule_reconnect()
         try:
             await self._active.delete_ban(user_id)
         except Exception as exc:  # noqa: BLE001 - the cached release still applies
             self._degrade(exc)
+        else:
+            if self._active is self._mongo:
+                self._bans_dirty = False
+                self._released.discard(user_id)
         return existed
 
     # -- users, presets and usage ---------------------------------------
