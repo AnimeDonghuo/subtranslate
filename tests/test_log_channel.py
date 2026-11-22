@@ -30,8 +30,8 @@ async def test_delivery_is_recorded_and_copied_to_the_log_channel():
 
     await service._send_result(JOB, "Hindi", RESULT, NoTransport())
 
-    assert [item["chat_id"] for item in service.bot.documents] == [42, CHANNEL]
-    copy = service.bot.documents[-1]
+    assert [item["chat_id"] for item in service.bot.documents] == [42, CHANNEL, CHANNEL]
+    copy = service.bot.documents[1]
     assert copy["document"].filename == "Hindi.srt"
     assert "Asha Kumari" in copy["caption"]
     assert "@asha" in copy["caption"]
@@ -87,8 +87,10 @@ async def test_large_result_on_disk_is_copied_from_the_file(tmp_path: Path):
 
     await service._send_result(JOB, "Hindi", result, NoTransport())
 
-    assert [item["chat_id"] for item in service.bot.documents] == [42, CHANNEL]
+    assert [item["chat_id"] for item in service.bot.documents] == [42, CHANNEL, CHANNEL]
     assert service.bot.documents[0]["document"].filename == "Hindi.srt"
+    # The second channel message is the user's original, by file id.
+    assert service.bot.documents[2]["document"] == "file1"
 
 
 class FakeTransport:
@@ -125,7 +127,9 @@ async def test_large_results_use_mtproto_for_the_user_and_the_channel(tmp_path, 
     assert transport.sent == [(42, "Hindi.srt")]
     assert [copy[0] for copy in transport.copies] == [CHANNEL]
     assert "Asha Kumari" in transport.copies[0][2] and "@asha" in transport.copies[0][2]
-    assert service.bot.documents == []
+    # The original is copied too; without a local copy it is resent by file id.
+    assert [item["chat_id"] for item in service.bot.documents] == [CHANNEL]
+    assert service.bot.documents[0]["document"] == "file1"
 
 
 async def test_failed_large_channel_copy_still_records_and_delivers(tmp_path, monkeypatch):
@@ -146,3 +150,82 @@ async def test_failed_large_channel_copy_still_records_and_delivers(tmp_path, mo
     assert notice["chat_id"] == CHANNEL
     assert "could not be sent" in notice["text"]
     assert (await service.store.stats()).translations_total == 1
+
+
+async def test_the_original_file_is_copied_with_its_own_name(tmp_path: Path):
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+    source = tmp_path / "source.srt"
+    source.write_bytes(b"10\n00:00:01,000 --> 00:00:02,000\nHello\n\n")
+    job = TranslationJob(
+        chat_id=42, original_message_id=77, file_id="file1",
+        file_name=r"C:\videos\movie name.srt", file_size=41,
+        language_code="hi", language_name="Hindi",
+        user_id=42, user_name="Asha Kumari", username="asha",
+    )
+
+    await service._log_channel_source(job, "Hindi", source, None)
+
+    copy = service.bot.documents[-1]
+    assert copy["chat_id"] == CHANNEL
+    assert copy["document"].filename == "movie name.srt"
+    assert "Original subtitle" in copy["caption"]
+    assert "movie name.srt" in copy["caption"] and "Hindi" in copy["caption"]
+    assert copy["parse_mode"] == "HTML"
+
+
+async def test_the_original_is_copied_only_once_per_job(tmp_path: Path):
+    # A batch runs several languages over one source file: one copy is enough.
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+
+    await service._log_channel_source(JOB, "Hindi", None, None)
+    await service._log_channel_source(JOB, "Spanish", None, None)
+
+    assert len(service.bot.documents) == 1
+
+
+async def test_the_source_copy_does_not_affect_the_translation_or_its_record(tmp_path: Path):
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+    service.bot.fail_chat_ids.add(CHANNEL)   # the channel refuses everything
+
+    await service._log_channel_source(JOB, "Hindi", None, None)
+
+    assert (await service.store.stats()).translations_total == 0
+    assert service.bot.documents == []
+
+
+async def test_a_large_source_is_copied_over_mtproto(tmp_path: Path, monkeypatch):
+    import subtranslate.bot as bot_module
+
+    monkeypatch.setattr(bot_module, "BOT_API_UPLOAD_BYTES", 4)
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+    source = tmp_path / "source.ass"
+    source.write_bytes(b"x" * 100)
+    transport = FakeTransport()
+
+    await service._log_channel_source(JOB, "Hindi", source, transport)
+
+    assert transport.copies[0][0] == CHANNEL
+    assert transport.copies[0][1] == "movie.srt"
+    assert "Original subtitle" in transport.copies[0][2]
+
+
+def test_the_source_path_is_found_for_disk_and_memory_sources(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from subtranslate.bot import BotService
+
+    on_disk = tmp_path / "downloaded.srt"
+    on_disk.write_bytes(b"1\n00:00:01,000 --> 00:00:02,000\nHi\n\n")
+    # SRT jobs keep the download in a FileSubtitle with a path.
+    assert BotService._job_source_path(SimpleNamespace(path=on_disk), tmp_path) == on_disk
+
+    # Formats read into memory keep the MTProto download at source.srt.
+    directory = tmp_path / "job"
+    directory.mkdir()
+    (directory / "source.srt").write_bytes(b"x")
+    assert BotService._job_source_path(object(), directory) == directory / "source.srt"
+    assert BotService._job_source_path(object(), tmp_path / "empty") is None
