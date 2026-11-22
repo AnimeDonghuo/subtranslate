@@ -8,6 +8,7 @@ contain those values.
 """
 
 import asyncio
+import errno
 import logging
 from pathlib import Path
 
@@ -39,6 +40,14 @@ DOWNLOAD_WORKERS = 4
 # Below this size one request is already fast enough to be worth no extra
 # connections (and Telegram charges per-request overhead).
 PARALLEL_DOWNLOAD_MIN_BYTES = 2 * 1024 * 1024
+# A free instance drops connections mid-download; one lost part must not throw
+# away the whole transfer. Each stream resumes from its own position.
+DOWNLOAD_RETRIES = 4
+DOWNLOAD_MAX_BACKOFF = 15.0
+# Telegram may ask a download to slow down; honour it instead of failing the job.
+DOWNLOAD_MAX_WAIT = 120.0
+# Errors that really mean "no space left", not "the connection broke".
+_DISK_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EFBIG, errno.EROFS})
 
 
 class LargeTransferError(Exception):
@@ -54,6 +63,20 @@ def ensure_telegram_size(size: int | None) -> None:
         )
 
 
+def missing_ranges(covered: list[tuple[int, int]], size: int) -> list[tuple[int, int]]:
+    """Byte ranges of a preallocated file that no stream actually wrote."""
+    spans = sorted((max(0, start), min(size, end)) for start, end in covered if end > start)
+    gaps: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            gaps.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < size:
+        gaps.append((cursor, size))
+    return [(start, end) for start, end in gaps if end > start]
+
+
 class LargeTelegramTransfer:
     def __init__(self, settings: Settings, *, client=None) -> None:
         self.settings = settings
@@ -63,6 +86,7 @@ class LargeTelegramTransfer:
         self._message_key = None
         self._peer_key = None
         self._peer_value = None
+        self._fallback_error: str | None = None
 
     async def start(self) -> None:
         if self._started:
@@ -129,63 +153,153 @@ class LargeTelegramTransfer:
             return 1
         return max(1, min(DOWNLOAD_WORKERS, size // DOWNLOAD_CHUNK_BYTES))
 
+    @staticmethod
+    def _retry_delay(exc: BaseException, failures: int) -> float | None:
+        """How long to wait before resuming a stream, or ``None`` to give up."""
+        if failures > DOWNLOAD_RETRIES:
+            return None
+        seconds = getattr(exc, "seconds", None)
+        try:
+            requested = float(seconds) if seconds is not None else 0.0
+        except (TypeError, ValueError):
+            requested = 0.0
+        if 0 < requested <= DOWNLOAD_MAX_WAIT:
+            return requested
+        return min(2.0 ** failures, DOWNLOAD_MAX_BACKOFF)
+
+    async def _pause(self, delay: float) -> None:
+        """Backoff between resumed parts; a hook so tests need not really wait."""
+        await asyncio.sleep(delay)
+
+    async def _stream(self, message, path: Path, size: int, index: int, stride: int,
+                      covered: list[tuple[int, int]]) -> None:
+        """One MTProto stream: fixed parts, resuming where it stopped."""
+        position = index * DOWNLOAD_CHUNK_BYTES
+        failures = 0
+        with path.open("r+b") as handle:
+            while position < size:
+                try:
+                    async for piece in self.client.iter_download(
+                            message, offset=position, stride=stride,
+                            request_size=DOWNLOAD_CHUNK_BYTES, file_size=size):
+                        if not piece:
+                            return
+                        handle.seek(position)
+                        handle.write(piece)
+                        covered.append((position, position + len(piece)))
+                        position += stride
+                        failures = 0
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failures += 1
+                    delay = self._retry_delay(exc, failures)
+                    if delay is None:
+                        raise
+                    logger.warning("MTProto part download failed (%s); resuming in %.1fs",
+                                   type(exc).__name__, delay)
+                    await self._pause(delay)
+
+    async def _fill_gaps(self, message, path: Path, size: int,
+                         covered: list[tuple[int, int]]) -> None:
+        """Refetch anything the streams left unwritten, one stream at a time."""
+        gaps = missing_ranges(covered, size)
+        if not gaps:
+            return
+        logger.warning("MTProto left %d part(s) unwritten; refetching them", len(gaps))
+        with path.open("r+b") as handle:
+            for start, end in gaps:
+                position = start
+                while position < end:
+                    progressed = False
+                    async for piece in self.client.iter_download(
+                            message, offset=position, request_size=DOWNLOAD_CHUNK_BYTES,
+                            file_size=size):
+                        if not piece:
+                            break
+                        handle.seek(position)
+                        handle.write(piece)
+                        position += len(piece)
+                        progressed = True
+                        if position >= end:
+                            break
+                    if not progressed:
+                        raise OSError("a missing part could not be refetched")
+
     async def _parallel_download(self, message, path: Path, size: int, workers: int) -> None:
         """Fetch interleaved MTProto parts over ``workers`` connections at once."""
-        # Preallocate so each worker can write at its own offset.
+        # Preallocate so each stream can write at its own offset.
         with path.open("wb") as handle:
             handle.truncate(size)
         stride = workers * DOWNLOAD_CHUNK_BYTES
+        covered: list[tuple[int, int]] = []
+        await asyncio.gather(*(self._stream(message, path, size, index, stride, covered)
+                               for index in range(workers)))
+        await self._fill_gaps(message, path, size, covered)
 
-        async def worker(index: int) -> None:
-            position = index * DOWNLOAD_CHUNK_BYTES
-            with path.open("r+b") as handle:
-                async for piece in self.client.iter_download(
-                        message, offset=position, stride=stride,
-                        request_size=DOWNLOAD_CHUNK_BYTES, file_size=size):
-                    if not piece:
-                        break
-                    handle.seek(position)
-                    handle.write(piece)
-                    position += stride
-
-        await asyncio.gather(*(worker(index) for index in range(workers)))
+    async def _single_stream(self, message, path: Path) -> None:
+        saved = await self.client.download_media(message, file=str(path))
+        if not saved or not path.is_file():
+            raise OSError("download did not create the destination")
 
     async def _download_to(self, message, path: Path, size: int | None) -> None:
         workers = self._worker_count(size)
         if size is None or workers < 2 or getattr(self.client, "iter_download", None) is None:
-            saved = await self.client.download_media(message, file=str(path))
-            if not saved or not path.is_file():
-                raise OSError("download did not create the destination")
+            await self._single_stream(message, path)
             return
-        await self._parallel_download(message, path, size, workers)
+        try:
+            await self._parallel_download(message, path, size, workers)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - one slow stream is better than failing
+            # Several connections are faster but more fragile than Telethon's own
+            # single-stream downloader, so fall back to it before giving up.
+            logger.warning("Parallel MTProto download failed (%s); using one stream",
+                           type(exc).__name__)
+            await asyncio.to_thread(path.unlink, missing_ok=True)
+            self._fallback_error = type(exc).__name__
+            await self._single_stream(message, path)
+
+    def _download_message(self, exc: BaseException) -> str:
+        """A safe, actionable failure text; the error class names the cause."""
+        detail = type(exc).__name__
+        if self._fallback_error:
+            detail = f"{self._fallback_error}, then {detail}"
+        return ("The Telegram file download failed or was incomplete "
+                f"({detail}). Please send the file again and retry.")
 
     async def download(self, job: TranslationJob, path: Path) -> None:
         message = await self._original(job)
         ensure_telegram_size(message.document.size if message.document else None)
         ensure_telegram_size(job.file_size)
+        document_size = message.document.size if message.document else None
         try:
-            size = message.document.size if message.document else job.file_size
+            size = document_size if document_size is not None else job.file_size
             await self._download_to(message, path, size)
             if not path.is_file():
                 raise OSError("download did not create the destination")
             actual = path.stat().st_size
-            document_size = message.document.size
-            if (actual <= 0 or actual != document_size
+            if (actual <= 0 or (size is not None and actual != size)
                     or (job.file_size is not None and actual != job.file_size)):
+                logger.warning(
+                    "Downloaded %s bytes; document has %s and the update reported %s",
+                    actual, document_size, job.file_size)
                 raise ValueError("incomplete Telegram download")
         except asyncio.CancelledError:
             raise
         except OSError as exc:
-            logger.warning("Large Telegram download failed locally (%s)", type(exc).__name__)
-            raise LargeTransferError(
-                "Could not save the Telegram file. The deployment may not have enough temporary disk space; "
-                "no partial subtitle was sent."
-            ) from None
+            if exc.errno in _DISK_ERRNOS:
+                logger.warning("Telegram download ran out of disk (%s)", exc.errno)
+                raise LargeTransferError(
+                    "Could not save the Telegram file: the deployment ran out of temporary disk space; "
+                    "no partial subtitle was sent."
+                ) from None
+            logger.warning("Large Telegram download failed (%s)", type(exc).__name__)
+            raise LargeTransferError(self._download_message(exc)) from None
         except Exception as exc:  # noqa: BLE001 - may include private data
             logger.warning("Large Telegram download failed (%s)", type(exc).__name__)
-            raise LargeTransferError(
-                "The Telegram file download failed or was incomplete. Please send the file again and retry."
-            ) from None
+            raise LargeTransferError(self._download_message(exc)) from None
 
     async def send(self, job: TranslationJob, path: Path, filename: str, caption: str) -> None:
         message = await self._original(job)
