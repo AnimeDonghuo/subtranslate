@@ -1012,6 +1012,18 @@ class BotService:
             f"📄 File: {html.escape(job.file_name or 'subtitle')} → {html.escape(filename)}\n"
             f"🎬 Cues: {result.cue_count:,}"
         )
+        # A delivered file that kept part of its text is a quality issue the
+        # owner should see next to the file, not only in the user's chat.
+        if result.unchanged:
+            caption += "\n⚠️ Quality: the website returned unchanged text."
+        elif result.possibly_incomplete:
+            last = result.longest_run_start + result.longest_unchanged_run
+            caption += (f"\n⚠️ Quality: {result.longest_unchanged_run:,} cues in a row (cue "
+                        f"{result.longest_run_start + 1:,}–{last:,}) kept the original text; "
+                        f"{result.unchanged_count:,}/{result.cue_count:,} cues unchanged.")
+        elif result.untranslated_run >= 5:
+            caption += (f"\n⚠️ Quality: about {result.untranslated_run:,} cues in a row still look like "
+                        "the source language.")
         try:
             if isinstance(result.content, Path) and size > BOT_API_UPLOAD_BYTES:
                 # The Bot API cannot upload this, so reuse the 2 GB MTProto path.
@@ -1063,6 +1075,95 @@ class BotService:
             self._logged_sources.pop(next(iter(self._logged_sources)))
         return True
 
+    async def _send_channel_document(self, channel: int, job: TranslationJob,
+                                     source_path: Path | None,
+                                     transport: LargeTelegramTransfer | None,
+                                     caption: str, filename: str) -> bool:
+        """Send the user's own file to the channel; True when it went through."""
+        try:
+            if source_path is not None and source_path.is_file():
+                if source_path.stat().st_size > BOT_API_UPLOAD_BYTES:
+                    if transport is None:
+                        raise LargeTransferError("The large-file transport is unavailable.")
+                    await transport.send_file_to(channel, source_path, filename, caption)
+                else:
+                    with source_path.open("rb") as handle:
+                        await self.bot.send_document(
+                            chat_id=channel,
+                            document=InputFile(handle, filename=filename, read_file_handle=False),
+                            caption=caption, parse_mode="HTML",
+                            read_timeout=120, write_timeout=120,
+                        )
+            else:
+                # Small files are read into memory during the job, so resend
+                # the exact document Telegram already holds: the name survives.
+                await self.bot.send_document(
+                    chat_id=channel, document=job.file_id, caption=caption,
+                    parse_mode="HTML", read_timeout=120, write_timeout=120,
+                )
+            return True
+        except (TelegramError, OSError, LargeTransferError) as exc:
+            logger.warning("Log channel document copy failed (%s)", type(exc).__name__)
+            return False
+
+    async def _report_failure(self, job: TranslationJob, failure: BaseException | str, *,
+                              source_path: Path | None = None,
+                              transport: LargeTelegramTransfer | None = None,
+                              stage: str | None = None) -> None:
+        """Forward a failed job, its reason and the user's file to the channel.
+
+        The owner asked to see every failure with the file that caused it, so a
+        problem can be fixed instead of guessed at. Only user-facing error text
+        is quoted; unexpected exceptions are named by type, never by message,
+        and no token, hash or URL is ever included.
+        """
+        channel = self.settings.log_channel_id
+        if channel is None or self.bot is None:
+            return
+        try:
+            known = (SubtitleError, WebsiteError, LargeTransferError)
+            if isinstance(failure, str):
+                reason, kind = failure, ""
+            else:
+                kind = type(failure).__name__
+                text = str(failure).strip()
+                reason = text if text and isinstance(failure, (*known, TimeoutError)) else kind
+            reason = reason.replace("\n", " ").strip()
+            if len(reason) > 600:
+                reason = reason[:600].rstrip() + "…"
+            original = self._original_filename(job.file_name)
+            username = f"@{html.escape(job.username)}" if job.username else "not set"
+            lines = [
+                "🚨 <b>Translation failed</b>",
+                "",
+                f"👤 Name: {html.escape(job.user_name or 'Unknown')}",
+                f"🆔 User ID: <code>{job.user_id or 'unknown'}</code>",
+                f"🔗 Username: {username}",
+                f"🌐 Language: {html.escape(job.language_name or job.language_code or 'unknown')}",
+                f"📄 File: {html.escape(original)}",
+            ]
+            if job.task_id:
+                lines.append(f"🧩 Task: #{job.task_id}")
+            if stage:
+                lines.append(f"🎬 Stage: {html.escape(stage)}")
+            lines.append(f"❌ Reason: {html.escape(reason)}")
+            if kind and kind != reason:
+                lines.append(f"🏷 Error type: <code>{html.escape(kind)}</code>")
+            caption = "\n".join(lines)
+            if await self._send_channel_document(channel, job, source_path, transport, caption, original):
+                self._claim_source_copy(job)   # never copy the same file twice
+                return
+            try:
+                await self.bot.send_message(
+                    chat_id=channel,
+                    text=caption + "\n\n⚠️ The original file could not be copied to this channel.",
+                    parse_mode="HTML",
+                )
+            except TelegramError as notice_error:
+                logger.info("Failure report to the channel failed (%s)", type(notice_error).__name__)
+        except Exception as exc:  # noqa: BLE001 - reporting must never break a job
+            logger.warning("Could not report a failure to the log channel (%s)", type(exc).__name__)
+
     async def _log_channel_source(self, job: TranslationJob, name: str,
                                   source_path: Path | None,
                                   transport: LargeTelegramTransfer | None = None) -> None:
@@ -1080,37 +1181,16 @@ class BotService:
             f"🌐 Requested language: {html.escape(name)}\n"
             f"📄 File: {html.escape(original)}"
         )
+        if await self._send_channel_document(channel, job, source_path, transport, caption, original):
+            return
         try:
-            if source_path is not None and source_path.is_file():
-                if source_path.stat().st_size > BOT_API_UPLOAD_BYTES:
-                    if transport is None:
-                        raise LargeTransferError("The large-file transport is unavailable.")
-                    await transport.send_file_to(channel, source_path, original, caption)
-                else:
-                    with source_path.open("rb") as handle:
-                        await self.bot.send_document(
-                            chat_id=channel,
-                            document=InputFile(handle, filename=original, read_file_handle=False),
-                            caption=caption, parse_mode="HTML",
-                            read_timeout=120, write_timeout=120,
-                        )
-            else:
-                # Small files are read into memory during the job, so resend
-                # the exact document Telegram already holds: the name survives.
-                await self.bot.send_document(
-                    chat_id=channel, document=job.file_id, caption=caption,
-                    parse_mode="HTML", read_timeout=120, write_timeout=120,
-                )
-        except (TelegramError, OSError, LargeTransferError) as exc:
-            logger.warning("Log channel source copy failed (%s)", type(exc).__name__)
-            try:
-                await self.bot.send_message(
-                    chat_id=channel,
-                    text=caption + "\n\n⚠️ The original file could not be copied.",
-                    parse_mode="HTML",
-                )
-            except TelegramError as notice_error:
-                logger.info("Log channel source notice failed (%s)", type(notice_error).__name__)
+            await self.bot.send_message(
+                chat_id=channel,
+                text=caption + "\n\n⚠️ The original file could not be copied.",
+                parse_mode="HTML",
+            )
+        except TelegramError as notice_error:
+            logger.info("Log channel source notice failed (%s)", type(notice_error).__name__)
 
     @staticmethod
     async def _cancelable(awaitable, cancel: asyncio.Event):
@@ -1190,15 +1270,25 @@ class BotService:
         try:
             try:
                 async with self._job_resources() as (directory, transport):
-                    source = await self._cancelable(self._download_source(job, directory, transport), cancel)
-                    result = await self._cancelable(
-                        self._translate_with_deadline(self.translator, source, job.language_code, progress), cancel
-                    )
-                    progress.set_stage("sending result")
-                    await self._cancelable(self._send_result(
-                        job, job.language_name, result, transport,
-                        source_path=self._job_source_path(source, directory),
-                    ), cancel)
+                    source_path: Path | None = None
+                    try:
+                        source = await self._cancelable(self._download_source(job, directory, transport), cancel)
+                        source_path = self._job_source_path(source, directory)
+                        result = await self._cancelable(
+                            self._translate_with_deadline(self.translator, source, job.language_code, progress), cancel
+                        )
+                        progress.set_stage("sending result")
+                        await self._cancelable(self._send_result(
+                            job, job.language_name, result, transport, source_path=source_path,
+                        ), cancel)
+                    except (JobCancelled, asyncio.CancelledError):
+                        raise
+                    except Exception as exc:
+                        # The temporary directory (and any downloaded original)
+                        # is about to be removed, so report while it still exists.
+                        await self._report_failure(job, exc, source_path=source_path,
+                                                   transport=transport, stage=progress.stage)
+                        raise
                 cue_word = "cue" if result.cue_count == 1 else "cues"
                 if result.suspect:
                     final = (f"⚠️ Sent {job.language_name} with {result.cue_count:,} checked {cue_word}, "
@@ -1276,10 +1366,12 @@ class BotService:
                 await self._finish_progress(progress, job.chat_id, "Translation batch canceled. No unfinished file was sent.")
                 return
             except (SubtitleError, LargeTransferError) as exc:
+                await self._report_failure(job, exc, transport=transport, stage="reading the subtitle")
                 await self._finish_progress(progress, job.chat_id, f"Could not read the subtitle: {exc}")
                 return
             except Exception as exc:  # noqa: BLE001 - notify the user if the batch cannot start
                 logger.warning("Could not start all-language batch (%s)", type(exc).__name__)
+                await self._report_failure(job, exc, transport=transport, stage="reading the subtitle")
                 await self._finish_progress(progress, job.chat_id, "Could not read the subtitle file. Please resend it and try again.")
                 return
             if cancel.is_set():
@@ -1354,12 +1446,24 @@ class BotService:
                         summary += f" and {len(names) - 8} more"
             for name, reason in failure_details:
                 summary += f"\n{name}: {reason}"
+            reason = f"{failed} of {len(job.languages)} languages failed"
+            if failed_names:
+                reason += f" ({', '.join(failed_names[:8])})"
+            for name, detail in failure_details[:4]:
+                reason += f"; {name}: {detail}"
+            if repeated_failures:
+                reason += "; the website failed repeatedly"
+            if session_failed:
+                reason += "; the browser session failed"
             if repeated_failures:
                 summary += "\nThe website failed repeatedly; try again later."
             if session_failed:
                 summary += "\nThe browser session failed; try again later."
             if stopped or failed:
                 summary += "\nUse the language buttons to retry."
+            if failed or session_failed:
+                await self._report_failure(job, reason, source_path=self._job_source_path(source, directory),
+                                           transport=transport, stage=progress.stage)
             await self._finish_progress(progress, job.chat_id, summary)
         finally:
             if heartbeat is not None:

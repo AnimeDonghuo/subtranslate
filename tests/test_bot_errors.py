@@ -216,3 +216,53 @@ async def test_possible_partial_result_is_delivered_but_never_as_complete(servic
     service.bot.send_document.assert_awaited_once()
     assert "some text may be untranslated" in last_notice(service)
     assert "Please review the file" in last_notice(service)
+
+
+async def test_a_failed_translation_is_forwarded_to_the_log_channel_with_the_reason(monkeypatch):
+    channel = -1009876543210
+    settings = Settings("12345:TESTTOKEN", "https://example.com", log_channel_id=channel)
+    translator = SimpleNamespace(translate=AsyncMock(side_effect=WebsiteError("The website timed out.")))
+    service = BotService(settings, LanguageCatalog(), translator)
+    service.bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=123)),
+        edit_message_text=AsyncMock(), send_document=AsyncMock(),
+        get_file=AsyncMock(return_value=telegram_file(VALID_SRT)),
+    )
+
+    await service.process_job(JOB)
+
+    # One message to the channel: the failure plus the user's own file.
+    copy = service.bot.send_document.await_args
+    assert copy.kwargs["chat_id"] == channel
+    assert "Translation failed" in copy.kwargs["caption"]
+    assert "The website timed out." in copy.kwargs["caption"]
+    assert "movie.srt" in copy.kwargs["caption"]
+    assert "Hindi" in copy.kwargs["caption"]
+    # The user still gets the normal failure notice.
+    assert "Could not translate" in last_notice(service)
+
+
+async def test_a_canceled_job_is_not_reported_as_a_failure():
+    channel = -1009876543210
+    settings = Settings("12345:TESTTOKEN", "https://example.com", log_channel_id=channel)
+
+    async def forever(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    translator = SimpleNamespace(translate=AsyncMock(side_effect=forever))
+    service = BotService(settings, LanguageCatalog(), translator)
+    service.bot = SimpleNamespace(
+        send_message=AsyncMock(return_value=SimpleNamespace(message_id=123)),
+        edit_message_text=AsyncMock(), send_document=AsyncMock(),
+        get_file=AsyncMock(return_value=telegram_file(VALID_SRT)),
+    )
+    task = asyncio.create_task(service.process_job(JOB))
+    for _ in range(200):
+        await asyncio.sleep(0.01)
+        if service.translator.translate.await_count:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    service.bot.send_document.assert_not_awaited()

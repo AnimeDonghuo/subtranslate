@@ -229,3 +229,83 @@ def test_the_source_path_is_found_for_disk_and_memory_sources(tmp_path: Path):
     (directory / "source.srt").write_bytes(b"x")
     assert BotService._job_source_path(object(), directory) == directory / "source.srt"
     assert BotService._job_source_path(object(), tmp_path / "empty") is None
+
+
+async def test_a_failed_job_forwards_the_reason_and_the_source_file(tmp_path: Path):
+    from subtranslate.subtitles import SubtitleError
+
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+    source = tmp_path / "original.srt"
+    source.write_bytes(b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n")
+
+    await service._report_failure(JOB, SubtitleError("The subtitle has no readable cues."),
+                                  source_path=source, stage="reading the subtitle")
+
+    copy = service.bot.documents[-1]
+    assert copy["chat_id"] == CHANNEL
+    assert copy["document"].filename == "movie.srt"           # the source's own name
+    from telegram import InputFile
+
+    assert isinstance(copy["document"], InputFile)   # the local download, not a file id
+    assert "Translation failed" in copy["caption"]
+    assert "no readable cues" in copy["caption"]
+    assert "Asha Kumari" in copy["caption"] and "@asha" in copy["caption"]
+    assert "reading the subtitle" in copy["caption"] and "SubtitleError" in copy["caption"]
+
+
+async def test_a_failure_without_a_local_file_is_resent_by_file_id():
+    from subtranslate.subtitles import SubtitleError
+
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+
+    await service._report_failure(JOB, SubtitleError("The website timed out."))
+
+    copy = service.bot.documents[-1]
+    assert copy["document"] == "file1"
+    assert "movie.srt" in copy["caption"]
+
+
+async def test_an_unexpected_error_is_named_by_type_without_its_message():
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+
+    await service._report_failure(JOB, RuntimeError("SECRET-TOKEN and a private URL"))
+
+    caption = service.bot.documents[-1]["caption"]
+    assert "RuntimeError" in caption
+    assert "SECRET-TOKEN" not in caption and "private URL" not in caption
+
+
+async def test_a_failure_report_never_breaks_a_job(caplog):
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+    service.bot.fail_chat_ids.add(CHANNEL)
+
+    await service._report_failure(JOB, "The website returned an error.")
+
+    # Best effort: the failure was swallowed, and the job is unaffected.
+    assert service.bot.documents == []
+
+
+async def test_failure_reporting_is_skipped_when_no_channel_is_configured():
+    service = make_service(owner=1)
+    service.bot = FakeBot()
+
+    await service._report_failure(JOB, "anything")
+
+    assert service.bot.documents == [] and service.bot.messages == []
+
+
+async def test_the_delivered_copy_flags_text_that_did_not_change():
+    service = make_service(owner=1, log_channel=CHANNEL)
+    service.bot = FakeBot()
+    partial = TranslatedSubtitle(content=RESULT.content, cue_count=100, unchanged=False,
+                                 changed_cues=60, longest_unchanged_run=40,
+                                 longest_run_start=60, unchanged_cues=40)
+
+    await service._log_channel_copy(JOB, "Hindi", "Hindi.srt", partial, len(RESULT.content))
+
+    caption = service.bot.documents[0]["caption"]
+    assert "Quality" in caption and "40 cues in a row" in caption
